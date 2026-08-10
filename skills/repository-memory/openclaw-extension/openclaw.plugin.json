@@ -11,7 +11,7 @@
     "additionalProperties": false,
     "properties": {
       "enabled": { "type": "boolean", "default": true },
-      "guardEnabled": { "type": "boolean", "default": false, "description": "Block non-repository memory and direct file fallback for repository-fact turns." },
+      "guardEnabled": { "type": "boolean", "default": false, "description": "Enforce repository-fact routing while preserving maintenance and narrow recovery operations." },
       "runtime": { "type": "string", "description": "The repository-memory CLI executable." },
       "auditPath": { "type": "string", "description": "Optional metadata-only host audit path." },
       "repoToolPrefix": { "type": "string", "default": "repository-memory__", "description": "Host namespace used for repository-memory MCP tools." },
