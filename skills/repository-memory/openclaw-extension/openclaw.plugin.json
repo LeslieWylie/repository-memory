@@ -1,0 +1,24 @@
+{
+  "id": "repository-memory-autocapture",
+  "name": "Repository Memory Auto Capture",
+  "description": "Enforce repository-memory evidence routing and capture completed OpenClaw turns through the shared L0-L2 runtime.",
+  "version": "0.2.0",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": { "type": "boolean", "default": true },
+      "guardEnabled": { "type": "boolean", "default": false, "description": "Block non-repository memory and direct file fallback for repository-fact turns." },
+      "runtime": { "type": "string", "description": "The repository-memory CLI executable." },
+      "auditPath": { "type": "string", "description": "Optional metadata-only host audit path." },
+      "repoToolPrefix": { "type": "string", "default": "repository-memory__", "description": "Host namespace used for repository-memory MCP tools." },
+      "agentIds": { "type": "array", "items": { "type": "string" }, "description": "Only capture these OpenClaw agent ids; empty means all agents." },
+      "maxMessages": { "type": "integer", "minimum": 4, "maximum": 64, "default": 24 },
+      "maxMessageChars": { "type": "integer", "minimum": 1000, "maximum": 50000, "default": 12000 },
+      "timeoutMs": { "type": "integer", "minimum": 1000, "maximum": 60000, "default": 15000 }
+    }
+  }
+}

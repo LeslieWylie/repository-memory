@@ -1,0 +1,14 @@
+{
+  "agents": {
+    "list": [
+      {
+        "id": "example-agent",
+        "workspace": "/path/to/agent-workspace",
+        "skills": [],
+        "tools": {"alsoAllow": []}
+      }
+    ]
+  },
+  "mcp": {"servers": {}},
+  "plugins": {"allow": [], "entries": {}, "load": {"paths": []}}
+}

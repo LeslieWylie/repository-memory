@@ -1,0 +1,12 @@
+[project]
+name = "repository-memory"
+version = "0.1.0"
+description = "Citation-first repository memory Skill, CLI, MCP server, and optional MemoryCore adapter"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Repository Memory contributors" }]
+dependencies = []
+
+[tool.pytest.ini_options]
+testpaths = ["skills/repository-memory/tests"]

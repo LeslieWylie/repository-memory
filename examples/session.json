@@ -1,0 +1,7 @@
+{
+  "session_id": "example-session",
+  "messages": [
+    {"role": "user", "content": "We decided to keep retries bounded and record the reason."},
+    {"role": "assistant", "content": "I will treat that as an explicit project decision and keep it reviewable."}
+  ]
+}

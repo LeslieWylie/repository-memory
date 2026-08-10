@@ -1,0 +1,4 @@
+interface:
+  display_name: "Repository Memory"
+  short_description: "Search repository memory with verified citations"
+  default_prompt: "Use Repository Memory to find verified project evidence and return source-backed citations."
