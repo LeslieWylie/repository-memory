@@ -31,7 +31,7 @@ fallback for explicit session ingestion and lexical L0/L1 recall. Its doctor
 output marks L2/L3 unsupported rather than pretending deterministic storage is
 equivalent to summarisation or profile memory.
 
-By default, the runtime fetches a remote reference and indexes a disposable snapshot without changing the working tree. Use `--local` only when the current checkout is intentionally the source. A dirty local source is not fresh and its results must not silently be presented as remote facts.
+By default, the runtime fetches a remote reference and indexes a disposable snapshot without changing the working tree. Use `--local` only when the current checkout is intentionally the source. An explicitly configured `local_only` source is an offline/local snapshot contract: it is fresh relative to its recorded commit when clean, but never implies that the commit is the latest remote revision. A dirty local source is not fresh and its results must not silently be presented as remote facts.
 
 When fetch or an adapter fails, the runtime may use conservative local exact evidence. Such fallback results must identify the fallback in diagnostics and cannot be upgraded merely because they are textually similar.
 

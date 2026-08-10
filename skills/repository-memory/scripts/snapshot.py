@@ -93,7 +93,7 @@ def local_view(spec: SourceSpec, reason: str | None = None) -> SourceView:
 
 
 def prepare_view(spec: SourceSpec, local: bool = False) -> SourceView:
-    if local:
+    if local or spec.local_only:
         return local_view(spec)
     remote_url = spec.remote or git(spec.root, "remote", "get-url", "origin")
     branch = spec.branch or remote_branch(spec.root)

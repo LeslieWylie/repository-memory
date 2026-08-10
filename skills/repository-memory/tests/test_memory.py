@@ -135,6 +135,19 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertTrue(dirty_result["abstain"])
         self.assertTrue(all(".env" not in item["path"] for item in dirty_result["candidates"]))
 
+    def test_local_only_source_is_fresh_without_remote_fetch(self):
+        self.write_config({
+            "sources": [{"id": "alpha", "root": str(self.alpha), "local_only": True}],
+        })
+
+        result = core.search(None, "Atlas evidence")
+
+        self.assertFalse(result["abstain"])
+        self.assertEqual(result["verified"][0]["citation"]["valid"], True)
+        self.assertEqual(result["freshness"]["alpha"]["state"], "fresh")
+        self.assertEqual(result["freshness"]["alpha"]["commit_type"], "local_worktree")
+        self.assertIsNone(result["freshness"]["alpha"]["fetch_error"])
+
     def test_default_index_filters_operational_templates_but_deep_can_include_them(self):
         (self.alpha / "templates").mkdir()
         (self.alpha / "templates" / "record-template.md").write_text("# Template\n", encoding="utf-8")

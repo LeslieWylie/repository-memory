@@ -657,10 +657,17 @@ def ingest_session(root: Path | None, input_path: str, source_id: str | None = N
     }
 
 
-def init_source(path: str, source_id: str | None = None, repository: str | None = None, profile: str | None = None, sync: bool = True) -> dict[str, Any]:
+def init_source(
+    path: str,
+    source_id: str | None = None,
+    repository: str | None = None,
+    profile: str | None = None,
+    sync: bool = True,
+    local_only: bool = False,
+) -> dict[str, Any]:
     """Register a user-owned source and optionally build its derived index."""
 
-    registration = add_source(path, source_id, repository, profile)
+    registration = add_source(path, source_id, repository, profile, local_only)
     root = Path(registration["root"])
     source = registration["id"]
     synced = sync_index(root, source_id=source, local=True) if sync else None
@@ -1130,8 +1137,8 @@ def build_parser() -> argparse.ArgumentParser:
     promote_parser = common("promote"); promote_parser.add_argument("--input", required=True); promote_parser.add_argument("--json", action="store_true")
     ingest_parser = common("ingest-session"); ingest_parser.add_argument("--input", required=True); ingest_parser.add_argument("--json", action="store_true")
     capture_parser = common("capture-turn"); capture_parser.add_argument("--input", required=True); capture_parser.add_argument("--json", action="store_true")
-    init_parser = sub.add_parser("init"); init_parser.add_argument("--path", required=True); init_parser.add_argument("--id", dest="source_id"); init_parser.add_argument("--repository"); init_parser.add_argument("--profile"); init_parser.add_argument("--no-sync", action="store_true"); init_parser.add_argument("--json", action="store_true")
-    source_parser = sub.add_parser("source"); source_parser.add_argument("action", choices=("add", "list", "remove")); source_parser.add_argument("--path"); source_parser.add_argument("--id", dest="source_id"); source_parser.add_argument("--repository"); source_parser.add_argument("--profile"); source_parser.add_argument("--no-sync", action="store_true"); source_parser.add_argument("--json", action="store_true")
+    init_parser = sub.add_parser("init"); init_parser.add_argument("--path", required=True); init_parser.add_argument("--id", dest="source_id"); init_parser.add_argument("--repository"); init_parser.add_argument("--profile"); init_parser.add_argument("--local-only", action="store_true"); init_parser.add_argument("--no-sync", action="store_true"); init_parser.add_argument("--json", action="store_true")
+    source_parser = sub.add_parser("source"); source_parser.add_argument("action", choices=("add", "list", "remove")); source_parser.add_argument("--path"); source_parser.add_argument("--id", dest="source_id"); source_parser.add_argument("--repository"); source_parser.add_argument("--profile"); source_parser.add_argument("--local-only", action="store_true"); source_parser.add_argument("--no-sync", action="store_true"); source_parser.add_argument("--json", action="store_true")
     evaluate_parser = common("evaluate"); evaluate_parser.add_argument("--queries", required=True); evaluate_parser.add_argument("--qrels", required=True); evaluate_parser.add_argument("--limit", type=int, default=5); evaluate_parser.add_argument("--deep", action="store_true"); evaluate_parser.add_argument("--local", action="store_true"); evaluate_parser.add_argument("--scope", choices=("repository", "memory", "all"), default="repository"); evaluate_parser.add_argument("--revision"); evaluate_parser.add_argument("--fallback-only", action="store_true"); evaluate_parser.add_argument("--json", action="store_true")
     memorycore = sub.add_parser("memorycore")
     memorycore.add_argument("action", choices=["configure", "install", "start", "stop", "status", "promote-l3"])
@@ -1214,14 +1221,14 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
                 payload = [json.loads(line) for line in raw.splitlines() if line.strip()]
             value = capture_turn(root if root_arg else None, payload, getattr(args, "source", None))
         elif args.command == "init":
-            value = init_source(args.path, args.source_id, args.repository, args.profile, not args.no_sync)
+            value = init_source(args.path, args.source_id, args.repository, args.profile, not args.no_sync, args.local_only)
         elif args.command == "source":
             if args.action == "list":
                 value = source_list()
             elif args.action == "add":
                 if not args.path:
                     raise RuntimeError("source add requires --path")
-                value = init_source(args.path, args.source_id, args.repository, args.profile, not args.no_sync)
+                value = init_source(args.path, args.source_id, args.repository, args.profile, not args.no_sync, args.local_only)
             elif args.action == "remove":
                 if not args.source_id:
                     raise RuntimeError("source remove requires --id")

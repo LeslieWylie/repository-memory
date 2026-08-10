@@ -206,6 +206,7 @@ def _source_from_item(item: dict[str, Any], fallback_root: Path) -> SourceSpec:
         remote=str(item.get("remote") or "") or None,
         branch=str(item.get("branch") or "") or None,
         profile=str(item.get("profile") or "") or None,
+        local_only=bool(item.get("local_only", item.get("localOnly", False))),
     )
 
 
@@ -252,7 +253,13 @@ def _write_config(config: dict[str, Any]) -> Path:
     return path
 
 
-def add_source(path: str, source_id: str | None = None, repository: str | None = None, profile: str | None = None) -> dict[str, Any]:
+def add_source(
+    path: str,
+    source_id: str | None = None,
+    repository: str | None = None,
+    profile: str | None = None,
+    local_only: bool = False,
+) -> dict[str, Any]:
     root = Path(path).expanduser().resolve()
     if not is_configured_source(root):
         raise RuntimeError(f"source is not a readable knowledge directory: {root}")
@@ -262,6 +269,8 @@ def add_source(path: str, source_id: str | None = None, repository: str | None =
     item = {"id": identifier, "root": str(root), "repository": str(repository or identifier)}
     if profile:
         item["profile"] = profile
+    if local_only:
+        item["local_only"] = True
     replaced = False
     updated = []
     for existing in configured:
@@ -276,7 +285,15 @@ def add_source(path: str, source_id: str | None = None, repository: str | None =
         updated.append(item)
     config["sources"] = updated
     config_path_value = _write_config(config)
-    return {"id": identifier, "root": str(root), "repository": item["repository"], "profile": profile, "config": str(config_path_value), "canonical_repo_changed": False}
+    return {
+        "id": identifier,
+        "root": str(root),
+        "repository": item["repository"],
+        "profile": profile,
+        "local_only": bool(item.get("local_only", False)),
+        "config": str(config_path_value),
+        "canonical_repo_changed": False,
+    }
 
 
 def remove_source(source_id: str) -> dict[str, Any]:
