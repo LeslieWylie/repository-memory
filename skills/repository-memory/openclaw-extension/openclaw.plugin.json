@@ -11,7 +11,8 @@
     "additionalProperties": false,
     "properties": {
       "enabled": { "type": "boolean", "default": true },
-      "guardEnabled": { "type": "boolean", "default": false, "description": "Enforce repository-fact routing while preserving maintenance and narrow recovery operations." },
+      "guardEnabled": { "type": "boolean", "default": false, "description": "Enable repository-fact routing audit/enforcement." },
+      "enforcement": { "type": "string", "enum": ["audit", "enforce"], "default": "audit", "description": "audit records violations without blocking tools; enforce blocks bypasses and incomplete receipts." },
       "runtime": { "type": "string", "description": "The repository-memory CLI executable." },
       "auditPath": { "type": "string", "description": "Optional metadata-only host audit path." },
       "repoToolPrefix": { "type": "string", "default": "repository-memory__", "description": "Host namespace used for repository-memory MCP tools." },
