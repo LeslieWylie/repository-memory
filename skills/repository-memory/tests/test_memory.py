@@ -646,10 +646,11 @@ class RepositoryMemoryTest(unittest.TestCase):
         openclaw_config.write_text(json.dumps({
             "agents": {
                 "list": [
-                    {"id": "alpha", "workspace": str(workspaces[0]), "skills": [], "tools": {"alsoAllow": []}},
+                    {"id": "alpha", "workspace": str(workspaces[0]), "skills": ["rlvr-memory"], "tools": {"alsoAllow": []}},
                     {"id": "beta", "workspace": str(workspaces[1])},
                 ]
-            }
+            },
+            "plugins": {"entries": {"rlvr-memory-autocapture": {"enabled": True, "config": {"guardEnabled": True}}}},
         }), encoding="utf-8")
         environment = os.environ.copy()
         environment.update({
@@ -687,8 +688,10 @@ class RepositoryMemoryTest(unittest.TestCase):
         plugin = configured["plugins"]["entries"]["repository-memory-autocapture"]
         self.assertTrue(plugin["config"]["guardEnabled"])
         self.assertTrue(plugin["hooks"]["allowConversationAccess"])
+        self.assertFalse(configured["plugins"]["entries"]["rlvr-memory-autocapture"]["enabled"])
         for agent in configured["agents"]["list"]:
             self.assertIn("repository-memory", agent["skills"])
+            self.assertNotIn("rlvr-memory", agent["skills"])
             self.assertIn("repository-memory__memory_search", agent["tools"]["alsoAllow"])
         wrapper = machine / ".local" / "bin" / "repository-memory"
         self.assertTrue(wrapper.is_file())

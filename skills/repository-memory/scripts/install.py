@@ -23,6 +23,8 @@ from typing import Any
 SKILL_NAME = "repository-memory"
 MCP_NAME = "repository-memory"
 OPENCLAW_PLUGIN_ID = "repository-memory-autocapture"
+LEGACY_SKILL_NAMES = {"rlvr-memory"}
+LEGACY_OPENCLAW_PLUGIN_IDS = {"rlvr-memory-autocapture"}
 MCP_TOOLS = [
     "memory_doctor",
     "memory_sync",
@@ -249,8 +251,13 @@ def _install_openclaw(canonical: Path, runtime: Path, config_path: Path | None =
         destination = workspace / "skills" / SKILL_NAME
         _copy_skill(canonical, destination)
         skills = row.get("skills") if isinstance(row.get("skills"), list) else []
+        # Keep old Skill files available for rollback, but remove their active
+        # registration so the model cannot choose between two memory contracts.
+        skills = [name for name in skills if name not in LEGACY_SKILL_NAMES]
         if SKILL_NAME not in skills:
             row["skills"] = [*skills, SKILL_NAME]
+        else:
+            row["skills"] = skills
         tools = row.get("tools") if isinstance(row.get("tools"), dict) else {}
         allowed = tools.get("alsoAllow") if isinstance(tools.get("alsoAllow"), list) else []
         tools["alsoAllow"] = [*allowed, *(name for name in OPENCLAW_TOOLS if name not in allowed)]
@@ -281,6 +288,14 @@ def _install_openclaw(canonical: Path, runtime: Path, config_path: Path | None =
         allow.append(OPENCLAW_PLUGIN_ID)
     plugins["allow"] = allow
     entries = plugins.get("entries") if isinstance(plugins.get("entries"), dict) else {}
+    disabled_legacy_plugins: list[str] = []
+    for legacy_id in LEGACY_OPENCLAW_PLUGIN_IDS:
+        if legacy_id == OPENCLAW_PLUGIN_ID:
+            continue
+        legacy = entries.get(legacy_id)
+        if isinstance(legacy, dict) and legacy.get("enabled") is not False:
+            legacy["enabled"] = False
+            disabled_legacy_plugins.append(legacy_id)
     entries[OPENCLAW_PLUGIN_ID] = {
         "enabled": True,
         "config": {
@@ -298,7 +313,7 @@ def _install_openclaw(canonical: Path, runtime: Path, config_path: Path | None =
     backup = path.with_name(f"{path.name}.bak.repository-memory-{int(time.time())}")
     shutil.copy2(path, backup)
     _atomic_json(path, config)
-    return {"config": str(path), "backup": str(backup), "agents": installed, "mcp_registered": True, "autocapture": {"plugin": OPENCLAW_PLUGIN_ID, "extension": str(extension_destination), "agent_ids": sorted(set(agent_ids or []))}}
+    return {"config": str(path), "backup": str(backup), "agents": installed, "mcp_registered": True, "autocapture": {"plugin": OPENCLAW_PLUGIN_ID, "extension": str(extension_destination), "agent_ids": sorted(set(agent_ids or [])), "disabled_legacy_plugins": disabled_legacy_plugins}}
 
 
 def _install_cli(canonical: Path) -> Path:
