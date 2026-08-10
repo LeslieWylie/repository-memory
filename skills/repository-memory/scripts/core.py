@@ -1020,6 +1020,11 @@ def doctor(root: Path | None = None, source_id: str | None = None) -> dict[str, 
     reports = []
     for spec in specs:
         state = repository_state(spec.root)
+        # The checkout directory may be a content-addressed or user-managed
+        # snapshot whose basename is not the configured repository identity.
+        # Keep doctor/source metadata aligned with the stable source contract.
+        state["repository"] = spec.repository
+        state["local_only"] = spec.local_only
         # Doctor must describe the same effective read view used by ordinary
         # search: a fresh remote snapshot when one is available.  Keep the
         # canonical worktree state separately in ``state`` so a dirty local
@@ -1037,7 +1042,7 @@ def doctor(root: Path | None = None, source_id: str | None = None) -> dict[str, 
             pass
         snapshot_path = cache_root() / "snapshots" / fingerprint(spec)
         snapshot = {"path": str(snapshot_path), "exists": (snapshot_path / ".git").exists(), "commit": git(snapshot_path, "rev-parse", "HEAD") if (snapshot_path / ".git").exists() else None}
-        report.update({"source": spec.id, "repository": spec.repository, "state": state, "index": local_index_status(view), "snapshot_cache": {**snapshot, **view.metadata}, "freshness": view.freshness})
+        report.update({"source": spec.id, "repository": spec.repository, "local_only": spec.local_only, "state": state, "index": local_index_status(view), "snapshot_cache": {**snapshot, **view.metadata}, "freshness": view.freshness})
         reports.append(report)
     active = [report.get("name") for report in reports if report.get("available")]
     capabilities = sorted({capability for report in reports for capability in report.get("capabilities", [])})
