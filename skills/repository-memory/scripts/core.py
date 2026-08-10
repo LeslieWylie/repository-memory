@@ -1172,7 +1172,7 @@ def _mcp_dispatch(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         path = str(arguments.get("path") or "").strip()
         if not path:
             raise ValueError("memory_init requires path")
-        return init_source(path, str(arguments.get("source_id") or "") or None, str(arguments.get("repository") or "") or None, str(arguments.get("profile") or "") or None, bool(arguments.get("sync", True)))
+        return init_source(path, str(arguments.get("source_id") or "") or None, str(arguments.get("repository") or "") or None, str(arguments.get("profile") or "") or None, bool(arguments.get("sync", True)), bool(arguments.get("local_only")))
     if name == "memory_ingest":
         if "session" not in arguments:
             raise ValueError("memory_ingest requires session")

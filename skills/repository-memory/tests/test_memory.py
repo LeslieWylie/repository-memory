@@ -684,6 +684,7 @@ class RepositoryMemoryTest(unittest.TestCase):
             str(openclaw_config),
             "--source-root",
             str(self.alpha),
+            "--source-local-only",
             "--json",
         ], text=True, capture_output=True, check=True, env=environment)
         report = json.loads(installed.stdout)
@@ -693,6 +694,8 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertTrue((machine / ".claude" / "skills" / "repository-memory" / "SKILL.md").is_file())
         self.assertTrue(all((workspace / "skills" / "repository-memory" / "SKILL.md").is_file() for workspace in workspaces))
         configured = json.loads(openclaw_config.read_text(encoding="utf-8"))
+        user_config = json.loads((machine / "config" / "repository-memory" / "config.json").read_text(encoding="utf-8"))
+        self.assertTrue(user_config["sources"][0]["local_only"])
         self.assertIn("repository-memory", configured["mcp"]["servers"])
         self.assertEqual(
             Path(configured["plugins"]["load"]["paths"][0]),

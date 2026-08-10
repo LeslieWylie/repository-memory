@@ -328,7 +328,7 @@ def _install_cli(canonical: Path) -> Path:
     return destination
 
 
-def _configure_source(canonical: Path, source_root: Path) -> dict[str, Any]:
+def _configure_source(canonical: Path, source_root: Path, local_only: bool = False) -> dict[str, Any]:
     command = [
         sys.executable,
         str(canonical / "scripts" / "repository-memory.py"),
@@ -339,6 +339,8 @@ def _configure_source(canonical: Path, source_root: Path) -> dict[str, Any]:
         source_root.name,
         "--json",
     ]
+    if local_only:
+        command.insert(-1, "--local-only")
     ok, output = _run(command)
     if not ok:
         raise RuntimeError(f"source initialization failed: {output[:500]}")
@@ -458,7 +460,7 @@ def install(args: argparse.Namespace) -> dict[str, Any]:
 
     source_status = None
     if args.source_root:
-        source_status = _configure_source(canonical, Path(args.source_root).expanduser().resolve())
+        source_status = _configure_source(canonical, Path(args.source_root).expanduser().resolve(), args.source_local_only)
     verification = None if args.no_verify else _verify(canonical, require_repository=bool(args.source_root))
     return {
         "schema_version": 1,
@@ -478,6 +480,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--target", action="append", choices=["auto", "all", "codex", "claude", "openclaw"])
     value.add_argument("--all", action="store_true", help="install for Codex, Claude Code, and every configured OpenClaw agent")
     value.add_argument("--source-root", help="register and index a repository or document directory")
+    value.add_argument("--source-local-only", action="store_true", help="declare --source-root as an intentional offline/local snapshot")
     value.add_argument("--openclaw-config", help="override the OpenClaw config path")
     value.add_argument("--openclaw-agent", action="append", help="agent id allowed to auto-capture; omit to allow all configured agents")
     value.add_argument("--no-mcp", action="store_true", help="install Skills without registering Codex/Claude MCP")
