@@ -10,6 +10,7 @@ const api = {
   pluginConfig: {
     enabled: true,
     guardEnabled: true,
+    enforcement: "enforce",
     agentIds: ["yaole"],
     auditPath: join(auditDir, "audit.jsonl"),
     runtime: "does-not-run-in-this-test",
@@ -124,6 +125,28 @@ await hooks.get("after_tool_call")({ toolName: "repository-memory__memory_search
 await hooks.get("before_tool_call")({ toolName: "repository-memory__memory_get", params: { id: "source:eval.md" } }, weakReceiptCtx);
 const weakReceipt = await hooks.get("before_agent_finalize")({ finalText: "来源是评测报告，结果是 90%" }, weakReceiptCtx);
 assert.equal(weakReceipt.action, "revise");
+
+// Operational default: audit routing/citation violations without deadlocking
+// useful diagnostics when a backend is slow or incomplete.
+const auditCtx = { agentId: "yaole", sessionKey: "audit-1" };
+const auditHooks = new Map();
+const auditApi = {
+  pluginConfig: {
+    enabled: true,
+    guardEnabled: true,
+    enforcement: "audit",
+    agentIds: ["yaole"],
+    auditPath: join(auditDir, "audit-mode.jsonl"),
+  },
+  logger: { info() {}, warn() {} },
+  on(name, handler) { auditHooks.set(name, handler); },
+};
+plugin.register(auditApi);
+await auditHooks.get("before_agent_run")({ prompt: "查询评测结果" }, auditCtx);
+assert.equal(await auditHooks.get("before_tool_call")({ toolName: "exec", params: { command: "cat report.md" } }, auditCtx), undefined);
+assert.equal(await auditHooks.get("before_tool_call")({ toolName: "repository-memory__memory_search", params: { query: "eval" } }, auditCtx), undefined);
+const auditFinalize = await auditHooks.get("before_agent_finalize")({ finalText: "结果待核实" }, auditCtx);
+assert.equal(auditFinalize, undefined);
 
 const audit = await readFile(join(auditDir, "audit.jsonl"), "utf8");
 assert.match(audit, /tool_blocked/);

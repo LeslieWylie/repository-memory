@@ -177,6 +177,7 @@ def _openclaw_routing() -> dict[str, Any]:
     autocapture = entries.get("repository-memory-autocapture") if isinstance(entries.get("repository-memory-autocapture"), dict) else {}
     autocapture_config = autocapture.get("config") if isinstance(autocapture.get("config"), dict) else {}
     guard_enabled = autocapture.get("enabled") is not False and autocapture_config.get("enabled") is not False and autocapture_config.get("guardEnabled") is True
+    enforcement = autocapture_config.get("enforcement") if autocapture_config.get("enforcement") in {"audit", "enforce"} else "audit"
     allowed_agents = autocapture_config.get("agentIds")
     if not isinstance(allowed_agents, list) or not all(isinstance(item, str) for item in allowed_agents):
         allowed_agents = []
@@ -187,15 +188,16 @@ def _openclaw_routing() -> dict[str, Any]:
     active_status = "disabled" if active_memory.get("enabled") is False else "enabled"
     legacy_status = "disabled" if memmy.get("enabled") is False and plugins.get("slots", {}).get("memory") != "memmy-memory" else "legacy-active"
     coverage_ok = bool(configured_agents) and set(covered_agents) == set(configured_agents)
-    guard_status = "ready" if guard_enabled and coverage_ok else "partial" if guard_enabled else "disabled"
-    managed_ready = repository_mcp == "ready" and builtin_status == "disabled" and active_status == "disabled" and guard_status == "ready"
+    guard_status = "enforce" if guard_enabled and coverage_ok and enforcement == "enforce" else "audit" if guard_enabled and coverage_ok else "partial" if guard_enabled else "disabled"
+    managed_ready = repository_mcp == "ready" and builtin_status == "disabled" and active_status == "disabled" and guard_status in {"audit", "enforce"}
     return {
         "status": "ready" if managed_ready else "degraded",
         "managed": True,
         "repository_mcp": repository_mcp,
         "builtin_memory_search": builtin_status,
-        "direct_file_fallback": "blocked" if guard_status == "ready" else "host-dependent",
+        "direct_file_fallback": "blocked" if guard_status == "enforce" else "audited" if guard_status == "audit" else "host-dependent",
         "guard": guard_status,
+        "guard_enforcement": enforcement if guard_enabled else "disabled",
         "legacy_memory": legacy_status,
         "active_memory": active_status,
         "agents": {"configured": configured_agents, "covered": covered_agents},

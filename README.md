@@ -15,7 +15,8 @@ It ships as one generic Skill with a shared Python runtime:
 - a local stdio MCP server for Claude, Codex, OpenClaw, and other hosts;
 - an optional MemoryCore adapter for L0-L3 conversation memory;
 - an optional OpenClaw lifecycle extension for conservative post-turn capture;
-- a metadata-only audit proxy and a guard that can block direct-file bypasses.
+- a metadata-only audit proxy and an optional guard that audits by default and
+  can block direct-file bypasses in explicit enforcement mode.
 
 The repository itself is the source of truth. Indexes, snapshots, audit logs,
 conversation data, and credentials stay in user-level data/config/cache
@@ -161,8 +162,8 @@ server is not bound to a port.
 The OpenClaw extension is optional. It can:
 
 1. require the repository-memory MCP route for project-fact turns;
-2. block the bare built-in memory tool and direct-file fallback when the host
-   supports the relevant lifecycle hooks;
+2. audit the bare built-in memory tool and direct-file fallback by default, or
+   block them when explicit enforcement mode is enabled;
 3. audit tool metadata without storing full prompts or answers;
 4. capture bounded user/assistant text after a completed turn into L0;
 5. leave L2 as a reviewable candidate and never write L3 automatically.

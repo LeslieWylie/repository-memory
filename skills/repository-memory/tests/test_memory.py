@@ -703,6 +703,7 @@ class RepositoryMemoryTest(unittest.TestCase):
         )
         plugin = configured["plugins"]["entries"]["repository-memory-autocapture"]
         self.assertTrue(plugin["config"]["guardEnabled"])
+        self.assertEqual(plugin["config"]["enforcement"], "audit")
         self.assertTrue(plugin["hooks"]["allowConversationAccess"])
         self.assertFalse(configured["plugins"]["entries"]["rlvr-memory-autocapture"]["enabled"])
         for agent in configured["agents"]["list"]:

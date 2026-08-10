@@ -301,6 +301,7 @@ def _install_openclaw(canonical: Path, runtime: Path, config_path: Path | None =
         "config": {
             "enabled": True,
             "guardEnabled": True,
+            "enforcement": "audit",
             "runtime": str(runtime),
             "agentIds": sorted(set(agent_ids or [])),
         },
