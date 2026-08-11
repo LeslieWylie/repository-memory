@@ -33,16 +33,16 @@ Task context path:
 
 ```text
 memory_context
-  -> repository evidence retrieval
-  -> Team Memory retrieval (metadata filters + lexical/recency/reuse ranking)
-  -> sectioned context package
+  -> parallel repository and Team Memory recall
+  -> sectioned lexical context package
   -> agent
 ```
 
 The source adapter ranks within its own source. `memory_context` is the fusion
 seam, but it returns repository evidence, decisions, failures, solutions,
-discoveries, and handoffs as separate sections. Scores are not combined into
-an opaque global RRF score.
+discoveries, and handoffs as separate sections. The two recalls run in
+parallel, but scores are not combined into an opaque global RRF score. The
+accurate capability name is `multi-source-lexical`, not semantic hybrid.
 
 ## Freshness
 
@@ -89,6 +89,12 @@ explicit publish or bounded task-end extraction
   -> feedback and reuse ranking
   -> explicit supersede or stale transition
 ```
+
+The default Team Memory backend is a local SQLite adapter behind the
+`TeamMemoryBackend` interface. It enables same-host sharing and uses WAL,
+busy-timeout, and bounded transaction retries. Cross-host/container transfer
+is an explicit JSON bundle export/import operation; it is not silently called
+remote sync and no hosted service is claimed by the core runtime.
 
 ## MCP transport
 

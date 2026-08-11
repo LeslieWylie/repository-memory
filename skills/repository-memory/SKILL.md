@@ -62,7 +62,7 @@ explicitly requests a write.
 1. Run `doctor --json` before the first query or when the environment changes.
 2. If no source is configured, ask for or discover the user's intended knowledge directory, then run `init --path <directory> --json`. Repeat `source add --path <directory> --id <stable-id>` for additional repositories or document roots. This writes only user config and derived cache.
 3. Run `sync --json` when the doctor reports a missing/stale index or the source is not fresh.
-4. For a task that may benefit from prior agent work, call `memory_context(query)` first. It returns repository evidence plus shared decisions, failures, solutions, discoveries, and handoffs with separate provenance. Use `search "<question>" --scope repository --json` for a repository-only lookup, or `--scope memory` when the native conversation layers are explicitly needed.
+4. For a task that may benefit from prior agent work, call `memory_context(query)` first. It returns repository evidence plus shared decisions, failures, solutions, discoveries, and handoffs with separate provenance. Its current mode is `multi-source-lexical`: the lanes run in parallel but are not score-fused. Use `search "<question>" --scope repository --json` for a repository-only lookup, or `--scope memory` when the native conversation layers are explicitly needed.
 5. Inspect `verified`, `candidates`, `support`, `freshness`, and `diagnostics`; use `get` or `explain` for the complete evidence window and pass the result's citation `commit` when available.
 6. Cite only `verified` results with a valid citation. A verified document proves that the document citation is real; `support.claim_support=partial|unknown` means the answer must abstain from the unsupported part of a composite claim.
 
@@ -100,6 +100,9 @@ Normal use is read-only. Only run `memory_publish`, `memory_feedback`,
 an explicit task-end workflow asks for a write. New Team Memory defaults to
 `candidate`; promotion/replacement is explicit. Use the local stdio MCP
 entrypoint when the host exposes it; CLI and MCP return the same contract.
+When agents run on different hosts, use the explicit `team-export` and
+`team-import` bundle commands (or `memory_team_sync`) to transfer Team Memory;
+do not claim that a local SQLite file is automatically cross-machine shared.
 
 When the host exposes the audited MCP registration, tool calls are recorded as
 metadata-only request/response events. Treat `audit_verified` evidence from the

@@ -44,3 +44,9 @@ remains `lexical` and the response must still carry a valid citation.
 
 Agents should send the user's question as-is. A filename-shaped second query
 is not required and should not be used to hide a failed first retrieval.
+
+`memory_context` is the multi-source task-start path. Its repository and Team
+Memory lanes run in parallel, then return sectioned provenance. Its
+`retrieval_mode` is `multi-source-lexical` until a configured semantic backend
+actually exists; do not call it hybrid merely because two lexical sources are
+present.

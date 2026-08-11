@@ -132,7 +132,9 @@ marked `partial` or `unknown`.
 The runtime does not require embeddings. When no semantic provider is
 configured, doctor and search say `retrieval_mode=lexical` and
 `semantic_available=false`; this is a supported fallback, not a hidden
-semantic claim. No black-box cross-backend RRF is used.
+semantic claim. `memory_context` reports `retrieval_mode=multi-source-lexical`:
+repository and Team Memory recall run in parallel, then remain in separate
+provenance sections. No black-box cross-backend RRF is used.
 
 ## Shared Team Memory
 
@@ -146,9 +148,23 @@ memory_supersede   # explicit correction and lifecycle transition
 ```
 
 Records use the lifecycle `candidate -> active -> superseded|stale` and are
-stored in a user-level SQLite cache. They contain `type`, `scope`,
-`provenance`, `confidence`, `author_agent`, and reuse feedback. They are not a
-second Git repository and are never written into the canonical source tree.
+stored in a user-level SQLite cache. SQLite is the default backend behind a
+`TeamMemoryBackend` seam; it uses WAL, a bounded busy timeout, and retryable
+transactions for concurrent local agents. Records contain `type`, `scope`,
+`provenance`, `confidence`, `author_agent`, validity windows, and reuse
+feedback. They are not a second Git repository and are never written into the
+canonical source tree.
+
+For cross-machine or container handoff, use an explicit portable bundle:
+
+```bash
+repository-memory team-export --output /tmp/team-memory.json --json
+repository-memory team-import --input /tmp/team-memory.json --json
+```
+
+The bundle merge is idempotent and reports inserts, updates, conflicts, and
+feedback additions. This is explicit file-based synchronization; the public
+runtime does not pretend to provide a hosted Team Memory service.
 
 ## Four memory layers
 
@@ -186,6 +202,7 @@ memory_get
 memory_init       # explicit source setup
 memory_ingest     # explicit write
 memory_context    # task context: repository + Team Memory
+memory_team_sync  # explicit Team Memory bundle status/export/import
 memory_publish    # explicit shared memory write
 memory_feedback   # reuse feedback
 memory_supersede  # explicit correction

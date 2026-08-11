@@ -28,3 +28,17 @@ The set contains no private repository names, credentials, user data, or
 organization-specific labels. Add a new query and qrel together, explain the
 gold choice in the qrel's `reason`, and run the gate before changing a
 retrieval heuristic.
+
+The synthetic Team Memory fixture is separate from repository qrels. Run it
+with:
+
+```bash
+python skills/repository-memory/scripts/repository-memory.py team-evaluate \
+  --records eval/public/team_memory/records.jsonl \
+  --queries eval/public/team_memory/queries.jsonl \
+  --qrels eval/public/team_memory/qrels.jsonl --json
+```
+
+It measures Team Memory P@1, MRR@5, Recall@5, negative abstention, candidate
+contamination, and latency in a temporary database. It does not use or modify
+the user-level Team Memory store.

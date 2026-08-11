@@ -49,5 +49,6 @@ py-modules = [
   "repository_memory",
   "snapshot",
   "team_memory",
+  "team_memory_eval",
   "version",
 ]

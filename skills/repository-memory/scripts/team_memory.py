@@ -12,11 +12,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Protocol, TypeVar
 
 from discovery import data_root
 
@@ -31,6 +33,7 @@ STOP_WORDS = {
     "the", "and", "for", "with", "from", "this", "that", "what", "when", "where",
     "which", "about", "project", "memory", "team", "最近", "最近的", "之前", "怎么", "什么",
 }
+T = TypeVar("T")
 
 
 def _now() -> str:
@@ -58,16 +61,36 @@ def _terms(value: str) -> list[str]:
     return [term.casefold() for term in dict.fromkeys(raw) if term.casefold() not in STOP_WORDS]
 
 
-class TeamMemoryStore:
-    """Small deep module for shared knowledge lifecycle and retrieval."""
+class SQLiteTeamMemoryBackend:
+    """Local Team Memory adapter with lifecycle, retrieval, and sync semantics."""
 
     def __init__(self, path: Path | None = None):
-        self.path = path or (data_root() / "team-memory" / "team.sqlite3")
+        configured_path = str(os.environ.get("REPOSITORY_MEMORY_TEAM_DB") or "").strip()
+        self.path = path or (Path(configured_path).expanduser().resolve() if configured_path else data_root() / "team-memory" / "team.sqlite3")
 
-    def _connect(self) -> sqlite3.Connection:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.path)
-        connection.row_factory = sqlite3.Row
+    backend_name = "team-memory-sqlite"
+    _write_attempts = 6
+    _busy_timeout_ms = 5000
+
+    @staticmethod
+    def _locked(error: sqlite3.OperationalError) -> bool:
+        message = str(error).casefold()
+        return "locked" in message or "busy" in message
+
+    @staticmethod
+    def _expired(value: str | None, now: datetime | None = None) -> bool:
+        if not value:
+            return False
+        try:
+            expiry = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        current = now or datetime.now(timezone.utc)
+        return current >= expiry.astimezone(timezone.utc)
+
+    def _ensure_schema(self, connection: sqlite3.Connection) -> None:
         connection.execute(
             """CREATE TABLE IF NOT EXISTS memories (
                 id TEXT PRIMARY KEY,
@@ -106,13 +129,62 @@ class TeamMemoryStore:
             connection.execute("CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(id UNINDEXED, body)")
         except sqlite3.OperationalError:
             pass
-        connection.commit()
-        try:
-            self.path.chmod(0o600)
-        except OSError:
-            pass
-        return connection
 
+    def _connect(self) -> sqlite3.Connection:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        last_error: sqlite3.OperationalError | None = None
+        for attempt in range(self._write_attempts):
+            connection: sqlite3.Connection | None = None
+            try:
+                connection = sqlite3.connect(self.path, timeout=self._busy_timeout_ms / 1000)
+                connection.row_factory = sqlite3.Row
+                # WAL allows readers to continue while another agent publishes.
+                # busy_timeout plus the bounded write retry below makes the
+                # concurrency contract explicit instead of relying on sqlite's
+                # process defaults.
+                connection.execute("PRAGMA busy_timeout = 5000")
+                connection.execute("PRAGMA journal_mode = WAL")
+                connection.execute("PRAGMA synchronous = NORMAL")
+                self._ensure_schema(connection)
+                connection.commit()
+                try:
+                    self.path.chmod(0o600)
+                except OSError:
+                    pass
+                return connection
+            except sqlite3.OperationalError as error:
+                last_error = error
+                if connection is not None:
+                    connection.close()
+                if not self._locked(error) or attempt == self._write_attempts - 1:
+                    raise
+                time.sleep(0.02 * (attempt + 1))
+        raise last_error or sqlite3.OperationalError("unable to open Team Memory database")
+
+    def _write(self, operation: Callable[[sqlite3.Connection], T]) -> T:
+        """Run one bounded transaction for concurrent agent writers."""
+
+        last_error: sqlite3.OperationalError | None = None
+        for attempt in range(self._write_attempts):
+            connection: sqlite3.Connection | None = None
+            try:
+                connection = self._connect()
+                connection.execute("BEGIN IMMEDIATE")
+                value = operation(connection)
+                connection.commit()
+                return value
+            except sqlite3.OperationalError as error:
+                last_error = error
+                if connection is not None:
+                    connection.rollback()
+                    connection.close()
+                if not self._locked(error) or attempt == self._write_attempts - 1:
+                    raise
+                time.sleep(0.02 * (attempt + 1))
+            finally:
+                if connection is not None:
+                    connection.close()
+        raise last_error or sqlite3.OperationalError("Team Memory write failed")
     @staticmethod
     def _fts_available(connection: sqlite3.Connection) -> bool:
         try:
@@ -128,11 +200,13 @@ class TeamMemoryStore:
             by_status = {str(row[0]): int(row[1]) for row in connection.execute("SELECT status, COUNT(*) FROM memories GROUP BY status")}
             by_type = {str(row[0]): int(row[1]) for row in connection.execute("SELECT memory_type, COUNT(*) FROM memories GROUP BY memory_type")}
             feedback = int(connection.execute("SELECT COUNT(*) FROM memory_feedback").fetchone()[0])
+            active_expired = sum(1 for row in connection.execute("SELECT valid_until FROM memories WHERE status = 'active' AND valid_until IS NOT NULL") if self._expired(row[0]))
             fts = self._fts_available(connection)
         finally:
             connection.close()
         return {
-            "backend": "team-memory-sqlite",
+            "backend": self.backend_name,
+            "backend_kind": "local",
             "configured": True,
             "reachable": True,
             "status": "ready",
@@ -141,10 +215,13 @@ class TeamMemoryStore:
             "by_status": by_status,
             "by_type": by_type,
             "feedback_count": feedback,
+            "active_expired": active_expired,
             "index": "fts5" if fts else "sqlite-scan",
             "retrieval_strategy": "keyword-only",
             "semantic_available": False,
             "canonical_repo_changed": False,
+            "sync": {"export": True, "import": True, "remote_service": False},
+            "concurrency": {"journal_mode": "wal", "busy_timeout_ms": self._busy_timeout_ms, "write_retry_attempts": self._write_attempts},
         }
 
     @staticmethod
@@ -191,10 +268,13 @@ class TeamMemoryStore:
         negative = sum(1 for item in feedback_rows if item["rating"] in {"wrong", "stale", "not_helpful"})
         evidence_backed = bool(provenance.get("citations") or provenance.get("commits"))
         evidence_status = "evidence-backed" if evidence_backed else "experience-backed"
+        expired = self._expired(row["valid_until"])
         if row["status"] == "candidate":
             evidence_status = "candidate"
         elif row["status"] in {"stale", "superseded"}:
             evidence_status = row["status"]
+        elif expired:
+            evidence_status = "expired"
         return {
             "id": row["id"],
             "kind": row["memory_type"],
@@ -215,6 +295,7 @@ class TeamMemoryStore:
             "superseded_by": row["superseded_by"],
             "valid_from": row["valid_from"],
             "valid_until": row["valid_until"],
+            "expired": expired,
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "reuse": {"helpful": helpful, "negative": negative, "total": helpful + negative},
@@ -243,8 +324,7 @@ class TeamMemoryStore:
         supersedes = str(payload.get("supersedes") or "").strip() or None
         valid_from = str(payload.get("valid_from") or now)
         valid_until = str(payload.get("valid_until") or "") or None
-        connection = self._connect()
-        try:
+        def operation(connection: sqlite3.Connection) -> dict[str, Any]:
             existing = connection.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
             if existing:
                 return {"schema_version": 1, "ok": True, "duplicate": True, "memory": self._row(existing), "canonical_repo_changed": False}
@@ -261,11 +341,9 @@ class TeamMemoryStore:
             if self._fts_available(connection):
                 body = "\n".join((title, summary, content, _json(scope), _json(provenance)))
                 connection.execute("INSERT INTO memories_fts (id, body) VALUES (?, ?)", (memory_id, body))
-            connection.commit()
             row = connection.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
-        finally:
-            connection.close()
-        return {"schema_version": 1, "ok": True, "duplicate": False, "memory": self._row(row), "write_operation": "explicit", "canonical_repo_changed": False}
+            return {"schema_version": 1, "ok": True, "duplicate": False, "memory": self._row(row), "write_operation": "explicit", "canonical_repo_changed": False}
+        return self._write(operation)
 
     def get(self, memory_id: str, *, include_feedback: bool = True) -> dict[str, Any]:
         connection = self._connect()
@@ -297,8 +375,13 @@ class TeamMemoryStore:
         for item in feedback_rows:
             feedback_map.setdefault(str(item["memory_id"]), []).append(item)
         ranked: list[tuple[float, str, dict[str, Any]]] = []
+        expired_count = 0
+        now = datetime.now(timezone.utc)
         for row in rows:
             if row["status"] == "superseded" or row["status"] == "stale":
+                continue
+            if self._expired(row["valid_until"], now):
+                expired_count += 1
                 continue
             if row["status"] == "candidate" and not include_candidates:
                 continue
@@ -334,25 +417,131 @@ class TeamMemoryStore:
             "active": active,
             "candidates": candidates,
             "abstain": not active,
-            "diagnostics": {"result_count": len(active), "candidate_count": len(candidates), "query_terms": terms, "filters": {"repo": repo, "issue": issue, "branch": branch, "agent": agent}},
+            "diagnostics": {"result_count": len(active), "candidate_count": len(candidates), "expired_count": expired_count, "query_terms": terms, "filters": {"repo": repo, "issue": issue, "branch": branch, "agent": agent}},
         }
 
     def feedback(self, memory_id: str, rating: str, note: str = "", agent: str | None = None) -> dict[str, Any]:
         rating = str(rating).strip().lower()
         if rating not in RATINGS:
             raise ValueError(f"rating must be one of: {', '.join(sorted(RATINGS))}")
-        connection = self._connect()
-        try:
+        def operation(connection: sqlite3.Connection) -> dict[str, Any]:
             if connection.execute("SELECT 1 FROM memories WHERE id = ?", (memory_id,)).fetchone() is None:
                 raise KeyError(f"team memory not found: {memory_id}")
-            connection.execute("INSERT INTO memory_feedback (memory_id, rating, note, agent, created_at) VALUES (?, ?, ?, ?, ?)", (memory_id, rating, str(note)[:2000], agent, _now()))
+            created_at = _now()
+            connection.execute("INSERT INTO memory_feedback (memory_id, rating, note, agent, created_at) VALUES (?, ?, ?, ?, ?)", (memory_id, rating, str(note)[:2000], agent, created_at))
+            transition = None
             if rating in {"stale", "wrong"}:
-                connection.execute("UPDATE memories SET confidence = MAX(0, confidence - 0.1), updated_at = ? WHERE id = ?", (_now(), memory_id))
-            connection.commit()
+                now = _now()
+                connection.execute("UPDATE memories SET confidence = MAX(0, confidence - 0.1), updated_at = ? WHERE id = ?", (now, memory_id))
+                if rating == "wrong":
+                    connection.execute("UPDATE memories SET status = 'stale', updated_at = ? WHERE id = ? AND status NOT IN ('superseded', 'stale')", (now, memory_id))
+                    transition = "stale"
+                else:
+                    agents = {str(row[0]).strip() for row in connection.execute("SELECT DISTINCT agent FROM memory_feedback WHERE memory_id = ? AND rating = 'stale' AND agent IS NOT NULL AND TRIM(agent) != ''", (memory_id,))}
+                    if len(agents) >= 2:
+                        connection.execute("UPDATE memories SET status = 'stale', updated_at = ? WHERE id = ? AND status = 'active'", (now, memory_id))
+                        transition = "stale"
+            status_row = connection.execute("SELECT status FROM memories WHERE id = ?", (memory_id,)).fetchone()
+            return {"schema_version": 1, "ok": True, "memory_id": memory_id, "rating": rating, "status": status_row[0] if status_row else None, "lifecycle_transition": transition, "canonical_repo_changed": False}
+        return self._write(operation)
+
+    def export_bundle(self) -> dict[str, Any]:
+        """Return a portable, mergeable Team Memory bundle.
+
+        The bundle is intentionally plain JSON so it can move through rsync,
+        an artifact store, or a human-reviewed handoff without introducing a
+        network service or writing into a canonical repository.
+        """
+
+        connection = self._connect()
+        try:
+            records = [dict(row) for row in connection.execute("SELECT * FROM memories ORDER BY id").fetchall()]
+            feedback = [dict(row) for row in connection.execute("SELECT memory_id, rating, note, agent, created_at FROM memory_feedback ORDER BY memory_id, created_at, id").fetchall()]
         finally:
             connection.close()
-        return {"schema_version": 1, "ok": True, "memory_id": memory_id, "rating": rating, "canonical_repo_changed": False}
+        return {"schema_version": 1, "kind": "repository-memory-team-bundle", "backend": self.backend_name, "exported_at": _now(), "records": records, "feedback": feedback}
+
+    def import_bundle(self, bundle: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(bundle, dict) or bundle.get("kind") != "repository-memory-team-bundle":
+            raise ValueError("invalid Team Memory bundle")
+        records = bundle.get("records") if isinstance(bundle.get("records"), list) else []
+        feedback = bundle.get("feedback") if isinstance(bundle.get("feedback"), list) else []
+
+        def operation(connection: sqlite3.Connection) -> dict[str, Any]:
+            inserted = updated = skipped = conflicts = feedback_added = 0
+            for incoming in records:
+                if not isinstance(incoming, dict) or not str(incoming.get("id") or "").startswith("team:"):
+                    raise ValueError("Team Memory bundle contains an invalid record")
+                record = {key: incoming.get(key) for key in ("id", "memory_type", "title", "content", "summary", "scope", "provenance", "confidence", "status", "supersedes", "superseded_by", "valid_from", "valid_until", "author_agent", "idempotency_key", "created_at", "updated_at")}
+                if not all(record.get(key) is not None for key in ("id", "memory_type", "title", "content", "summary", "scope", "provenance", "confidence", "status", "created_at", "updated_at")):
+                    raise ValueError(f"Team Memory record is incomplete: {record.get('id')}")
+                if record["memory_type"] not in MEMORY_TYPES or record["status"] not in STATUSES:
+                    raise ValueError(f"Team Memory record has an unsupported type/status: {record.get('id')}")
+                if SECRET_CONTENT.search(f"{record['title']}\n{record['content']}"):
+                    raise ValueError(f"Team Memory record contains a secret-like value: {record.get('id')}")
+                existing = connection.execute("SELECT * FROM memories WHERE id = ?", (record["id"],)).fetchone()
+                if existing is None:
+                    connection.execute(
+                        """INSERT INTO memories (id, memory_type, title, content, summary, scope, provenance, confidence, status, supersedes, superseded_by, valid_from, valid_until, author_agent, idempotency_key, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        tuple(record[key] for key in ("id", "memory_type", "title", "content", "summary", "scope", "provenance", "confidence", "status", "supersedes", "superseded_by", "valid_from", "valid_until", "author_agent", "idempotency_key", "created_at", "updated_at")),
+                    )
+                    if self._fts_available(connection):
+                        body = "\n".join((str(record["title"]), str(record["summary"]), str(record["content"]), str(record["scope"]), str(record["provenance"])))
+                        connection.execute("INSERT OR REPLACE INTO memories_fts (id, body) VALUES (?, ?)", (record["id"], body))
+                    inserted += 1
+                elif str(record["updated_at"]) > str(existing["updated_at"]):
+                    connection.execute(
+                        """UPDATE memories SET memory_type=?, title=?, content=?, summary=?, scope=?, provenance=?, confidence=?, status=?, supersedes=?, superseded_by=?, valid_from=?, valid_until=?, author_agent=?, idempotency_key=?, created_at=?, updated_at=? WHERE id=?""",
+                        tuple(record[key] for key in ("memory_type", "title", "content", "summary", "scope", "provenance", "confidence", "status", "supersedes", "superseded_by", "valid_from", "valid_until", "author_agent", "idempotency_key", "created_at", "updated_at")) + (record["id"],),
+                    )
+                    if self._fts_available(connection):
+                        connection.execute("DELETE FROM memories_fts WHERE id = ?", (record["id"],))
+                        body = "\n".join((str(record["title"]), str(record["summary"]), str(record["content"]), str(record["scope"]), str(record["provenance"])))
+                        connection.execute("INSERT INTO memories_fts (id, body) VALUES (?, ?)", (record["id"], body))
+                    updated += 1
+                elif any(existing[key] != record[key] for key in ("content", "status", "updated_at")):
+                    conflicts += 1
+                else:
+                    skipped += 1
+            for item in feedback:
+                if not isinstance(item, dict) or not item.get("memory_id"):
+                    continue
+                exists = connection.execute(
+                    "SELECT 1 FROM memory_feedback WHERE memory_id = ? AND rating = ? AND note = ? AND COALESCE(agent, '') = COALESCE(?, '') AND created_at = ?",
+                    (item.get("memory_id"), item.get("rating"), item.get("note") or "", item.get("agent"), item.get("created_at")),
+                ).fetchone()
+                if exists:
+                    continue
+                connection.execute("INSERT INTO memory_feedback (memory_id, rating, note, agent, created_at) VALUES (?, ?, ?, ?, ?)", (item.get("memory_id"), item.get("rating"), item.get("note") or "", item.get("agent"), item.get("created_at") or _now()))
+                feedback_added += 1
+            return {"inserted": inserted, "updated": updated, "skipped": skipped, "conflicts": conflicts, "feedback_added": feedback_added}
+
+        result = self._write(operation)
+        return {"schema_version": 1, "ok": True, "imported": result, "canonical_repo_changed": False}
+
+
+TeamMemoryStore = SQLiteTeamMemoryBackend
+
+
+class TeamMemoryBackend(Protocol):
+    """Stable seam used by the runtime; concrete storage stays behind it."""
+
+    def health(self) -> dict[str, Any]: ...
+    def publish(self, payload: dict[str, Any], *, default_status: str = "candidate") -> dict[str, Any]: ...
+    def get(self, memory_id: str, *, include_feedback: bool = True) -> dict[str, Any]: ...
+    def search(self, query: str, *, limit: int = 10, repo: str | None = None, issue: str | None = None, branch: str | None = None, agent: str | None = None, include_candidates: bool = True) -> dict[str, Any]: ...
+    def feedback(self, memory_id: str, rating: str, note: str = "", agent: str | None = None) -> dict[str, Any]: ...
+    def export_bundle(self) -> dict[str, Any]: ...
+    def import_bundle(self, bundle: dict[str, Any]) -> dict[str, Any]: ...
+
+
+def team_memory_backend() -> TeamMemoryBackend:
+    backend = str(os.environ.get("REPOSITORY_MEMORY_TEAM_BACKEND") or "sqlite").strip().lower()
+    if backend not in {"sqlite", ""}:
+        raise RuntimeError(f"unsupported Team Memory backend '{backend}'; supported backend: sqlite")
+    return SQLiteTeamMemoryBackend()
 
 
 def team_memory_store() -> TeamMemoryStore:
-    return TeamMemoryStore()
+    return team_memory_backend()  # type: ignore[return-value]

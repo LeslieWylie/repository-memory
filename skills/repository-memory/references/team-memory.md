@@ -40,8 +40,31 @@ candidate -> active -> superseded
 prevents a later correction from competing with an obsolete decision.
 
 `memory_feedback` accepts `helpful`, `not_helpful`, `stale`, or `wrong`. The
-feedback affects reuse ranking and lowers confidence for stale/wrong reports;
-it does not silently rewrite the content.
+feedback affects reuse ranking and lowers confidence for stale/wrong reports.
+`wrong` immediately marks an active record stale. Two stale reports from
+different named agents mark an active record stale; one report only applies a
+penalty. Expired `valid_until` records are excluded from recall and reported
+as expired by diagnostics.
+
+## Backend and synchronization
+
+The runtime calls a small `TeamMemoryBackend` interface. SQLite is the default
+local implementation and is configured through the user data directory (or an
+explicit user-level database path). It uses WAL, a five-second busy timeout,
+and bounded write retries, so task-end capture, publish, and feedback can
+share one host without treating `database is locked` as a normal outcome.
+
+Use explicit portable bundle operations when agents run in different
+containers or machines:
+
+```text
+team-export --output <bundle.json>
+team-import --input <bundle.json>
+```
+
+Import is an idempotent merge keyed by stable memory id and updated timestamp;
+it reports conflicts instead of silently choosing incompatible equal-version
+content. This is file-based synchronization, not a hosted database service.
 
 ## Context hydration
 
@@ -54,8 +77,9 @@ returns a single package with these sections:
   experience-backed records with their own provenance;
 - `repository_candidates` and `team_candidates`: leads that must not be stated
   as facts without checking;
-- `diagnostics`: lexical/semantic capability, counts, and the explicit
-  no-score-fusion policy.
+- `diagnostics`: lexical/semantic capability, counts, parallel recall, and the
+  explicit no-score-fusion policy. The current context mode is
+  `multi-source-lexical`; it is not an embedding-backed hybrid retriever.
 
 The package is a retrieval fusion seam, not a black-box RRF score. A Git
 citation remains a Git citation; an experience record remains an experience

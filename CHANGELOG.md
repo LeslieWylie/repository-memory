@@ -11,6 +11,12 @@ revision is a separate compatibility identifier; see
 - Add shared Team Memory with explicit publish, context hydration, feedback,
   supersede lifecycle, and reusable decision/failure/discovery/solution/handoff
   records.
+- Add a replaceable `TeamMemoryBackend` seam, SQLite WAL/busy-timeout/retry
+  behavior, validity-window filtering, stale/wrong lifecycle transitions, and
+  explicit portable Team Memory export/import bundles.
+- Rename context retrieval from `hybrid-lexical` to the accurate
+  `multi-source-lexical`; repository and Team Memory recall run in parallel but
+  keep scores and provenance separate.
 - Change the OpenClaw guard to advisory/output-audit behavior; it no longer
   blocks normal file, shell, Git, test, or debugging tools.
 - Strengthen evaluator qrels validation, citation commit pinning, and

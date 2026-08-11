@@ -22,6 +22,7 @@ from fallback import paths, query_terms
 from memorycore import MemoryCoreClient, MemoryCoreConfig
 from mcp_server import SERVER_VERSION
 from snapshot import _snapshot_lock, prepare_view, snapshot_lock_backend
+from team_memory import TeamMemoryStore
 from version import VERSION
 
 from models import SourceSpec
@@ -309,7 +310,8 @@ class RepositoryMemoryTest(unittest.TestCase):
         context = core.memory_context(None, "isolated worktree Atlas evidence", repo="alpha")
         self.assertTrue(context["context"]["repository_evidence"])
         self.assertEqual(context["context"]["decisions"][0]["id"], memory["id"])
-        self.assertEqual(context["retrieval_mode"], "hybrid-lexical")
+        self.assertEqual(context["retrieval_mode"], "multi-source-lexical")
+        self.assertTrue(context["diagnostics"]["parallel_recall"])
         self.assertFalse(context["semantic_available"])
 
         feedback = core.feedback(None, memory["id"], "reused successfully", "helpful")
@@ -327,6 +329,87 @@ class RepositoryMemoryTest(unittest.TestCase):
         replacement_id = superseded["replacement"]["memory"]["id"]
         self.assertEqual(core.get_result(None, memory["id"])["result"]["status"], "superseded")
         self.assertEqual(core.get_result(None, replacement_id)["result"]["status"], "active")
+
+    def test_team_memory_expiry_and_feedback_update_lifecycle(self):
+        store = TeamMemoryStore(Path(self.temp.name) / "expiry.sqlite3")
+        expired = store.publish({
+            "type": "decision",
+            "title": "Temporary decision",
+            "content": "Use the temporary runner until the migration finishes.",
+            "status": "active",
+            "valid_until": "2000-01-01T00:00:00+00:00",
+        }, default_status="active")
+        memory_id = expired["memory"]["id"]
+        search = store.search("temporary runner")
+        self.assertEqual(search["active"], [])
+        self.assertEqual(search["diagnostics"]["expired_count"], 1)
+        self.assertTrue(store.get(memory_id)["result"]["expired"])
+        self.assertEqual(store.feedback(memory_id, "wrong", "review rejected", agent="reviewer")["status"], "stale")
+
+        fresh = store.publish({
+            "type": "handoff",
+            "title": "Fresh handoff",
+            "content": "The isolated worktree is ready for the next agent.",
+            "status": "active",
+        }, default_status="active")
+        fresh_id = fresh["memory"]["id"]
+        self.assertEqual(store.feedback(fresh_id, "stale", "old from my lane", agent="agent-a")["status"], "active")
+        self.assertEqual(store.feedback(fresh_id, "stale", "confirmed old", agent="agent-b")["status"], "stale")
+
+    def test_team_memory_concurrent_writers_and_bundle_round_trip(self):
+        path = Path(self.temp.name) / "shared.sqlite3"
+
+        def publish(index: int):
+            return TeamMemoryStore(path).publish({
+                "type": "discovery",
+                "title": f"Concurrent discovery {index}",
+                "content": f"Agent {index} found the shared writer path.",
+                "status": "active",
+                "idempotency_key": f"concurrent-{index}",
+                "author_agent": f"agent-{index}",
+            }, default_status="active")
+
+        errors = []
+        results = []
+
+        def worker(index: int):
+            try:
+                results.append(publish(index))
+            except Exception as exc:  # pragma: no cover - failure is asserted below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(index,)) for index in range(20)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5)
+        self.assertFalse(errors, errors)
+        self.assertEqual(len(results), 20)
+        self.assertEqual(TeamMemoryStore(path).health()["record_count"], 20)
+
+        os.environ["REPOSITORY_MEMORY_TEAM_DB"] = str(path)
+        bundle_path = Path(self.temp.name) / "team-bundle.json"
+        exported = core.export_team_memory(str(bundle_path))
+        self.assertEqual(exported["records"], 20)
+        imported_db = Path(self.temp.name) / "imported.sqlite3"
+        os.environ["REPOSITORY_MEMORY_TEAM_DB"] = str(imported_db)
+        imported = core.import_team_memory(str(bundle_path))
+        self.assertEqual(imported["imported"]["inserted"], 20)
+        self.assertEqual(TeamMemoryStore(imported_db).health()["record_count"], 20)
+
+    def test_team_memory_public_benchmark_is_isolated_and_measures_top1(self):
+        from team_memory_eval import evaluate_team_memory
+
+        root = Path(__file__).resolve().parents[3]
+        report = evaluate_team_memory(
+            root / "eval/public/team_memory/records.jsonl",
+            root / "eval/public/team_memory/queries.jsonl",
+            root / "eval/public/team_memory/qrels.jsonl",
+        )
+        self.assertEqual(report["metrics"]["precision_at_1"], 1.0)
+        self.assertEqual(report["metrics"]["recall_at_5"], 1.0)
+        self.assertEqual(report["metrics"]["negative_abstain_accuracy"], 1.0)
+        self.assertFalse(report["canonical_repo_changed"])
 
 
     def test_mcp_stdio_matches_cli_contract(self):
@@ -349,7 +432,7 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(responses[0]["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "repository-memory")
         self.assertEqual(responses[0]["result"]["resultType"], "complete")
         self.assertEqual(responses[1]["result"]["resultType"], "complete")
-        self.assertEqual({tool["name"] for tool in responses[1]["result"]["tools"]}, {"memory_doctor", "memory_sync", "memory_search", "memory_get", "memory_init", "memory_ingest", "memory_context", "memory_publish", "memory_feedback", "memory_supersede"})
+        self.assertEqual({tool["name"] for tool in responses[1]["result"]["tools"]}, {"memory_doctor", "memory_sync", "memory_search", "memory_get", "memory_init", "memory_ingest", "memory_context", "memory_team_sync", "memory_publish", "memory_feedback", "memory_supersede"})
         payload = responses[2]["result"]["structuredContent"]
         self.assertEqual(responses[2]["result"]["resultType"], "complete")
         self.assertIn("verified", payload)

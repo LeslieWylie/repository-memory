@@ -39,8 +39,11 @@ repository-memory feedback "<result-id>" --note "..." --json
 repository-memory promote --input <file> --json
 repository-memory ingest-session --input <json-or-jsonl> --json
 repository-memory capture-turn --input <bounded-turn.json> --json  # lifecycle adapter only
+repository-memory team-export --output <bundle.json> --json
+repository-memory team-import --input <bundle.json> --json
 repository-memory memorycore promote-l3 --candidate <autocapture:L2:id> --accept --json
 repository-memory evaluate --queries <queries.jsonl> --qrels <qrels.jsonl> [--revision <commit>] [--scope repository|memory|all] --json
+repository-memory team-evaluate --records <records.jsonl> --queries <queries.jsonl> --qrels <qrels.jsonl> --json
 repository-memory memorycore configure|start|stop|status
 repository-memory mcp
 ```
@@ -62,6 +65,11 @@ memory_search
 memory_get
 memory_init
 memory_ingest
+memory_context
+memory_team_sync
+memory_publish
+memory_feedback
+memory_supersede
 ```
 
 `memory_init` registers a user-provided knowledge directory and builds a
@@ -70,6 +78,11 @@ sources; source IDs are stable handles, not assumptions about a particular
 repository. It never edits canonical documents. `memory_ingest` is an explicit
 write and accepts a session object or JSONL value; it is not part of ordinary
 retrieval.
+
+`team-export`/`team-import` and `memory_team_sync` move the user-level Team
+Memory plane as an explicit JSON bundle. They are idempotent merge operations,
+not repository snapshot sync and not a claim that a hosted cross-machine
+service exists.
 
 The native ingest response is intentionally conservative: it can verify the
 durable L0 conversation write while reporting L1 extraction as `pending` or

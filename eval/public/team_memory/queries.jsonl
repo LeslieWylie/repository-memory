@@ -1,0 +1,5 @@
+{"id":"tm-decision","query":"isolated worktree branch issue","intent":"decision"}
+{"id":"tm-failure","query":"concurrent database lock WAL retry","intent":"failure"}
+{"id":"tm-solution","query":"export import bundle next machine","intent":"solution"}
+{"id":"tm-handoff","query":"runner ready next agent branch","intent":"handoff"}
+{"id":"tm-negative","query":"ZZZQWE fictional memory","intent":"negative","expected_abstain":true}

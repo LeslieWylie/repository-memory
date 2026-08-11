@@ -1,0 +1,4 @@
+{"query_id":"tm-decision","memory_id":"team:decision:isolated-worktree","relevance":2,"reason":"The decision record directly covers isolated worktrees and branches."}
+{"query_id":"tm-failure","memory_id":"team:failure:sqlite-lock","relevance":2,"reason":"The failure record directly covers concurrent SQLite locks and retry."}
+{"query_id":"tm-solution","memory_id":"team:solution:portable-bundle","relevance":2,"reason":"The solution record directly covers bundle export and import across machines."}
+{"query_id":"tm-handoff","memory_id":"team:handoff:runner","relevance":2,"reason":"The handoff directly covers the runner and next agent."}

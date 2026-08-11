@@ -16,6 +16,7 @@ import os
 import re
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -1195,6 +1196,35 @@ def publish_memory(input_path: str, *, status: str | None = None) -> dict[str, A
     return {"schema_version": SCHEMA_VERSION, "ok": True, "published": written, "count": len(written), "canonical_repo_changed": False}
 
 
+def export_team_memory(output_path: str) -> dict[str, Any]:
+    """Export the user-level Team Memory plane as an explicit sync bundle."""
+
+    destination = Path(output_path).expanduser().resolve()
+    bundle = team_memory_store().export_bundle()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(bundle, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, destination)
+    try:
+        destination.chmod(0o600)
+    except OSError:
+        pass
+    return {"schema_version": SCHEMA_VERSION, "ok": True, "operation": "team-memory-export", "path": str(destination), "records": len(bundle.get("records", [])), "feedback": len(bundle.get("feedback", [])), "canonical_repo_changed": False}
+
+
+def import_team_memory(input_path: str) -> dict[str, Any]:
+    """Merge an explicit Team Memory bundle into the configured backend."""
+
+    source = Path(input_path).expanduser().resolve()
+    try:
+        bundle = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid Team Memory bundle: {source}") from exc
+    result = team_memory_store().import_bundle(bundle)
+    result.update({"operation": "team-memory-import", "path": str(source)})
+    return result
+
+
 def supersede_memory(memory_id: str, input_path: str) -> dict[str, Any]:
     store = team_memory_store()
     store.get(memory_id)
@@ -1230,8 +1260,14 @@ def memory_context(
     provenance.  No cross-backend score is invented.
     """
 
-    repository = search(root, query, limit=limit, source_id=source_id, local=local, scope="repository")
-    team = team_memory_store().search(query, limit=limit, repo=repo, issue=issue, branch=branch, agent=agent)
+    # Query normalization is shared, but the two retrieval lanes run in
+    # parallel.  They remain separate after recall: scores and provenance are
+    # never mixed into an opaque cross-backend ranking.
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="memory-context") as pool:
+        repository_future = pool.submit(search, root, query, limit, False, source_id, local, "repository")
+        team_future = pool.submit(team_memory_store().search, query, limit=limit, repo=repo, issue=issue, branch=branch, agent=agent)
+        repository = repository_future.result()
+        team = team_future.result()
     active = team.get("active", []) if isinstance(team, dict) else []
     candidates = team.get("candidates", []) if isinstance(team, dict) else []
     grouped: dict[str, list[dict[str, Any]]] = {memory_type: [] for memory_type in ("evidence", "decision", "discovery", "failure", "solution", "handoff")}
@@ -1241,7 +1277,8 @@ def memory_context(
         "schema_version": SCHEMA_VERSION,
         "query": query,
         "mode": classify(query),
-        "retrieval_mode": "hybrid-lexical",
+        "retrieval_mode": "multi-source-lexical",
+        "retrieval_strategy": "sectioned-lexical",
         "semantic_available": False,
         "abstain": not repository.get("verified") and not active,
         "context": {
@@ -1259,6 +1296,7 @@ def memory_context(
         "freshness": repository.get("freshness", {}),
         "diagnostics": {
             "fusion": "sectioned-provenance; repository and team scores are not mixed",
+            "parallel_recall": True,
             "repository_verified": len(repository.get("verified", [])),
             "repository_candidates": len(repository.get("candidates", [])),
             "team_active": len(active),
@@ -1267,7 +1305,7 @@ def memory_context(
             "repository": repository.get("diagnostics", {}),
             "semantic_available": False,
         },
-        "sources": {"repository": repository, "team_memory": {"backend": "team-memory-sqlite", "retrieval_mode": "lexical"}},
+        "sources": {"repository": repository, "team_memory": {**team_memory_store().health(), "retrieval_mode": "lexical"}},
     }
 
 
@@ -1290,6 +1328,8 @@ def build_parser() -> argparse.ArgumentParser:
     feedback_parser = common("feedback"); feedback_parser.add_argument("result_id"); feedback_parser.add_argument("--note", required=True); feedback_parser.add_argument("--rating"); feedback_parser.add_argument("--json", action="store_true")
     promote_parser = common("promote"); promote_parser.add_argument("--input", required=True); promote_parser.add_argument("--json", action="store_true")
     publish_parser = common("publish"); publish_parser.add_argument("--input", required=True); publish_parser.add_argument("--status", choices=("candidate", "active"), default="candidate"); publish_parser.add_argument("--json", action="store_true")
+    export_parser = common("team-export"); export_parser.add_argument("--output", required=True); export_parser.add_argument("--json", action="store_true")
+    import_parser = common("team-import"); import_parser.add_argument("--input", required=True); import_parser.add_argument("--json", action="store_true")
     context_parser = common("context"); context_parser.add_argument("query"); context_parser.add_argument("--limit", type=int, default=5); context_parser.add_argument("--repo"); context_parser.add_argument("--issue"); context_parser.add_argument("--branch"); context_parser.add_argument("--agent"); context_parser.add_argument("--local", action="store_true"); context_parser.add_argument("--json", action="store_true")
     supersede_parser = common("supersede"); supersede_parser.add_argument("--id", required=True); supersede_parser.add_argument("--input", required=True); supersede_parser.add_argument("--json", action="store_true")
     ingest_parser = common("ingest-session"); ingest_parser.add_argument("--input", required=True); ingest_parser.add_argument("--json", action="store_true")
@@ -1297,6 +1337,7 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser = sub.add_parser("init"); init_parser.add_argument("--path", required=True); init_parser.add_argument("--id", dest="source_id"); init_parser.add_argument("--repository"); init_parser.add_argument("--profile"); init_parser.add_argument("--local-only", action="store_true"); init_parser.add_argument("--no-sync", action="store_true"); init_parser.add_argument("--json", action="store_true")
     source_parser = sub.add_parser("source"); source_parser.add_argument("action", choices=("add", "list", "remove")); source_parser.add_argument("--path"); source_parser.add_argument("--id", dest="source_id"); source_parser.add_argument("--repository"); source_parser.add_argument("--profile"); source_parser.add_argument("--local-only", action="store_true"); source_parser.add_argument("--no-sync", action="store_true"); source_parser.add_argument("--json", action="store_true")
     evaluate_parser = common("evaluate"); evaluate_parser.add_argument("--queries", required=True); evaluate_parser.add_argument("--qrels", required=True); evaluate_parser.add_argument("--limit", type=int, default=5); evaluate_parser.add_argument("--deep", action="store_true"); evaluate_parser.add_argument("--local", action="store_true"); evaluate_parser.add_argument("--scope", choices=("repository", "memory", "all"), default="repository"); evaluate_parser.add_argument("--revision"); evaluate_parser.add_argument("--fallback-only", action="store_true"); evaluate_parser.add_argument("--json", action="store_true")
+    team_evaluate_parser = common("team-evaluate"); team_evaluate_parser.add_argument("--records", required=True); team_evaluate_parser.add_argument("--queries", required=True); team_evaluate_parser.add_argument("--qrels", required=True); team_evaluate_parser.add_argument("--limit", type=int, default=5); team_evaluate_parser.add_argument("--json", action="store_true")
     memorycore = sub.add_parser("memorycore")
     memorycore.add_argument("action", choices=["configure", "install", "start", "stop", "status", "promote-l3"])
     memorycore.add_argument("--memorycore-root")
@@ -1327,6 +1368,19 @@ def _mcp_dispatch(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         return get_result(root, str(arguments.get("id") or ""), expected_commit=str(arguments.get("commit") or "") or None)
     if name == "memory_context":
         return memory_context(root, str(arguments.get("query") or ""), limit=int(arguments.get("limit") or 5), source_id=source, repo=str(arguments.get("repo") or "") or None, issue=str(arguments.get("issue") or "") or None, branch=str(arguments.get("branch") or "") or None, agent=str(arguments.get("agent") or "") or None, local=bool(arguments.get("local")))
+    if name == "memory_team_sync":
+        mode = str(arguments.get("mode") or "status").lower()
+        if mode == "export":
+            output = str(arguments.get("output") or "").strip()
+            if not output:
+                raise ValueError("memory_team_sync export requires output")
+            return export_team_memory(output)
+        if mode == "import":
+            source_path = str(arguments.get("input") or "").strip()
+            if not source_path:
+                raise ValueError("memory_team_sync import requires input")
+            return import_team_memory(source_path)
+        return {"schema_version": SCHEMA_VERSION, "ok": True, "operation": "team-memory-status", "backend": team_memory_store().health(), "canonical_repo_changed": False}
     if name == "memory_publish":
         if "memory" not in arguments:
             raise ValueError("memory_publish requires memory")
@@ -1379,7 +1433,7 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
                     arguments = {**arguments, "root": configured_root}
                 return _mcp_dispatch(name, arguments)
             return serve(dispatch)
-        root = None if args.command in {"init", "source", "doctor", "sync", "search", "get", "explain", "feedback", "promote", "publish", "context", "supersede", "ingest-session", "capture-turn"} else resolve_root(root_arg)
+        root = None if args.command in {"init", "source", "doctor", "sync", "search", "get", "explain", "feedback", "promote", "publish", "team-export", "team-import", "team-evaluate", "context", "supersede", "ingest-session", "capture-turn"} else resolve_root(root_arg)
         if args.command in {"init", "source"} and root_arg:
             root = resolve_root(root_arg)
         if args.command == "doctor":
@@ -1398,6 +1452,14 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
             value = promote(root, args.input)
         elif args.command == "publish":
             value = publish_memory(args.input, status=args.status)
+        elif args.command == "team-export":
+            value = export_team_memory(args.output)
+        elif args.command == "team-import":
+            value = import_team_memory(args.input)
+        elif args.command == "team-evaluate":
+            from team_memory_eval import evaluate_team_memory
+
+            value = evaluate_team_memory(Path(args.records).expanduser(), Path(args.queries).expanduser(), Path(args.qrels).expanduser(), limit=args.limit)
         elif args.command == "context":
             value = memory_context(root if root_arg else None, args.query, limit=args.limit, source_id=getattr(args, "source", None), repo=args.repo, issue=args.issue, branch=args.branch, agent=args.agent, local=args.local)
         elif args.command == "supersede":

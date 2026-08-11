@@ -58,6 +58,8 @@ repository-memory context "What changed in the evaluation pipeline recently?" --
 
 The response keeps Git evidence separate from Team Memory decisions, failures,
 solutions, discoveries, and handoffs. `team_candidates` are not accepted facts.
+The context response uses `retrieval_mode=multi-source-lexical`: the two
+recall lanes are parallel, but their scores and provenance are not mixed.
 
 ## 4. Ask a repository-only question
 
@@ -78,6 +80,8 @@ the source directly to bypass a failed search.
 ```bash
 repository-memory publish --input memory.json --status candidate --json
 repository-memory feedback team:decision:<id> --rating helpful --note "reused" --json
+repository-memory team-export --output /tmp/team-memory.json --json
+repository-memory team-import --input /tmp/team-memory.json --json
 ```
 
 Use `type=decision|failure|discovery|solution|handoff`, include scope and
