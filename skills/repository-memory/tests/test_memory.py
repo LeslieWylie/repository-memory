@@ -982,7 +982,7 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertIn("repository-memory__memory_search", alpha["tools"]["alsoAllow"])
         self.assertNotIn("repository-memory", beta.get("skills", []))
         self.assertNotIn("repository-memory__memory_search", beta.get("tools", {}).get("alsoAllow", []))
-        wrapper = machine / ".local" / "bin" / "repository-memory"
+        wrapper = machine / ".local" / "bin" / ("repository-memory.cmd" if os.name == "nt" else "repository-memory")
         self.assertTrue(wrapper.is_file())
         searched = subprocess.run([
             str(wrapper),

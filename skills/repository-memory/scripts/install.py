@@ -348,10 +348,13 @@ def _install_openclaw(
 
 
 def _install_cli(canonical: Path) -> Path:
-    destination = _home() / ".local" / "bin" / "repository-memory"
+    destination = _home() / ".local" / "bin" / ("repository-memory.cmd" if os.name == "nt" else "repository-memory")
     destination.parent.mkdir(parents=True, exist_ok=True)
     script = canonical / "scripts" / "repository-memory.py"
-    wrapper = f"#!/bin/sh\nexec {json.dumps(sys.executable)} {json.dumps(str(script))} \"$@\"\n"
+    if os.name == "nt":
+        wrapper = f'@echo off\n"{sys.executable}" "{script}" %*\n'
+    else:
+        wrapper = f"#!/bin/sh\nexec {json.dumps(sys.executable)} {json.dumps(str(script))} \"$@\"\n"
     temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
     temporary.write_text(wrapper, encoding="utf-8")
     os.chmod(temporary, 0o755)
