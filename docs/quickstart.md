@@ -11,8 +11,14 @@ For a host with a profile:
 ```bash
 python3 install.py --target openclaw \
   --openclaw-config /path/to/openclaw.json \
+  --openclaw-agent <agent-id> \
   --source-root /path/to/your-repo --json
 ```
+
+The OpenClaw installer requires an explicit agent selection and only changes
+that agent's Skill/tool permissions. Repeat `--openclaw-agent` for a small
+allowlist, or use `--openclaw-all-agents` only when every configured agent is
+intentionally in scope.
 
 The source root must be a Git repository or a directory explicitly intended
 as a knowledge source. The installer writes user config and derived cache;

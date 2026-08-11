@@ -42,9 +42,14 @@ use the local fallback and will report its actual supported layers.
 
 The guard is host-dependent. Confirm the profile-local extension is in the
 profile's own `extensions/` directory, that the plugin is allowed, and that
-`guardEnabled=true`. The guard only blocks direct tools for turns classified as
-repository-fact turns; ordinary coding turns remain unaffected. A host without
-`before_tool_call` cannot provide a hard block.
+`guardEnabled=true`. The default `enforcement=audit` records direct fallback
+without blocking it; use `enforcement=enforce` only when a hard routing gate is
+intended. A host without `before_tool_call` cannot provide a hard block.
+
+If only one OpenClaw agent should use Repository Memory, install with
+`--openclaw-agent <id>`. The installer no longer silently writes the Skill and
+MCP permissions to every configured agent; use `--openclaw-all-agents` only
+when that broad scope is intentional.
 
 ## The bare `memory_search` fails
 

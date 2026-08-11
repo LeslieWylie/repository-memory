@@ -675,6 +675,19 @@ class RepositoryMemoryTest(unittest.TestCase):
             "CLAUDE_CONFIG_DIR": str(machine / ".claude"),
         })
         environment.pop("REPOSITORY_MEMORY_CONFIG", None)
+        missing_selection = subprocess.run([
+            sys.executable,
+            str(SCRIPTS / "install.py"),
+            "--target",
+            "openclaw",
+            "--no-mcp",
+            "--no-verify",
+            "--openclaw-config",
+            str(openclaw_config),
+            "--json",
+        ], text=True, capture_output=True, env=environment)
+        self.assertNotEqual(missing_selection.returncode, 0)
+        self.assertIn("requires --openclaw-agent", missing_selection.stdout)
         installed = subprocess.run([
             sys.executable,
             str(SCRIPTS / "install.py"),
@@ -685,6 +698,8 @@ class RepositoryMemoryTest(unittest.TestCase):
             "--source-root",
             str(self.alpha),
             "--source-local-only",
+            "--openclaw-agent",
+            "alpha",
             "--json",
         ], text=True, capture_output=True, check=True, env=environment)
         report = json.loads(installed.stdout)
@@ -692,7 +707,8 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(report["targets"], ["claude", "codex", "openclaw"])
         self.assertTrue((machine / ".codex" / "skills" / "repository-memory" / "SKILL.md").is_file())
         self.assertTrue((machine / ".claude" / "skills" / "repository-memory" / "SKILL.md").is_file())
-        self.assertTrue(all((workspace / "skills" / "repository-memory" / "SKILL.md").is_file() for workspace in workspaces))
+        self.assertTrue((workspaces[0] / "skills" / "repository-memory" / "SKILL.md").is_file())
+        self.assertFalse((workspaces[1] / "skills" / "repository-memory").exists())
         configured = json.loads(openclaw_config.read_text(encoding="utf-8"))
         user_config = json.loads((machine / "config" / "repository-memory" / "config.json").read_text(encoding="utf-8"))
         self.assertTrue(user_config["sources"][0]["local_only"])
@@ -704,12 +720,16 @@ class RepositoryMemoryTest(unittest.TestCase):
         plugin = configured["plugins"]["entries"]["repository-memory-autocapture"]
         self.assertTrue(plugin["config"]["guardEnabled"])
         self.assertEqual(plugin["config"]["enforcement"], "audit")
+        self.assertEqual(plugin["config"]["agentIds"], ["alpha"])
         self.assertTrue(plugin["hooks"]["allowConversationAccess"])
         self.assertFalse(configured["plugins"]["entries"]["rlvr-memory-autocapture"]["enabled"])
-        for agent in configured["agents"]["list"]:
-            self.assertIn("repository-memory", agent["skills"])
-            self.assertNotIn("rlvr-memory", agent["skills"])
-            self.assertIn("repository-memory__memory_search", agent["tools"]["alsoAllow"])
+        alpha = next(agent for agent in configured["agents"]["list"] if agent["id"] == "alpha")
+        beta = next(agent for agent in configured["agents"]["list"] if agent["id"] == "beta")
+        self.assertIn("repository-memory", alpha["skills"])
+        self.assertNotIn("rlvr-memory", alpha["skills"])
+        self.assertIn("repository-memory__memory_search", alpha["tools"]["alsoAllow"])
+        self.assertNotIn("repository-memory", beta.get("skills", []))
+        self.assertNotIn("repository-memory__memory_search", beta.get("tools", {}).get("alsoAllow", []))
         wrapper = machine / ".local" / "bin" / "repository-memory"
         self.assertTrue(wrapper.is_file())
         searched = subprocess.run([

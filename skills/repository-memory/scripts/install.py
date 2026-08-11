@@ -230,7 +230,13 @@ def _install_claude(canonical: Path, register_mcp: bool) -> dict[str, Any]:
     return {"skill": str(destination), "mcp_registered": registered, "mcp_detail": detail}
 
 
-def _install_openclaw(canonical: Path, runtime: Path, config_path: Path | None = None, agent_ids: list[str] | None = None) -> dict[str, Any]:
+def _install_openclaw(
+    canonical: Path,
+    runtime: Path,
+    config_path: Path | None = None,
+    agent_ids: list[str] | None = None,
+    all_agents: bool = False,
+) -> dict[str, Any]:
     path = config_path or (_home() / ".openclaw" / "openclaw.json")
     if not path.is_file():
         return {"config": str(path), "agents": [], "mcp_registered": False, "detail": "OpenClaw is not configured"}
@@ -243,9 +249,23 @@ def _install_openclaw(canonical: Path, runtime: Path, config_path: Path | None =
     _copy_openclaw_extension(extension_source, extension_destination)
     agents = config.get("agents") if isinstance(config.get("agents"), dict) else {}
     rows = agents.get("list") if isinstance(agents.get("list"), list) else []
+    configured_ids = {
+        str(row.get("id") or Path(str(row.get("workspace") or "")).name)
+        for row in rows
+        if isinstance(row, dict) and row.get("workspace")
+    }
+    selected_ids = configured_ids if all_agents else set(agent_ids or [])
+    if not selected_ids:
+        raise RuntimeError("OpenClaw installation requires --openclaw-agent <id>; use --openclaw-all-agents only when intentional")
+    unknown_ids = selected_ids - configured_ids
+    if unknown_ids:
+        raise RuntimeError(f"OpenClaw agent id(s) not found: {', '.join(sorted(unknown_ids))}")
     installed: list[dict[str, str]] = []
     for row in rows:
         if not isinstance(row, dict) or not row.get("workspace"):
+            continue
+        agent_id = str(row.get("id") or Path(str(row["workspace"])).name)
+        if agent_id not in selected_ids:
             continue
         workspace = Path(str(row["workspace"])).expanduser().resolve()
         destination = workspace / "skills" / SKILL_NAME
@@ -262,7 +282,7 @@ def _install_openclaw(canonical: Path, runtime: Path, config_path: Path | None =
         allowed = tools.get("alsoAllow") if isinstance(tools.get("alsoAllow"), list) else []
         tools["alsoAllow"] = [*allowed, *(name for name in OPENCLAW_TOOLS if name not in allowed)]
         row["tools"] = tools
-        installed.append({"agent": str(row.get("id") or workspace.name), "skill": str(destination)})
+        installed.append({"agent": agent_id, "skill": str(destination)})
 
     config.setdefault("agents", {})["list"] = rows
     mcp = config.get("mcp") if isinstance(config.get("mcp"), dict) else {}
@@ -303,7 +323,7 @@ def _install_openclaw(canonical: Path, runtime: Path, config_path: Path | None =
             "guardEnabled": True,
             "enforcement": "audit",
             "runtime": str(runtime),
-            "agentIds": sorted(set(agent_ids or [])),
+            "agentIds": sorted(selected_ids),
         },
         # OpenClaw requires an explicit opt-in before a non-bundled plugin can
         # receive conversation lifecycle events such as agent_end.
@@ -457,6 +477,7 @@ def install(args: argparse.Namespace) -> dict[str, Any]:
             # point at a different-looking profile than the one supplied.
             Path(args.openclaw_config).expanduser() if args.openclaw_config else None,
             args.openclaw_agent,
+            args.openclaw_all_agents,
         )
 
     source_status = None
@@ -483,7 +504,8 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--source-root", help="register and index a repository or document directory")
     value.add_argument("--source-local-only", action="store_true", help="declare --source-root as an intentional offline/local snapshot")
     value.add_argument("--openclaw-config", help="override the OpenClaw config path")
-    value.add_argument("--openclaw-agent", action="append", help="agent id allowed to auto-capture; omit to allow all configured agents")
+    value.add_argument("--openclaw-agent", action="append", help="install and enable repository-memory only for this OpenClaw agent; repeat for multiple agents")
+    value.add_argument("--openclaw-all-agents", action="store_true", help="explicitly install and enable repository-memory for every configured OpenClaw agent")
     value.add_argument("--no-mcp", action="store_true", help="install Skills without registering Codex/Claude MCP")
     value.add_argument("--no-verify", action="store_true", help="skip installed doctor and MCP smoke checks")
     value.add_argument("--json", action="store_true")

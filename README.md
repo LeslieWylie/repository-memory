@@ -60,7 +60,8 @@ cd repository-memory
 
 # Install the Skill, CLI, MCP registration, and (when OpenClaw is configured)
 # the profile-local lifecycle extension.
-python3 install.py --all --source-root /path/to/knowledge-repository --json
+python3 install.py --all --openclaw-agent <agent-id> \
+  --source-root /path/to/knowledge-repository --json
 ```
 
 For a single host:
@@ -69,8 +70,15 @@ For a single host:
 python3 install.py --target codex --source-root /path/to/knowledge-repository --json
 python3 install.py --target claude --source-root /path/to/knowledge-repository --json
 python3 install.py --target openclaw --openclaw-config /path/to/openclaw.json \
+  --openclaw-agent <agent-id> \
   --source-root /path/to/knowledge-repository --json
 ```
+
+OpenClaw installation is least-privilege by default: `--openclaw-agent` is
+required and only that agent receives the Skill, MCP tool permissions, and
+automatic capture. Use `--openclaw-agent` repeatedly for a selected set. The
+all-agent behavior is available only through the explicit
+`--openclaw-all-agents` flag.
 
 The installer makes a timestamped backup before changing a host config. It
 does not push, commit, pull, or rewrite the knowledge repository.

@@ -16,7 +16,7 @@
       "runtime": { "type": "string", "description": "The repository-memory CLI executable." },
       "auditPath": { "type": "string", "description": "Optional metadata-only host audit path." },
       "repoToolPrefix": { "type": "string", "default": "repository-memory__", "description": "Host namespace used for repository-memory MCP tools." },
-      "agentIds": { "type": "array", "items": { "type": "string" }, "description": "Only capture these OpenClaw agent ids; empty means all agents." },
+      "agentIds": { "type": "array", "items": { "type": "string" }, "description": "Only install/capture for these OpenClaw agent ids. The installer requires an explicit selection." },
       "maxMessages": { "type": "integer", "minimum": 4, "maximum": 64, "default": 24 },
       "maxMessageChars": { "type": "integer", "minimum": 1000, "maximum": 50000, "default": 12000 },
       "timeoutMs": { "type": "integer", "minimum": 1000, "maximum": 60000, "default": 15000 }
