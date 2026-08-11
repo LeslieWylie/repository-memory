@@ -35,7 +35,7 @@ repository-memory sync [--source <id>|--all] [--local] --json
 repository-memory search "<query>" [--source <id>] [--scope repository|memory|all] [--deep] [--local] --json
 repository-memory get "<result-id>" [--commit <citation-commit>] --json
 repository-memory explain "<result-id>" [--commit <citation-commit>] --json
-repository-memory feedback "<result-id>" --note "..." --json
+repository-memory feedback "<result-id>" --note "..." [--feedback-id <stable-id>] --json
 repository-memory promote --input <file> --json
 repository-memory ingest-session --input <json-or-jsonl> --json
 repository-memory capture-turn --input <bounded-turn.json> --json  # lifecycle adapter only

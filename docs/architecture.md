@@ -93,10 +93,13 @@ explicit publish or bounded task-end extraction
 The default Team Memory backend is a local SQLite adapter behind the
 `TeamMemoryBackend` interface. It enables same-host sharing and uses WAL,
 busy-timeout, and bounded transaction retries. Each record carries a causal
-`revision`, `origin_node`, and `parent_revision`; bundle import applies only a
-matching child revision and reports concurrent branches. Cross-host/container
-transfer is an explicit JSON bundle export/import operation; it is not silently
-called remote sync and no hosted service is claimed by the core runtime.
+`revision`, `origin_node`, and `parent_revision`. Bundle schema 3 also carries
+an append-only revision log, allowing a receiver to fast-forward from a known
+ancestor after missed intermediate exports; concurrent branches are still
+reported rather than selected. Review metadata is separate from authorship.
+Cross-host/container transfer is an explicit JSON bundle export/import
+operation; it is not silently called remote sync and no hosted service is
+claimed by the core runtime.
 
 ## MCP transport
 

@@ -34,6 +34,12 @@ STOP_WORDS = {
     "the", "and", "for", "with", "from", "this", "that", "what", "when", "where",
     "which", "about", "project", "memory", "team", "最近", "最近的", "之前", "怎么", "什么",
 }
+MEMORY_PAYLOAD_FIELDS = (
+    "id", "memory_type", "title", "content", "summary", "scope", "provenance",
+    "confidence", "status", "supersedes", "superseded_by", "valid_from",
+    "valid_until", "author_agent", "reviewed_by", "activated_at", "idempotency_key", "created_at", "updated_at",
+    "revision", "origin_node", "parent_revision",
+)
 T = TypeVar("T")
 
 
@@ -117,16 +123,18 @@ class SQLiteTeamMemoryBackend:
                 valid_from TEXT,
                 valid_until TEXT,
                 author_agent TEXT,
+                reviewed_by TEXT,
+                activated_at TEXT,
                 idempotency_key TEXT UNIQUE,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-                ,revision INTEGER NOT NULL DEFAULT 1
-                ,origin_node TEXT NOT NULL DEFAULT 'legacy'
-                ,parent_revision TEXT
+                updated_at TEXT NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 1,
+                origin_node TEXT NOT NULL DEFAULT 'legacy',
+                parent_revision TEXT
             )"""
         )
         columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(memories)")}
-        for name, definition in (("revision", "INTEGER NOT NULL DEFAULT 1"), ("origin_node", "TEXT NOT NULL DEFAULT 'legacy'"), ("parent_revision", "TEXT")):
+        for name, definition in (("reviewed_by", "TEXT"), ("activated_at", "TEXT"), ("revision", "INTEGER NOT NULL DEFAULT 1"), ("origin_node", "TEXT NOT NULL DEFAULT 'legacy'"), ("parent_revision", "TEXT")):
             if name not in columns:
                 connection.execute(f"ALTER TABLE memories ADD COLUMN {name} {definition}")
         connection.execute("CREATE INDEX IF NOT EXISTS memories_status_idx ON memories(status)")
@@ -139,9 +147,38 @@ class SQLiteTeamMemoryBackend:
                 rating TEXT NOT NULL,
                 note TEXT NOT NULL,
                 agent TEXT,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                feedback_id TEXT,
+                origin_node TEXT NOT NULL DEFAULT 'legacy'
             )"""
         )
+        feedback_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(memory_feedback)")}
+        for name, definition in (("feedback_id", "TEXT"), ("origin_node", "TEXT NOT NULL DEFAULT 'legacy'")):
+            if name not in feedback_columns:
+                connection.execute(f"ALTER TABLE memory_feedback ADD COLUMN {name} {definition}")
+        for row in connection.execute("SELECT id, memory_id, rating, note, agent, created_at FROM memory_feedback WHERE feedback_id IS NULL OR feedback_id = ''"):
+            basis = "|".join(str(row[key] or "") for key in ("id", "memory_id", "rating", "note", "agent", "created_at"))
+            feedback_id = f"legacy:{hashlib.sha256(basis.encode('utf-8')).hexdigest()[:24]}"
+            connection.execute("UPDATE memory_feedback SET feedback_id = ? WHERE id = ?", (feedback_id, row["id"]))
+        connection.execute("CREATE INDEX IF NOT EXISTS memory_feedback_identity_idx ON memory_feedback(memory_id, feedback_id)")
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS memory_revisions (
+                memory_id TEXT NOT NULL,
+                revision_id TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                origin_node TEXT NOT NULL,
+                parent_revision TEXT,
+                payload TEXT NOT NULL,
+                payload_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (memory_id, revision_id)
+            )"""
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS memory_revisions_parent_idx ON memory_revisions(memory_id, parent_revision)")
+        for row in connection.execute("SELECT * FROM memories"):
+            revision_id = self._revision_id(row["revision"], row["origin_node"])
+            if connection.execute("SELECT 1 FROM memory_revisions WHERE memory_id = ? AND revision_id = ?", (row["id"], revision_id)).fetchone() is None:
+                self._append_revision(connection, row)
         try:
             connection.execute("CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(id UNINDEXED, body)")
         except sqlite3.OperationalError:
@@ -217,6 +254,7 @@ class SQLiteTeamMemoryBackend:
             by_status = {str(row[0]): int(row[1]) for row in connection.execute("SELECT status, COUNT(*) FROM memories GROUP BY status")}
             by_type = {str(row[0]): int(row[1]) for row in connection.execute("SELECT memory_type, COUNT(*) FROM memories GROUP BY memory_type")}
             feedback = int(connection.execute("SELECT COUNT(*) FROM memory_feedback").fetchone()[0])
+            revisions = int(connection.execute("SELECT COUNT(*) FROM memory_revisions").fetchone()[0])
             active_expired = sum(1 for row in connection.execute("SELECT valid_until FROM memories WHERE status = 'active' AND valid_until IS NOT NULL") if self._expired(row[0]))
             fts = self._fts_available(connection)
         finally:
@@ -232,6 +270,7 @@ class SQLiteTeamMemoryBackend:
             "by_status": by_status,
             "by_type": by_type,
             "feedback_count": feedback,
+            "revision_count": revisions,
             "active_expired": active_expired,
             "index": "fts5" if fts else "sqlite-scan",
             "retrieval_strategy": "keyword-only",
@@ -288,6 +327,41 @@ class SQLiteTeamMemoryBackend:
         revision = int(row["revision"] or 1) + 1
         return revision, node_id, cls._revision_id(row["revision"], row["origin_node"])
 
+    @staticmethod
+    def _revision_payload(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        return {field: row[field] for field in MEMORY_PAYLOAD_FIELDS}
+
+    @staticmethod
+    def _payload_hash(payload: dict[str, Any]) -> str:
+        return hashlib.sha256(_json(payload).encode("utf-8")).hexdigest()
+
+    def _append_revision(self, connection: sqlite3.Connection, row: sqlite3.Row | dict[str, Any]) -> None:
+        payload = self._revision_payload(row)
+        revision_id = self._revision_id(row["revision"], row["origin_node"])
+        payload_json = _json(payload)
+        connection.execute(
+            """INSERT OR IGNORE INTO memory_revisions
+            (memory_id, revision_id, revision, origin_node, parent_revision, payload, payload_hash, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (row["id"], revision_id, int(row["revision"] or 1), row["origin_node"] or "legacy", row["parent_revision"], payload_json, self._payload_hash(payload), row["updated_at"] or _now()),
+        )
+
+    def _is_ancestor(self, connection: sqlite3.Connection, memory_id: str, ancestor: str, descendant: str) -> bool:
+        """Return whether ``ancestor`` is in the retained causal chain."""
+
+        cursor = descendant
+        seen: set[str] = set()
+        while cursor and cursor not in seen:
+            if cursor == ancestor:
+                return True
+            seen.add(cursor)
+            row = connection.execute(
+                "SELECT parent_revision FROM memory_revisions WHERE memory_id = ? AND revision_id = ?",
+                (memory_id, cursor),
+            ).fetchone()
+            cursor = str(row[0]) if row and row[0] else ""
+        return False
+
     def _row(self, row: sqlite3.Row, feedback: list[sqlite3.Row] | None = None) -> dict[str, Any]:
         scope = _parse(row["scope"], {})
         provenance = _parse(row["provenance"], {})
@@ -315,6 +389,8 @@ class SQLiteTeamMemoryBackend:
             "scope": scope,
             "provenance": provenance,
             "author_agent": row["author_agent"],
+            "reviewed_by": row["reviewed_by"],
+            "activated_at": row["activated_at"],
             "confidence": float(row["confidence"]),
             "status": row["status"],
             "evidence_status": evidence_status,
@@ -365,18 +441,20 @@ class SQLiteTeamMemoryBackend:
             connection.execute(
                 """INSERT INTO memories
                 (id, memory_type, title, content, summary, scope, provenance, confidence, status,
-                 supersedes, superseded_by, valid_from, valid_until, author_agent, idempotency_key,
+                 supersedes, superseded_by, valid_from, valid_until, author_agent, reviewed_by, activated_at, idempotency_key,
                 created_at, updated_at, revision, origin_node, parent_revision)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?)""",
                 (memory_id, memory_type, title, content, summary, _json(scope), _json(provenance), confidence, status, supersedes, valid_from, valid_until, author_agent, idempotency, now, now, 1, self.node_id, parent_revision),
             )
             if superseded_row and superseded_row["status"] != "superseded":
                 revision, origin_node, parent = self._next_revision(superseded_row, self.node_id)
                 connection.execute("UPDATE memories SET status = 'superseded', superseded_by = ?, updated_at = ?, revision = ?, origin_node = ?, parent_revision = ? WHERE id = ?", (memory_id, now, revision, origin_node, parent, supersedes))
+                self._append_revision(connection, connection.execute("SELECT * FROM memories WHERE id = ?", (supersedes,)).fetchone())
             if self._fts_available(connection):
                 body = "\n".join((title, summary, content, _json(scope), _json(provenance)))
                 connection.execute("INSERT INTO memories_fts (id, body) VALUES (?, ?)", (memory_id, body))
             row = connection.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+            self._append_revision(connection, row)
             return {"schema_version": 1, "ok": True, "duplicate": False, "memory": self._row(row), "write_operation": "explicit", "canonical_repo_changed": False}
         return self._write(operation)
 
@@ -393,8 +471,9 @@ class SQLiteTeamMemoryBackend:
                 raise ValueError(f"only candidate Team Memory can be activated: {memory_id}")
             revision, origin_node, parent = self._next_revision(row, self.node_id)
             now = _now()
-            connection.execute("UPDATE memories SET status = 'active', updated_at = ?, revision = ?, origin_node = ?, parent_revision = ?, author_agent = COALESCE(?, author_agent) WHERE id = ?", (now, revision, origin_node, parent, reviewer, memory_id))
+            connection.execute("UPDATE memories SET status = 'active', updated_at = ?, revision = ?, origin_node = ?, parent_revision = ?, reviewed_by = COALESCE(?, reviewed_by), activated_at = ? WHERE id = ?", (now, revision, origin_node, parent, reviewer, now, memory_id))
             updated = connection.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+            self._append_revision(connection, updated)
             return {"schema_version": 1, "ok": True, "memory_id": memory_id, "status": "active", "duplicate": False, "reviewer": reviewer, "memory": self._row(updated), "canonical_repo_changed": False}
 
         return self._write(operation)
@@ -405,7 +484,7 @@ class SQLiteTeamMemoryBackend:
             row = connection.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
             if row is None:
                 raise KeyError(f"team memory not found: {memory_id}")
-            feedback = connection.execute("SELECT rating, note, agent, created_at FROM memory_feedback WHERE memory_id = ? ORDER BY id", (memory_id,)).fetchall() if include_feedback else []
+            feedback = connection.execute("SELECT rating, note, agent, created_at, feedback_id, origin_node FROM memory_feedback WHERE memory_id = ? ORDER BY id", (memory_id,)).fetchall() if include_feedback else []
         finally:
             connection.close()
         value = self._row(row, feedback)
@@ -474,15 +553,24 @@ class SQLiteTeamMemoryBackend:
             "diagnostics": {"result_count": len(active), "candidate_count": len(candidates), "expired_count": expired_count, "query_terms": terms, "filters": {"repo": repo, "issue": issue, "branch": branch, "agent": agent}},
         }
 
-    def feedback(self, memory_id: str, rating: str, note: str = "", agent: str | None = None) -> dict[str, Any]:
+    def feedback(self, memory_id: str, rating: str, note: str = "", agent: str | None = None, feedback_id: str | None = None) -> dict[str, Any]:
         rating = str(rating).strip().lower()
         if rating not in RATINGS:
             raise ValueError(f"rating must be one of: {', '.join(sorted(RATINGS))}")
+        note = str(note)[:2000]
+        feedback_id = str(feedback_id or "").strip()
+        if not feedback_id:
+            basis = "|".join((memory_id, rating, note, str(agent or "")))
+            feedback_id = f"{self.node_id}:{hashlib.sha256(basis.encode('utf-8')).hexdigest()[:24]}"
         def operation(connection: sqlite3.Connection) -> dict[str, Any]:
             if connection.execute("SELECT 1 FROM memories WHERE id = ?", (memory_id,)).fetchone() is None:
                 raise KeyError(f"team memory not found: {memory_id}")
+            duplicate = connection.execute("SELECT 1 FROM memory_feedback WHERE memory_id = ? AND feedback_id = ?", (memory_id, feedback_id)).fetchone()
+            if duplicate:
+                status_row = connection.execute("SELECT status FROM memories WHERE id = ?", (memory_id,)).fetchone()
+                return {"schema_version": 1, "ok": True, "memory_id": memory_id, "feedback_id": feedback_id, "rating": rating, "status": status_row[0] if status_row else None, "duplicate": True, "canonical_repo_changed": False}
             created_at = _now()
-            connection.execute("INSERT INTO memory_feedback (memory_id, rating, note, agent, created_at) VALUES (?, ?, ?, ?, ?)", (memory_id, rating, str(note)[:2000], agent, created_at))
+            connection.execute("INSERT INTO memory_feedback (memory_id, rating, note, agent, created_at, feedback_id, origin_node) VALUES (?, ?, ?, ?, ?, ?, ?)", (memory_id, rating, note, agent, created_at, feedback_id, self.node_id))
             transition = None
             if rating in {"stale", "wrong"}:
                 now = _now()
@@ -497,8 +585,9 @@ class SQLiteTeamMemoryBackend:
                     if len(agents) >= 2:
                         connection.execute("UPDATE memories SET status = 'stale' WHERE id = ? AND status = 'active'", (memory_id,))
                         transition = "stale"
+                self._append_revision(connection, connection.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone())
             status_row = connection.execute("SELECT status FROM memories WHERE id = ?", (memory_id,)).fetchone()
-            return {"schema_version": 1, "ok": True, "memory_id": memory_id, "rating": rating, "status": status_row[0] if status_row else None, "lifecycle_transition": transition, "canonical_repo_changed": False}
+            return {"schema_version": 1, "ok": True, "memory_id": memory_id, "feedback_id": feedback_id, "rating": rating, "status": status_row[0] if status_row else None, "lifecycle_transition": transition, "duplicate": False, "canonical_repo_changed": False}
         return self._write(operation)
 
     def export_bundle(self) -> dict[str, Any]:
@@ -512,27 +601,53 @@ class SQLiteTeamMemoryBackend:
         connection = self._connect()
         try:
             records = [dict(row) for row in connection.execute("SELECT * FROM memories ORDER BY id").fetchall()]
-            feedback = [dict(row) for row in connection.execute("SELECT memory_id, rating, note, agent, created_at FROM memory_feedback ORDER BY memory_id, created_at, id").fetchall()]
+            feedback = [dict(row) for row in connection.execute("SELECT memory_id, rating, note, agent, created_at, feedback_id, origin_node FROM memory_feedback ORDER BY memory_id, created_at, id").fetchall()]
+            revisions = [dict(row) for row in connection.execute("SELECT memory_id, revision_id, revision, origin_node, parent_revision, payload, payload_hash, created_at FROM memory_revisions ORDER BY memory_id, revision, revision_id").fetchall()]
         finally:
             connection.close()
-        return {"schema_version": 2, "kind": "repository-memory-team-bundle", "backend": self.backend_name, "node_id": self.node_id, "exported_at": _now(), "records": records, "feedback": feedback}
+        return {"schema_version": 3, "kind": "repository-memory-team-bundle", "backend": self.backend_name, "node_id": self.node_id, "exported_at": _now(), "records": records, "revisions": revisions, "feedback": feedback}
 
     def import_bundle(self, bundle: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(bundle, dict) or bundle.get("kind") != "repository-memory-team-bundle":
             raise ValueError("invalid Team Memory bundle")
-        if int(bundle.get("schema_version", 1)) not in {1, 2}:
+        if int(bundle.get("schema_version", 1)) not in {1, 2, 3}:
             raise ValueError(f"unsupported Team Memory bundle schema: {bundle.get('schema_version')}")
         records = bundle.get("records") if isinstance(bundle.get("records"), list) else []
+        revisions = bundle.get("revisions") if isinstance(bundle.get("revisions"), list) else []
         feedback = bundle.get("feedback") if isinstance(bundle.get("feedback"), list) else []
 
         def operation(connection: sqlite3.Connection) -> dict[str, Any]:
-            inserted = updated = skipped = conflicts = stale_ignored = feedback_added = 0
+            inserted = updated = skipped = conflicts = stale_ignored = feedback_added = revisions_inserted = revisions_skipped = 0
             conflict_records: list[dict[str, Any]] = []
-            mutable_fields = ("memory_type", "title", "content", "summary", "scope", "provenance", "confidence", "status", "supersedes", "superseded_by", "valid_from", "valid_until", "author_agent")
+            mutable_fields = ("memory_type", "title", "content", "summary", "scope", "provenance", "confidence", "status", "supersedes", "superseded_by", "valid_from", "valid_until", "author_agent", "reviewed_by", "activated_at")
+            for incoming in revisions:
+                if not isinstance(incoming, dict) or not str(incoming.get("memory_id") or "").startswith("team:"):
+                    raise ValueError("Team Memory bundle contains an invalid revision")
+                revision = int(incoming.get("revision") or 1)
+                origin_node = str(incoming.get("origin_node") or "legacy")
+                revision_id = str(incoming.get("revision_id") or self._revision_id(revision, origin_node))
+                payload = incoming.get("payload")
+                if not isinstance(payload, str):
+                    payload = _json(payload if isinstance(payload, dict) else {})
+                payload_hash = str(incoming.get("payload_hash") or self._payload_hash(_parse(payload, {})))
+                current_revision = connection.execute("SELECT payload_hash FROM memory_revisions WHERE memory_id = ? AND revision_id = ?", (incoming["memory_id"], revision_id)).fetchone()
+                if current_revision:
+                    if str(current_revision[0]) != payload_hash:
+                        conflicts += 1
+                        conflict_records.append({"id": incoming["memory_id"], "revision_id": revision_id, "reason": "revision id already exists with different payload"})
+                    else:
+                        revisions_skipped += 1
+                    continue
+                connection.execute(
+                    """INSERT INTO memory_revisions (memory_id, revision_id, revision, origin_node, parent_revision, payload, payload_hash, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (incoming["memory_id"], revision_id, revision, origin_node, incoming.get("parent_revision"), payload, payload_hash, incoming.get("created_at") or _now()),
+                )
+                revisions_inserted += 1
             for incoming in records:
                 if not isinstance(incoming, dict) or not str(incoming.get("id") or "").startswith("team:"):
                     raise ValueError("Team Memory bundle contains an invalid record")
-                record = {key: incoming.get(key) for key in ("id", "memory_type", "title", "content", "summary", "scope", "provenance", "confidence", "status", "supersedes", "superseded_by", "valid_from", "valid_until", "author_agent", "idempotency_key", "created_at", "updated_at", "revision", "origin_node", "parent_revision")}
+                record = {key: incoming.get(key) for key in ("id", "memory_type", "title", "content", "summary", "scope", "provenance", "confidence", "status", "supersedes", "superseded_by", "valid_from", "valid_until", "author_agent", "reviewed_by", "activated_at", "idempotency_key", "created_at", "updated_at", "revision", "origin_node", "parent_revision")}
                 try:
                     record["revision"] = int(record.get("revision") or 1)
                 except (TypeError, ValueError):
@@ -547,13 +662,14 @@ class SQLiteTeamMemoryBackend:
                 existing = connection.execute("SELECT * FROM memories WHERE id = ?", (record["id"],)).fetchone()
                 if existing is None:
                     connection.execute(
-                        """INSERT INTO memories (id, memory_type, title, content, summary, scope, provenance, confidence, status, supersedes, superseded_by, valid_from, valid_until, author_agent, idempotency_key, created_at, updated_at, revision, origin_node, parent_revision)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                        tuple(record[key] for key in ("id", "memory_type", "title", "content", "summary", "scope", "provenance", "confidence", "status", "supersedes", "superseded_by", "valid_from", "valid_until", "author_agent", "idempotency_key", "created_at", "updated_at", "revision", "origin_node", "parent_revision")),
+                        """INSERT INTO memories (id, memory_type, title, content, summary, scope, provenance, confidence, status, supersedes, superseded_by, valid_from, valid_until, author_agent, reviewed_by, activated_at, idempotency_key, created_at, updated_at, revision, origin_node, parent_revision)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        tuple(record[key] for key in ("id", "memory_type", "title", "content", "summary", "scope", "provenance", "confidence", "status", "supersedes", "superseded_by", "valid_from", "valid_until", "author_agent", "reviewed_by", "activated_at", "idempotency_key", "created_at", "updated_at", "revision", "origin_node", "parent_revision")),
                     )
                     if self._fts_available(connection):
                         body = "\n".join((str(record["title"]), str(record["summary"]), str(record["content"]), str(record["scope"]), str(record["provenance"])))
                         connection.execute("INSERT OR REPLACE INTO memories_fts (id, body) VALUES (?, ?)", (record["id"], body))
+                    self._append_revision(connection, connection.execute("SELECT * FROM memories WHERE id = ?", (record["id"],)).fetchone())
                     inserted += 1
                 else:
                     current_revision = int(existing["revision"] or 1)
@@ -574,34 +690,36 @@ class SQLiteTeamMemoryBackend:
                         conflicts += 1
                         conflict_records.append({"id": record["id"], "reason": "concurrent revisions have the same logical version but different content", "local_revision": current_revision_id, "incoming_revision": incoming_revision_id})
                         continue
-                    if record.get("parent_revision") != current_revision_id:
+                    if not self._is_ancestor(connection, record["id"], current_revision_id, incoming_revision_id):
                         conflicts += 1
                         conflict_records.append({"id": record["id"], "reason": "incoming revision is not causally based on local revision", "local_revision": current_revision_id, "incoming_revision": incoming_revision_id, "incoming_parent": record.get("parent_revision")})
                         continue
                     connection.execute(
-                        """UPDATE memories SET memory_type=?, title=?, content=?, summary=?, scope=?, provenance=?, confidence=?, status=?, supersedes=?, superseded_by=?, valid_from=?, valid_until=?, author_agent=?, idempotency_key=?, created_at=?, updated_at=?, revision=?, origin_node=?, parent_revision=? WHERE id=?""",
-                        tuple(record[key] for key in ("memory_type", "title", "content", "summary", "scope", "provenance", "confidence", "status", "supersedes", "superseded_by", "valid_from", "valid_until", "author_agent", "idempotency_key", "created_at", "updated_at", "revision", "origin_node", "parent_revision")) + (record["id"],),
+                        """UPDATE memories SET memory_type=?, title=?, content=?, summary=?, scope=?, provenance=?, confidence=?, status=?, supersedes=?, superseded_by=?, valid_from=?, valid_until=?, author_agent=?, reviewed_by=?, activated_at=?, idempotency_key=?, created_at=?, updated_at=?, revision=?, origin_node=?, parent_revision=? WHERE id=?""",
+                        tuple(record[key] for key in ("memory_type", "title", "content", "summary", "scope", "provenance", "confidence", "status", "supersedes", "superseded_by", "valid_from", "valid_until", "author_agent", "reviewed_by", "activated_at", "idempotency_key", "created_at", "updated_at", "revision", "origin_node", "parent_revision")) + (record["id"],),
                     )
                     if self._fts_available(connection):
                         connection.execute("DELETE FROM memories_fts WHERE id = ?", (record["id"],))
                         body = "\n".join((str(record["title"]), str(record["summary"]), str(record["content"]), str(record["scope"]), str(record["provenance"])))
                         connection.execute("INSERT INTO memories_fts (id, body) VALUES (?, ?)", (record["id"], body))
+                    self._append_revision(connection, connection.execute("SELECT * FROM memories WHERE id = ?", (record["id"],)).fetchone())
                     updated += 1
             for item in feedback:
                 if not isinstance(item, dict) or not item.get("memory_id"):
                     continue
-                exists = connection.execute(
-                    "SELECT 1 FROM memory_feedback WHERE memory_id = ? AND rating = ? AND note = ? AND COALESCE(agent, '') = COALESCE(?, '') AND created_at = ?",
-                    (item.get("memory_id"), item.get("rating"), item.get("note") or "", item.get("agent"), item.get("created_at")),
-                ).fetchone()
+                feedback_id = str(item.get("feedback_id") or "").strip()
+                if not feedback_id:
+                    basis = "|".join(str(item.get(key) or "") for key in ("memory_id", "rating", "note", "agent", "created_at"))
+                    feedback_id = f"legacy:{hashlib.sha256(basis.encode('utf-8')).hexdigest()[:24]}"
+                exists = connection.execute("SELECT 1 FROM memory_feedback WHERE memory_id = ? AND feedback_id = ?", (item.get("memory_id"), feedback_id)).fetchone()
                 if exists:
                     continue
-                connection.execute("INSERT INTO memory_feedback (memory_id, rating, note, agent, created_at) VALUES (?, ?, ?, ?, ?)", (item.get("memory_id"), item.get("rating"), item.get("note") or "", item.get("agent"), item.get("created_at") or _now()))
+                connection.execute("INSERT INTO memory_feedback (memory_id, rating, note, agent, created_at, feedback_id, origin_node) VALUES (?, ?, ?, ?, ?, ?, ?)", (item.get("memory_id"), item.get("rating"), item.get("note") or "", item.get("agent"), item.get("created_at") or _now(), feedback_id, item.get("origin_node") or "legacy"))
                 feedback_added += 1
-            return {"inserted": inserted, "updated": updated, "skipped": skipped, "stale_ignored": stale_ignored, "conflicts": conflicts, "conflict_records": conflict_records, "feedback_added": feedback_added}
+            return {"inserted": inserted, "updated": updated, "skipped": skipped, "stale_ignored": stale_ignored, "conflicts": conflicts, "conflict_records": conflict_records, "feedback_added": feedback_added, "revisions_inserted": revisions_inserted, "revisions_skipped": revisions_skipped}
 
         result = self._write(operation)
-        return {"schema_version": 2, "ok": True, "imported": result, "canonical_repo_changed": False}
+        return {"schema_version": 3, "ok": True, "imported": result, "canonical_repo_changed": False}
 
 
 TeamMemoryStore = SQLiteTeamMemoryBackend
@@ -615,7 +733,7 @@ class TeamMemoryBackend(Protocol):
     def activate(self, memory_id: str, reviewer: str | None = None) -> dict[str, Any]: ...
     def get(self, memory_id: str, *, include_feedback: bool = True) -> dict[str, Any]: ...
     def search(self, query: str, *, limit: int = 10, repo: str | None = None, issue: str | None = None, branch: str | None = None, agent: str | None = None, include_candidates: bool = True) -> dict[str, Any]: ...
-    def feedback(self, memory_id: str, rating: str, note: str = "", agent: str | None = None) -> dict[str, Any]: ...
+    def feedback(self, memory_id: str, rating: str, note: str = "", agent: str | None = None, feedback_id: str | None = None) -> dict[str, Any]: ...
     def export_bundle(self) -> dict[str, Any]: ...
     def import_bundle(self, bundle: dict[str, Any]) -> dict[str, Any]: ...
 

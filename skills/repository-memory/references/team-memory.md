@@ -65,10 +65,16 @@ team-import --input <bundle.json>
 ```
 
 Import is an idempotent merge keyed by stable memory id and causal revision.
-Only an incoming child whose `parent_revision` matches the local revision is
-applied automatically. Concurrent branches and stale revisions are reported,
-not selected by wall-clock last-write-wins. This is file-based
-synchronization, not a hosted database service.
+Bundle schema 3 includes an append-only `memory_revisions` log. An incoming
+revision is applied when the local revision is in its retained ancestor chain,
+so `v1 -> v3` is a valid fast-forward even if `v2` was missed. Concurrent
+branches and stale revisions are reported, not selected by wall-clock
+last-write-wins. Feedback carries a stable `feedback_id` and `origin_node` for
+cross-machine deduplication. This is file-based synchronization, not a hosted
+database service.
+
+Activation records `reviewed_by` and `activated_at` while preserving the
+original `author_agent`.
 
 ## Context hydration
 

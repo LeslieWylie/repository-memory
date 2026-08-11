@@ -154,9 +154,12 @@ stored in a user-level SQLite cache. SQLite is the default backend behind a
 transactions for concurrent local agents. Records contain `type`, `scope`,
 `provenance`, `confidence`, `author_agent`, validity windows, and reuse
 feedback plus causal `revision`, `origin_node`, and `parent_revision` fields.
-Bundle import only auto-applies a causally based child revision; concurrent
-branches are reported as conflicts instead of being resolved by wall-clock
-time. They are not a second Git repository and are never written into the
+Reviews are recorded separately as `reviewed_by`/`activated_at`; they never
+overwrite `author_agent`. Bundle schema 3 carries an append-only revision log,
+so a receiver can fast-forward from an older known ancestor even when it
+missed intermediate exports. Concurrent branches are reported as conflicts
+instead of being resolved by wall-clock time. They are not a second Git
+repository and are never written into the
 canonical source tree.
 
 For cross-machine or container handoff, use an explicit portable bundle:

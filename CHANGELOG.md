@@ -20,6 +20,9 @@ revision is a separate compatibility identifier; see
 - Add causal Team Memory revisions (`revision`, `origin_node`,
   `parent_revision`), conflict-aware bundle merge, automatic migration for
   older SQLite databases, and explicit candidate activation after review.
+- Extend Team Memory bundles with an append-only revision log for skipped-version
+  fast-forward, separate activation reviewer metadata from authorship, and add
+  stable feedback IDs for cross-machine deduplication.
 - Change the OpenClaw guard to advisory/output-audit behavior; it no longer
   blocks normal file, shell, Git, test, or debugging tools.
 - Strengthen evaluator qrels validation, citation commit pinning, and

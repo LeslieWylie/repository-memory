@@ -5,6 +5,7 @@ import json
 import os
 import stat
 import subprocess
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -406,22 +407,37 @@ class RepositoryMemoryTest(unittest.TestCase):
             "title": "Causal decision",
             "content": "Use one isolated worktree per issue.",
             "status": "candidate",
+            "author_agent": "agent-a",
         })
         memory_id = candidate["memory"]["id"]
+        candidate_bundle = node_a.export_bundle()
         activated = node_a.activate(memory_id, reviewer="reviewer-a")
         self.assertEqual(activated["status"], "active")
         self.assertEqual(activated["memory"]["revision"], 2)
         self.assertEqual(activated["memory"]["parent_revision"], "node-a:1")
+        self.assertEqual(activated["memory"]["author_agent"], "agent-a")
+        self.assertEqual(activated["memory"]["reviewed_by"], "reviewer-a")
+        self.assertEqual(activated["memory"]["activated_at"], activated["memory"]["updated_at"])
 
         node_b = TeamMemoryStore(Path(self.temp.name) / "node-b.sqlite3", node_id="node-b")
         base_bundle = node_a.export_bundle()
-        self.assertEqual(base_bundle["schema_version"], 2)
+        self.assertEqual(base_bundle["schema_version"], 3)
         self.assertEqual(node_b.import_bundle(base_bundle)["imported"]["inserted"], 1)
+        lagging = TeamMemoryStore(Path(self.temp.name) / "lagging.sqlite3", node_id="node-lagging")
+        lagging.import_bundle(candidate_bundle)
         node_a.feedback(memory_id, "wrong", "A rejected it", agent="reviewer-a")
+        fast_forward = lagging.import_bundle(node_a.export_bundle())
+        self.assertEqual(fast_forward["imported"]["updated"], 1)
+        self.assertEqual(lagging.get(memory_id)["result"]["revision"], 3)
+        self.assertEqual(lagging.get(memory_id)["result"]["status"], "stale")
         node_b.feedback(memory_id, "stale", "B has not confirmed expiry", agent="reviewer-b")
         conflict = node_a.import_bundle(node_b.export_bundle())
         self.assertEqual(conflict["imported"]["conflicts"], 1)
         self.assertEqual(node_a.get(memory_id)["result"]["status"], "stale")
+        feedback = node_a.feedback(memory_id, "helpful", "stable feedback", agent="reviewer-a", feedback_id="feedback-1")
+        duplicate_feedback = node_a.feedback(memory_id, "helpful", "stable feedback", agent="reviewer-a", feedback_id="feedback-1")
+        self.assertFalse(feedback["duplicate"])
+        self.assertTrue(duplicate_feedback["duplicate"])
 
         receiver = TeamMemoryStore(Path(self.temp.name) / "receiver.sqlite3", node_id="node-r")
         receiver.import_bundle(base_bundle)
@@ -457,6 +473,37 @@ class RepositoryMemoryTest(unittest.TestCase):
         gated = subprocess.run(command, text=True, capture_output=True, check=False)
         self.assertEqual(gated.returncode, 0, gated.stderr)
         self.assertTrue(json.loads(gated.stdout)["gate"]["passed"])
+
+    def test_team_memory_migrates_legacy_database_and_backfills_revision_log(self):
+        path = Path(self.temp.name) / "legacy.sqlite3"
+        connection = sqlite3.connect(path)
+        connection.executescript("""
+            CREATE TABLE memories (
+                id TEXT PRIMARY KEY, memory_type TEXT NOT NULL, title TEXT NOT NULL,
+                content TEXT NOT NULL, summary TEXT NOT NULL, scope TEXT NOT NULL,
+                provenance TEXT NOT NULL, confidence REAL NOT NULL, status TEXT NOT NULL,
+                supersedes TEXT, superseded_by TEXT, valid_from TEXT, valid_until TEXT,
+                author_agent TEXT, idempotency_key TEXT UNIQUE, created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE memory_feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, memory_id TEXT NOT NULL,
+                rating TEXT NOT NULL, note TEXT NOT NULL, agent TEXT, created_at TEXT NOT NULL
+            );
+        """)
+        connection.execute("INSERT INTO memories VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (
+            "team:legacy:1", "decision", "Legacy", "Legacy content", "Legacy content", "{}", "{}", 0.5, "active", None, None, None, None, "agent-a", None, "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00",
+        ))
+        connection.commit()
+        connection.close()
+        store = TeamMemoryStore(path, node_id="node-migrated")
+        value = store.get("team:legacy:1")["result"]
+        bundle = store.export_bundle()
+        self.assertEqual(value["revision"], 1)
+        self.assertEqual(value["origin_node"], "legacy")
+        self.assertIsNone(value["reviewed_by"])
+        self.assertEqual(bundle["schema_version"], 3)
+        self.assertEqual(len(bundle["revisions"]), 1)
 
 
     def test_mcp_stdio_matches_cli_contract(self):

@@ -1139,9 +1139,9 @@ def doctor(root: Path | None = None, source_id: str | None = None) -> dict[str, 
     return {"schema_version": SCHEMA_VERSION, "ok": healthy, "status": "ready" if healthy else "degraded", "active_adapter": active_values[0] if len(active_values) == 1 else active_values, "capabilities": capabilities, "memory": memory[0] if len(memory) == 1 else memory, "team_memory": team_memory_store().health(), "repository": {"status": "ready" if reports else "not_configured", "source_count": len(reports)}, "knowledge_service": {"configured": False, "required": False, "status": "optional"}, "semantic": semantic[0] if len(semantic) == 1 else ({"available": False, "strategy": "keyword-only"} if native_ready else semantic), "routing": routing, "agents": routing.get("agents", {"configured": [], "covered": []}), "sources": reports, "config": config_summary(), "actions": actions}
 
 
-def feedback(root: Path | None, result_id: str, note: str, rating: str | None = None) -> dict[str, Any]:
+def feedback(root: Path | None, result_id: str, note: str, rating: str | None = None, feedback_id: str | None = None) -> dict[str, Any]:
     if result_id.startswith("team:"):
-        return team_memory_store().feedback(result_id, rating or "helpful", note)
+        return team_memory_store().feedback(result_id, rating or "helpful", note, feedback_id=feedback_id)
     destination = data_root() / "feedback.jsonl"
     destination.parent.mkdir(parents=True, exist_ok=True)
     item = {"timestamp": dt.datetime.now(dt.timezone.utc).isoformat(), "repository": str(root) if root else None, "result_id": result_id, "note": note, "rating": rating}
@@ -1334,7 +1334,7 @@ def build_parser() -> argparse.ArgumentParser:
     search_parser = common("search"); search_parser.add_argument("query"); search_parser.add_argument("--limit", type=int, default=5); search_parser.add_argument("--deep", action="store_true"); search_parser.add_argument("--local", action="store_true"); search_parser.add_argument("--scope", choices=("repository", "memory", "all"), default="repository"); search_parser.add_argument("--json", action="store_true")
     get_parser = common("get"); get_parser.add_argument("result_id"); get_parser.add_argument("--commit"); get_parser.add_argument("--json", action="store_true")
     explain_parser = common("explain"); explain_parser.add_argument("result_id"); explain_parser.add_argument("--commit"); explain_parser.add_argument("--json", action="store_true")
-    feedback_parser = common("feedback"); feedback_parser.add_argument("result_id"); feedback_parser.add_argument("--note", required=True); feedback_parser.add_argument("--rating"); feedback_parser.add_argument("--json", action="store_true")
+    feedback_parser = common("feedback"); feedback_parser.add_argument("result_id"); feedback_parser.add_argument("--note", required=True); feedback_parser.add_argument("--rating"); feedback_parser.add_argument("--feedback-id"); feedback_parser.add_argument("--json", action="store_true")
     promote_parser = common("promote"); promote_parser.add_argument("--input", required=True); promote_parser.add_argument("--json", action="store_true")
     publish_parser = common("publish"); publish_parser.add_argument("--input", required=True); publish_parser.add_argument("--status", choices=("candidate", "active"), default="candidate"); publish_parser.add_argument("--json", action="store_true")
     activate_parser = common("team-activate"); activate_parser.add_argument("--id", required=True); activate_parser.add_argument("--reviewer"); activate_parser.add_argument("--json", action="store_true")
@@ -1407,7 +1407,7 @@ def _mcp_dispatch(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         finally:
             path.unlink(missing_ok=True)
     if name == "memory_feedback":
-        return feedback(root, str(arguments.get("id") or ""), str(arguments.get("note") or ""), str(arguments.get("rating") or "helpful"))
+        return feedback(root, str(arguments.get("id") or ""), str(arguments.get("note") or ""), str(arguments.get("rating") or "helpful"), str(arguments.get("feedback_id") or "") or None)
     if name == "memory_supersede":
         if "memory" not in arguments:
             raise ValueError("memory_supersede requires memory")
@@ -1460,7 +1460,7 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
         elif args.command == "explain":
             value = get_result(root if root_arg else None, args.result_id, explain=True, expected_commit=args.commit)
         elif args.command == "feedback":
-            value = feedback(root, args.result_id, args.note, args.rating)
+            value = feedback(root, args.result_id, args.note, args.rating, args.feedback_id)
         elif args.command == "promote":
             value = promote(root, args.input)
         elif args.command == "publish":
