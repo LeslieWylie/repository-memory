@@ -1,7 +1,7 @@
 {
   "id": "repository-memory-autocapture",
   "name": "Repository Memory Auto Capture",
-  "description": "Audit repository-memory evidence routing and capture completed OpenClaw turns through the shared L0-L2 runtime.",
+  "description": "Audit repository-memory evidence and capture reusable shared team memory without blocking ordinary agent work.",
   "version": "0.2.0",
   "activation": {
     "onStartup": true
@@ -11,8 +11,8 @@
     "additionalProperties": false,
     "properties": {
       "enabled": { "type": "boolean", "default": true },
-      "guardEnabled": { "type": "boolean", "default": false, "description": "Enable repository-fact routing audit/enforcement." },
-      "enforcement": { "type": "string", "enum": ["audit", "enforce"], "default": "audit", "description": "audit records violations without blocking tools; enforce blocks bypasses and incomplete receipts." },
+      "guardEnabled": { "type": "boolean", "default": false, "description": "Enable advisory repository-fact routing and final evidence audit." },
+      "enforcement": { "type": "string", "enum": ["audit", "enforce"], "default": "audit", "description": "Compatibility label; this extension remains advisory and records observations without blocking ordinary tools." },
       "runtime": { "type": "string", "description": "The repository-memory CLI executable." },
       "auditPath": { "type": "string", "description": "Optional metadata-only host audit path." },
       "repoToolPrefix": { "type": "string", "default": "repository-memory__", "description": "Host namespace used for repository-memory MCP tools." },

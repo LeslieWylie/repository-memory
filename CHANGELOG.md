@@ -8,9 +8,11 @@ revision is a separate compatibility identifier; see
 ## [Unreleased]
 
 - Keep unreleased changes here until a tagged release is prepared.
-- Narrow host guard enforcement to explicit file reads, source-reading
-  commands, and destructive commands; generic execution and maintenance tools
-  remain available.
+- Add shared Team Memory with explicit publish, context hydration, feedback,
+  supersede lifecycle, and reusable decision/failure/discovery/solution/handoff
+  records.
+- Change the OpenClaw guard to advisory/output-audit behavior; it no longer
+  blocks normal file, shell, Git, test, or debugging tools.
 - Strengthen evaluator qrels validation, citation commit pinning, and
   multi-gold Recall@5 accounting.
 - Add a standard wheel/console entry point and a Windows `msvcrt` snapshot

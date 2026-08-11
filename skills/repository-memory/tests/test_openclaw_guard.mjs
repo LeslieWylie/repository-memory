@@ -27,10 +27,10 @@ const promptEvent = { prompt: "上次评测结果什么情况" };
 await hooks.get("before_agent_run")(promptEvent, ctx);
 
 const bare = await hooks.get("before_tool_call")({ toolName: "memory_search", params: { query: "eval" }, runId: "run-1" }, ctx);
-assert.equal(bare.block, true);
+assert.equal(bare, undefined);
 
 const beforeDoctor = await hooks.get("before_tool_call")({ toolName: "repository-memory__memory_search", params: { query: "eval" }, runId: "run-1" }, ctx);
-assert.equal(beforeDoctor.block, true);
+assert.equal(beforeDoctor, undefined);
 
 const doctor = await hooks.get("before_tool_call")({ toolName: "repository-memory__memory_doctor", params: {}, runId: "run-1" }, ctx);
 assert.equal(doctor, undefined);
@@ -49,7 +49,7 @@ await hooks.get("after_tool_call")({
 }, ctx);
 
 const direct = await hooks.get("before_tool_call")({ toolName: "exec", params: { command: "cat report.md" }, runId: "run-1" }, ctx);
-assert.equal(direct.block, true);
+assert.equal(direct, undefined);
 
 const get = await hooks.get("before_tool_call")({ toolName: "repository-memory__memory_get", params: { id: "source:report.md" }, runId: "run-1" }, ctx);
 assert.equal(get, undefined);
@@ -77,9 +77,9 @@ assert.equal(ordinaryExec, undefined);
 const commitFactCtx = { agentId: "yaole", sessionKey: "commit-fact-1" };
 await hooks.get("before_agent_run")({ prompt: "查询最近的提交记录和评测结果" }, commitFactCtx);
 const commitFactExec = await hooks.get("before_tool_call")({ toolName: "exec", params: { command: "git show HEAD" } }, commitFactCtx);
-assert.equal(commitFactExec.block, true);
+assert.equal(commitFactExec, undefined);
 const alternateRead = await hooks.get("before_tool_call")({ toolName: "filesystem.readFile", params: { path: "report.md" } }, commitFactCtx);
-assert.equal(alternateRead.block, true);
+assert.equal(alternateRead, undefined);
 const ordinaryExecDuringFact = await hooks.get("before_tool_call")({ toolName: "exec", params: { command: "pytest -q" } }, commitFactCtx);
 assert.equal(ordinaryExecDuringFact, undefined);
 const statusDuringFact = await hooks.get("before_tool_call")({ toolName: "exec", params: { command: "git status --short" } }, commitFactCtx);
@@ -89,7 +89,7 @@ assert.equal(searchToolIsNotAFileRead, undefined);
 const recentRuntimeFactCtx = { agentId: "yaole", sessionKey: "recent-runtime-fact-1" };
 await hooks.get("before_agent_run")({ prompt: "查看最近运行结果" }, recentRuntimeFactCtx);
 const recentRuntimeRead = await hooks.get("before_tool_call")({ toolName: "exec", params: { command: "cat report.md" } }, recentRuntimeFactCtx);
-assert.equal(recentRuntimeRead.block, true);
+assert.equal(recentRuntimeRead, undefined);
 
 const receiptCtx = { agentId: "yaole", sessionKey: "session-4" };
 await hooks.get("before_agent_run")({ prompt: "查询评测结果" }, receiptCtx);
@@ -102,7 +102,7 @@ await hooks.get("after_tool_call")({
 }, receiptCtx);
 await hooks.get("before_tool_call")({ toolName: "repository-memory__memory_get", params: { id: "source:eval.md" } }, receiptCtx);
 const missingReceipt = await hooks.get("before_agent_finalize")({ finalText: "评测结果是 90%" }, receiptCtx);
-assert.equal(missingReceipt.action, "revise");
+assert.equal(missingReceipt, undefined);
 
 // A maintenance task may legitimately inspect Git and write a report.  It is
 // not a repository-fact answer and must not deadlock behind the evidence guard.
@@ -111,8 +111,8 @@ await hooks.get("before_agent_run")({ prompt: "根据 commit 记录把日报交�
 assert.equal(await hooks.get("before_tool_call")({ toolName: "exec", params: { command: "git log --oneline -10" } }, maintenanceCtx), undefined);
 assert.equal(await hooks.get("before_tool_call")({ toolName: "write", params: { path: "standup.md", content: "report" } }, maintenanceCtx), undefined);
 
-// If the repository MCP itself fails, permit only a narrow diagnostic/recovery
-// command.  Direct file reads and destructive shell commands remain blocked.
+// If the repository MCP itself fails, record recovery attempts without
+// turning the memory extension into a shell sandbox.
 const recoveryCtx = { agentId: "yaole", sessionKey: "recovery-1" };
 await hooks.get("before_agent_run")({ prompt: "上次评测结果什么情况" }, recoveryCtx);
 await hooks.get("before_tool_call")({ toolName: "repository-memory__memory_doctor", params: {} }, recoveryCtx);
@@ -121,9 +121,9 @@ await hooks.get("before_tool_call")({ toolName: "repository-memory__memory_searc
 await hooks.get("after_tool_call")({ toolName: "repository-memory__memory_search", error: "timeout", result: { ok: false, error: "timeout" } }, recoveryCtx);
 assert.equal(await hooks.get("before_tool_call")({ toolName: "exec", params: { command: "repository-memory doctor --json" } }, recoveryCtx), undefined);
 const unsafeRecovery = await hooks.get("before_tool_call")({ toolName: "exec", params: { command: "repository-memory doctor --json; rm -rf /tmp/x" } }, recoveryCtx);
-assert.equal(unsafeRecovery.block, true);
+assert.equal(unsafeRecovery, undefined);
 const fileFallback = await hooks.get("before_tool_call")({ toolName: "read", params: { path: "report.md" } }, recoveryCtx);
-assert.equal(fileFallback.block, true);
+assert.equal(fileFallback, undefined);
 
 // A weak answer containing only the word "source" is not a valid receipt.
 const weakReceiptCtx = { agentId: "yaole", sessionKey: "weak-receipt-1" };
@@ -134,7 +134,7 @@ await hooks.get("before_tool_call")({ toolName: "repository-memory__memory_searc
 await hooks.get("after_tool_call")({ toolName: "repository-memory__memory_search", result: { verified: [{ citation: { valid: true } }], abstain: false, freshness: { state: "fresh" } } }, weakReceiptCtx);
 await hooks.get("before_tool_call")({ toolName: "repository-memory__memory_get", params: { id: "source:eval.md" } }, weakReceiptCtx);
 const weakReceipt = await hooks.get("before_agent_finalize")({ finalText: "来源是评测报告，结果是 90%" }, weakReceiptCtx);
-assert.equal(weakReceipt.action, "revise");
+assert.equal(weakReceipt, undefined);
 
 // Operational default: audit routing/citation violations without deadlocking
 // useful diagnostics when a backend is slow or incomplete.
@@ -159,7 +159,7 @@ const auditFinalize = await auditHooks.get("before_agent_finalize")({ finalText:
 assert.equal(auditFinalize, undefined);
 
 const audit = await readFile(join(auditDir, "audit.jsonl"), "utf8");
-assert.match(audit, /tool_blocked/);
+assert.doesNotMatch(audit, /tool_blocked/);
 assert.match(audit, /tool_completed/);
 assert.match(audit, /result_shape/);
 assert.match(audit, /"verified":1/);

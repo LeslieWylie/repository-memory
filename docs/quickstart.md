@@ -47,7 +47,19 @@ The exact adapter and counts are environment-specific. `supported_layers`
 means the adapter knows how to inspect those layers; it does not mean every
 layer contains accepted records.
 
-## 3. Ask a question
+## 3. Hydrate a multi-agent task
+
+For coding work, start with the shared context package when previous agent
+work may matter:
+
+```bash
+repository-memory context "What changed in the evaluation pipeline recently?" --json
+```
+
+The response keeps Git evidence separate from Team Memory decisions, failures,
+solutions, discoveries, and handoffs. `team_candidates` are not accepted facts.
+
+## 4. Ask a repository-only question
 
 Send the user's original question unchanged:
 
@@ -61,7 +73,18 @@ If all results are candidates or the answer is negative/unsupported, return an
 explicit abstention. Do not turn the question into a filename and do not read
 the source directly to bypass a failed search.
 
-## 4. Add another source
+## 5. Publish reusable team knowledge explicitly
+
+```bash
+repository-memory publish --input memory.json --status candidate --json
+repository-memory feedback team:decision:<id> --rating helpful --note "reused" --json
+```
+
+Use `type=decision|failure|discovery|solution|handoff`, include scope and
+provenance, and let a reviewer promote candidates to `active` or supersede an
+outdated record.
+
+## 6. Add another source
 
 ```bash
 repository-memory source add --path /path/to/another-repo --id another-repo --json
@@ -70,7 +93,7 @@ repository-memory sync --all --json
 
 Source IDs are local stable handles. They do not need to match a remote name.
 
-## 5. Use conversation memory explicitly
+## 7. Use conversation memory explicitly
 
 ```bash
 repository-memory search "What did we decide about retries?" \
@@ -81,13 +104,13 @@ repository-memory ingest-session --input examples/session.json --json
 Ingestion is a write. It must be requested explicitly. It reports the actual
 L0/L1 read-back status and never silently creates an accepted L2 or L3 record.
 
-## 6. MCP smoke test
+## 8. MCP smoke test
 
 ```bash
 repository-memory mcp
 ```
 
 The process speaks stdio. A host should register the process, then call
-`memory_doctor`, `memory_search`, and `memory_get`. The host namespace may
+`memory_doctor`, `memory_context`, and `memory_get`. The host namespace may
 prefix these names; use the registered namespace, not a bare unrelated
 `memory_search` tool.

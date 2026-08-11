@@ -40,14 +40,16 @@ use the local fallback and will report its actual supported layers.
 
 ## OpenClaw still reads files directly
 
-The guard is host-dependent and intentionally narrow. It only treats explicit
-file reads and high-confidence source-reading commands as bypasses; ordinary
-`exec`, tests, builds, `git status`, and patch operations remain available.
+The extension is advisory and host-dependent. It records explicit file reads
+and high-confidence source-reading commands as routing observations; ordinary
+`exec`, tests, builds, shell, Git, and patch operations remain available.
 Confirm the profile-local extension is in the
 profile's own `extensions/` directory, that the plugin is allowed, and that
 `guardEnabled=true`. The default `enforcement=audit` records direct fallback
-without blocking it; use `enforcement=enforce` only when a hard routing gate is
-intended. A host without `before_tool_call` cannot provide a hard block.
+without blocking it. The old `enforcement=enforce` setting is retained for
+configuration compatibility but does not turn this extension into a shell
+sandbox. A host without `before_tool_call` can still use the MCP contract, but
+cannot provide routing audit receipts.
 
 If only one OpenClaw agent should use Repository Memory, install with
 `--openclaw-agent <id>`. The installer no longer silently writes the Skill and
@@ -63,9 +65,9 @@ namespaced Repository Memory MCP. The correct sequence is:
 memory_doctor -> memory_search -> memory_get
 ```
 
-If the namespaced query has no verified citation, abstain. Do not fall back to
-`read`, `exec`, grep, or a direct file scan while claiming the answer came from
-Repository Memory.
+If the namespaced query has no verified citation, mark the repository claim
+unknown. Direct workspace inspection is allowed for a coding task, but do not
+claim it came from Repository Memory.
 
 ## MCP client compatibility
 

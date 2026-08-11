@@ -158,10 +158,6 @@ function isSafeRecoveryCommand(command) {
     || /\b(?:ps|lsof)\b/i.test(command);
 }
 
-function auditOnly(cfg) {
-  return cfg.enforcement !== "enforce";
-}
-
 function parseResult(value) {
   if (value && typeof value === "object") {
     if (Array.isArray(value)) {
@@ -211,9 +207,10 @@ function isResultPayload(value) {
 function resultCounts(value) {
   const result = parseResult(value);
   const verified = Array.isArray(result.verified) ? result.verified : Array.isArray(result.results) ? result.results : [];
+  const contextEvidence = Array.isArray(result.context?.repository_evidence) ? result.context.repository_evidence : [];
   const groups = result.groups && typeof result.groups === "object" ? Object.values(result.groups) : [];
   const groupedVerified = groups.flatMap((group) => Array.isArray(group?.verified) ? group.verified : []);
-  const items = groupedVerified.length ? groupedVerified : verified;
+  const items = groupedVerified.length ? groupedVerified : contextEvidence.length ? contextEvidence : verified;
   const citations = items.filter((item) => item?.citation?.valid === true || item?.citation_valid === true).length;
   const freshnessValue = result.freshness;
   const freshness = freshnessValue && typeof freshnessValue === "object"
@@ -298,7 +295,7 @@ function runCapture(cfg, payload) {
 export default {
   id: PLUGIN_ID,
   name: "Repository Memory Auto Capture and Guard",
-  description: "Enforce repository-memory evidence routing and capture completed turns into the shared L0-L2 pipeline.",
+  description: "Audit repository-memory evidence and capture reusable shared team memory without blocking normal agent work.",
   register(api) {
     const raw = api.pluginConfig && typeof api.pluginConfig === "object" ? api.pluginConfig : {};
     const cfg = {
@@ -309,6 +306,8 @@ export default {
       repoToolPrefix: typeof raw.repoToolPrefix === "string" ? raw.repoToolPrefix : "repository-memory__",
       // Audit is the usable default: preserve routing receipts without
       // deadlocking diagnostics or ordinary work when a backend is slow.
+      // ``enforcement`` is retained for config compatibility, but the guard
+      // itself is advisory: it must not become a capability sandbox.
       enforcement: raw.enforcement === "enforce" ? "enforce" : "audit",
       agentIds: Array.isArray(raw.agentIds) ? raw.agentIds.filter((item) => typeof item === "string") : [],
       maxMessages: Math.max(4, Math.min(64, Number(raw.maxMessages) || 24)),
@@ -331,6 +330,7 @@ export default {
           doctorCompleted: false,
           doctorFailed: false,
           search: false,
+          context: false,
           searchCompleted: false,
           searchFailed: false,
           get: false,
@@ -351,23 +351,20 @@ export default {
       api.on("before_tool_call", async (event, ctx) => {
         if (!isAllowedAgent(cfg, ctx)) return;
         const toolName = optional(event?.toolName) || "unknown";
-        const key = stateKey(ctx, event);
         const state = agentState(cfg, ctx, event);
         if (bareHostMemoryTool(toolName) && state?.strict) {
-          const eventName = auditOnly(cfg) ? "tool_audited" : "tool_blocked";
-          await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: eventName, tool: toolName, reason: "bare host memory backend is not repository-memory" });
-          if (auditOnly(cfg)) {
-            await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "policy_warning", tool: toolName, reason: "bare host memory backend is not repository-memory" });
-            return;
-          }
-          return { block: true, blockReason: "Use the namespaced repository-memory MCP tools. A bare host memory_search is not a repository citation source." };
+          await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "tool_audited", tool: toolName, reason: "bare host memory backend is outside the repository-memory evidence plane" });
         }
         if (!state?.strict) return;
         if (repoTool(cfg, toolName, "memory_search")) {
           if (!state.doctorCompleted) {
             await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "policy_warning", tool: toolName, reason: "repository search started before a successful doctor" });
-            if (!auditOnly(cfg)) return { block: true, blockReason: "Call repository-memory__memory_doctor and wait for a successful result before repository search." };
           }
+          state.search = true;
+          return;
+        }
+        if (repoTool(cfg, toolName, "memory_context")) {
+          state.context = true;
           state.search = true;
           return;
         }
@@ -382,7 +379,6 @@ export default {
         if (repoTool(cfg, toolName, "memory_get")) {
           if (!state.searchCompleted) {
             await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "policy_warning", tool: toolName, reason: "memory_get started before repository search" });
-            if (!auditOnly(cfg)) return { block: true, blockReason: "Call repository-memory__memory_search before memory_get." };
           }
           state.get = true;
           return;
@@ -396,26 +392,28 @@ export default {
         }
         const evidenceBypass = directKind === "file-read" || (directKind === "shell" && (isEvidenceReadCommand(command) || isDestructiveCommand(command)));
         if (evidenceBypass) {
-          const eventName = auditOnly(cfg) ? "tool_audited" : "tool_blocked";
-          await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: eventName, tool: toolName, reason: "repository-fact request must not bypass MCP" });
-          if (auditOnly(cfg)) {
-            await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "policy_warning", tool: toolName, reason: "repository-fact request used direct file/shell access" });
-            return;
-          }
-          return { block: true, blockReason: "Repository-fact turns must use repository-memory MCP. Direct file/shell fallback is blocked; after an MCP failure only a safe repository-memory diagnostic/recovery command is allowed." };
+          await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "tool_audited", tool: toolName, reason: "repository-fact turn used direct file/shell access; final evidence remains the agent's responsibility" });
         }
       }, { priority: 100, timeoutMs: 5000 });
 
       api.on("after_tool_call", async (event, ctx) => {
         if (!isAllowedAgent(cfg, ctx)) return;
         const toolName = optional(event?.toolName) || "unknown";
-        const key = stateKey(ctx, event);
         const state = agentState(cfg, ctx, event);
         const repoSearch = repoTool(cfg, toolName, "memory_search");
+        const contextTool = repoTool(cfg, toolName, "memory_context");
         const result = event?.result ?? event?.output ?? event?.resultText;
-        const counts = repoSearch ? resultCounts(result) : { verified: 0, citations: 0, abstain: false, freshness: null, failed: false };
-        if (repoSearch && event?.error) counts.failed = true;
-        if (repoSearch && state) {
+        const counts = repoSearch || contextTool ? resultCounts(result) : { verified: 0, citations: 0, abstain: false, freshness: null, failed: false };
+        if ((repoSearch || contextTool) && event?.error) counts.failed = true;
+        if ((repoSearch || contextTool) && state) {
+          state.searchCompleted = true;
+          state.searchFailed = counts.failed;
+          state.verified = counts.verified;
+          state.citations = counts.citations;
+          state.abstain = counts.abstain;
+        }
+        if (state && repoTool(cfg, toolName, "memory_context")) {
+          state.context = true;
           state.searchCompleted = true;
           state.searchFailed = counts.failed;
           state.verified = counts.verified;
@@ -448,28 +446,20 @@ export default {
 
       api.on("before_agent_finalize", async (_event, ctx) => {
         if (!isAllowedAgent(cfg, ctx)) return;
-        const key = stateKey(ctx, _event);
         const state = agentState(cfg, ctx, _event);
         if (!state?.strict || state.revisionRequested) return;
         const answer = finalAnswerText(_event);
         const missingReceipt = Boolean(answer) && state.verified > 0 && !hasEvidenceReceipt(answer);
-        const missingAbstain = Boolean(answer) && state.verified === 0 && !state.abstain && !hasExplicitAbstention(answer);
-        if (!state.searchCompleted || (state.verified > 0 && !state.get) || missingReceipt || missingAbstain) {
-          if (auditOnly(cfg)) {
-            await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "finalize_warning", reason: missingReceipt || missingAbstain ? "repository-memory answer receipt incomplete" : "repository-memory sequence incomplete", search_failed: state.searchFailed === true });
-            return;
-          }
-          state.revisionRequested = true;
-          await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "finalize_revision", reason: missingReceipt || missingAbstain ? "repository-memory answer receipt incomplete" : "repository-memory sequence incomplete", search_failed: state.searchFailed === true });
-          return {
-            action: "revise",
-            reason: missingReceipt || missingAbstain ? "Repository-memory answer must include an evidence receipt or explicit abstention." : "Repository-memory evidence sequence was not observed.",
-            retry: {
-              instruction: "Use the namespaced repository-memory doctor/search/get tools. If search fails, you may run only a safe repository-memory diagnostic/recovery command; never read files or use an unrelated shell fallback. If no verified citation remains, answer with an explicit abstention.",
-              idempotencyKey: `${key}:repository-memory-guard`,
-              maxAttempts: 1,
-            },
-          };
+        const missingRetrieval = Boolean(answer) && !state.searchCompleted && !hasExplicitAbstention(answer);
+        const emptyRetrieval = Boolean(answer) && state.searchCompleted && state.verified === 0 && !state.abstain && !hasExplicitAbstention(answer);
+        if (missingReceipt || missingRetrieval || emptyRetrieval) {
+          await appendAudit(cfg, {
+            agent: optional(ctx?.agentId) || "main",
+            run_id: optional(ctx?.runId) || null,
+            event: "finalize_warning",
+            reason: missingReceipt ? "repository-memory answer receipt incomplete" : missingRetrieval ? "repository-fact answer had no observed shared-memory retrieval" : "repository-memory answer had no verified result or explicit abstention",
+            search_failed: state.searchFailed === true,
+          });
         }
       }, { priority: 100, timeoutMs: 5000 });
     }
@@ -490,6 +480,7 @@ export default {
         intent: state?.mode || "ordinary",
         doctor: state?.doctor === true,
         search: state?.searchCompleted === true,
+        context: state?.context === true,
         get: state?.get === true,
         recovery: state?.recovery === true,
         verified: Number(state?.verified || 0),

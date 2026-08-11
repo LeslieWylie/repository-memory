@@ -292,6 +292,43 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertFalse(promoted["canonical_repo_changed"])
         self.assertEqual(before_status, after_status)
 
+    def test_shared_team_memory_context_lifecycle_and_feedback(self):
+        record_input = Path(self.temp.name) / "team-memory.json"
+        record_input.write_text(json.dumps({
+            "type": "decision",
+            "title": "Use isolated worktrees",
+            "content": "Each issue uses an isolated persistent worktree; do not work from the canonical clone.",
+            "scope": {"repo": "alpha", "issue": "A-42"},
+            "provenance": {"agent": "planner", "commits": ["abc1234"]},
+            "confidence": 0.9,
+            "status": "active",
+        }), encoding="utf-8")
+        published = core.publish_memory(str(record_input), status="active")
+        memory = published["published"][0]["memory"]
+        self.assertTrue(memory["id"].startswith("team:decision:"))
+        context = core.memory_context(None, "isolated worktree Atlas evidence", repo="alpha")
+        self.assertTrue(context["context"]["repository_evidence"])
+        self.assertEqual(context["context"]["decisions"][0]["id"], memory["id"])
+        self.assertEqual(context["retrieval_mode"], "hybrid-lexical")
+        self.assertFalse(context["semantic_available"])
+
+        feedback = core.feedback(None, memory["id"], "reused successfully", "helpful")
+        self.assertTrue(feedback["ok"])
+        replacement_input = Path(self.temp.name) / "replacement.json"
+        replacement_input.write_text(json.dumps({
+            "type": "decision",
+            "title": "Use isolated worktrees, updated",
+            "content": "Keep one isolated worktree per issue and record the branch in the handoff.",
+            "scope": {"repo": "alpha", "issue": "A-42"},
+            "provenance": {"agent": "reviewer", "commits": ["def5678"]},
+            "confidence": 0.95,
+        }), encoding="utf-8")
+        superseded = core.supersede_memory(memory["id"], str(replacement_input))
+        replacement_id = superseded["replacement"]["memory"]["id"]
+        self.assertEqual(core.get_result(None, memory["id"])["result"]["status"], "superseded")
+        self.assertEqual(core.get_result(None, replacement_id)["result"]["status"], "active")
+
+
     def test_mcp_stdio_matches_cli_contract(self):
         command = [sys.executable, str(SCRIPTS / "repository-memory.py"), "mcp", "--root", str(self.alpha)]
         modern_meta = {
@@ -304,6 +341,7 @@ class RepositoryMemoryTest(unittest.TestCase):
             {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {"_meta": modern_meta}},
             {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"_meta": modern_meta, "name": "memory_search", "arguments": {"query": "Atlas evidence"}}},
             {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"_meta": modern_meta, "name": "not-a-memory-tool", "arguments": {"source": "alpha"}}},
+            {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"_meta": modern_meta, "name": "memory_context", "arguments": {"query": "Atlas evidence"}}},
         ]
         process = subprocess.run(command, input="\n".join(json.dumps(item) for item in requests) + "\n", text=True, capture_output=True, check=True)
         responses = [json.loads(line) for line in process.stdout.splitlines() if line.strip()]
@@ -311,13 +349,16 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(responses[0]["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "repository-memory")
         self.assertEqual(responses[0]["result"]["resultType"], "complete")
         self.assertEqual(responses[1]["result"]["resultType"], "complete")
-        self.assertEqual({tool["name"] for tool in responses[1]["result"]["tools"]}, {"memory_doctor", "memory_sync", "memory_search", "memory_get", "memory_init", "memory_ingest"})
+        self.assertEqual({tool["name"] for tool in responses[1]["result"]["tools"]}, {"memory_doctor", "memory_sync", "memory_search", "memory_get", "memory_init", "memory_ingest", "memory_context", "memory_publish", "memory_feedback", "memory_supersede"})
         payload = responses[2]["result"]["structuredContent"]
         self.assertEqual(responses[2]["result"]["resultType"], "complete")
         self.assertIn("verified", payload)
         self.assertIn("candidates", payload)
         self.assertFalse(payload["abstain"])
         self.assertEqual({item["source"] for item in payload["verified"]}, {"alpha"})
+        context_payload = responses[4]["result"]["structuredContent"]
+        self.assertIn("repository_evidence", context_payload["context"])
+        self.assertEqual(context_payload["semantic_available"], False)
         error_data = responses[3]["error"]["data"]
         self.assertEqual(error_data["adapter"], "repository-memory-runtime")
         self.assertEqual(error_data["source"], "alpha")
@@ -800,7 +841,7 @@ class RepositoryMemoryTest(unittest.TestCase):
         with patch.dict(os.environ, {"HOME": str(home)}):
             routing = core._openclaw_routing()
         self.assertEqual(routing["status"], "ready")
-        self.assertEqual(routing["guard"], "audit")
+        self.assertEqual(routing["guard"], "advisory")
         self.assertEqual(routing["agents"]["scope"], "allowlist")
         self.assertEqual(routing["agents"]["covered"], ["yaole"])
         self.assertEqual(routing["agents"]["excluded"], ["other"])
@@ -815,6 +856,20 @@ class RepositoryMemoryTest(unittest.TestCase):
             result = core._mcp_dispatch("memory_ingest", {"session": {"messages": [{"role": "user", "content": "remember this"}]}, "source": "mcp"})
             self.assertTrue(result["ok"])
             ingest.assert_called_once()
+
+    def test_mcp_shared_team_memory_tools_use_same_runtime(self):
+        published = core._mcp_dispatch("memory_publish", {"memory": {
+            "type": "handoff",
+            "title": "Review handoff",
+            "content": "Review the isolated worktree decision before changing the runner.",
+            "scope": {"repo": "alpha", "issue": "A-7"},
+            "provenance": {"agent": "coder"},
+        }, "status": "active"})
+        memory_id = published["published"][0]["memory"]["id"]
+        context = core._mcp_dispatch("memory_context", {"query": "isolated worktree runner", "repo": "alpha"})
+        self.assertEqual(context["context"]["handoffs"][0]["id"], memory_id)
+        feedback = core._mcp_dispatch("memory_feedback", {"id": memory_id, "rating": "helpful", "note": "used"})
+        self.assertTrue(feedback["ok"])
 
     def test_memory_scope_works_without_repository_source(self):
         client = Mock()
@@ -866,6 +921,28 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertTrue(fetched["found"])
         self.assertEqual(fetched["source"], "local-memory")
         self.assertFalse(subprocess.check_output(["git", "-C", str(self.alpha), "status", "--porcelain"], text=True))
+
+    def test_capture_turn_creates_one_team_candidate_without_accepting_it(self):
+        self.write_config({})
+        os.environ["REPOSITORY_MEMORY_AUTODISCOVER"] = "0"
+        payload = {
+            "session_id": "capture-session",
+            "run_id": "capture-run",
+            "agent_id": "coder",
+            "messages": [
+                {"role": "user", "content": "记录这次决定"},
+                {"role": "assistant", "content": "决定：每个 issue 使用独立 worktree，避免共享 canonical clone。"},
+            ],
+        }
+        first = core.capture_turn(None, payload)
+        second = core.capture_turn(None, payload)
+        self.assertTrue(first["ok"])
+        self.assertEqual(first["team_memory"]["status"], "candidate")
+        self.assertTrue(first["team_memory"]["created"])
+        self.assertTrue(second["duplicate"])
+        context = core.memory_context(None, "独立 worktree canonical clone")
+        self.assertEqual(context["context"]["team_memory"], [])
+        self.assertTrue(context["context"]["team_candidates"])
 
     def test_memory_ingest_does_not_require_repository_source(self):
         client = Mock()

@@ -30,6 +30,12 @@ L0 durable conversation --read-back--> verified
                                       L3 profile/core --read-back--> accepted
 ```
 
+When the answer is substantive and looks like a reusable decision, failure,
+discovery, solution, or handoff, the callback also creates a `team_memory`
+candidate with an idempotency key. This is still pending review; ordinary
+short conversation is ignored and no Team Memory record becomes `active`
+automatically.
+
 The hook is deliberately conservative. It does not capture system prompts,
 developer instructions, tool outputs, or function arguments. It bounds the
 number and size of messages, redacts common credential forms, and uses a
@@ -80,8 +86,9 @@ turn in an isolated identity/session:
 4. an L2 candidate is returned only for a durable turn;
 5. a duplicate event does not create a second candidate;
 6. a fabricated search does not return the candidate as `verified`;
-7. explicit acceptance produces an L3 read-back;
-8. the canonical repository remains unchanged.
+7. a substantive turn creates at most one Team Memory candidate;
+8. explicit acceptance produces an L3 read-back;
+9. the canonical repository remains unchanged.
 
 The same checks should be repeated for each host/profile that opts in. A Skill
 installation alone does not prove that a host lifecycle hook is registered.

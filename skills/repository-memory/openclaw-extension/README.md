@@ -6,17 +6,17 @@ OpenClaw `agent_end` lifecycle event and invokes the installed
 
 When `guardEnabled` is on, the host policy has three intent classes:
 
-- `repository-fact`: doctor → search → get, verified citation or abstention;
+- `repository-fact`: prefer doctor → context/search → get, verified citation or
+  an explicit uncertainty statement;
 - `maintenance`: Git inspection, tests, report generation, and explicit writes
   remain available;
 - `ordinary`: no repository-memory routing requirement.
 
-The installer sets `enforcement=audit` by default. In audit mode, the extension
-records wrong routes, missing doctor/search/get steps, direct fallback, and
-incomplete receipts, but does not block the host's tools. Set
-`enforcement=enforce` only for a controlled evaluation or compliance run; that
-mode blocks bypasses and can revise incomplete answers. This keeps an MCP outage
-from deadlocking repair work while preserving an auditable evidence contract.
+The installer sets `enforcement=audit` by default. The extension records wrong
+routes, missing doctor/search/get steps, direct fallback, and incomplete
+receipts, but does not block the host's tools in either mode. The old
+`enforcement=enforce` value is retained for configuration compatibility; it is
+not a shell sandbox and cannot deadlock repair work.
 
 The write contract is deliberately conservative:
 

@@ -1,0 +1,70 @@
+# Shared Team Memory
+
+Team Memory is the compact knowledge plane shared by multiple agents. It is
+not a copy of every conversation and it is not a replacement for Git evidence.
+Use it for information that another agent can reuse:
+
+```text
+evidence | decision | discovery | failure | solution | handoff
+```
+
+## Publish contract
+
+`memory_publish` is an explicit write. A record should contain:
+
+```json
+{
+  "type": "failure",
+  "title": "Network reachability, not authentication, caused the download failure",
+  "content": "...what was observed, attempted, and resolved...",
+  "scope": {"repo": "example", "issue": "EX-42", "branch": "fix/network"},
+  "provenance": {"agent": "coder", "session": "...", "commits": ["abc123"]},
+  "confidence": 0.9
+}
+```
+
+New records default to `candidate`. A caller may explicitly publish an
+`active` record when the result has been reviewed or has sufficient direct
+provenance. The runtime rejects secret-like content and records are stored in
+the user-level data directory, not the canonical repository.
+
+## Lifecycle
+
+```text
+candidate -> active -> superseded
+                    \-> stale
+```
+
+`memory_supersede` publishes a replacement and marks the old record
+`superseded`; search excludes superseded and stale records by default. This
+prevents a later correction from competing with an obsolete decision.
+
+`memory_feedback` accepts `helpful`, `not_helpful`, `stale`, or `wrong`. The
+feedback affects reuse ranking and lowers confidence for stale/wrong reports;
+it does not silently rewrite the content.
+
+## Context hydration
+
+Call `memory_context` at task start when prior agent work may matter. It runs
+repository retrieval and Team Memory retrieval in their own ranking planes and
+returns a single package with these sections:
+
+- `repository_evidence`: source-backed, commit/path/line citations;
+- `decisions`, `failures`, `solutions`, `discoveries`, `handoffs`:
+  experience-backed records with their own provenance;
+- `repository_candidates` and `team_candidates`: leads that must not be stated
+  as facts without checking;
+- `diagnostics`: lexical/semantic capability, counts, and the explicit
+  no-score-fusion policy.
+
+The package is a retrieval fusion seam, not a black-box RRF score. A Git
+citation remains a Git citation; an experience record remains an experience
+record. Agents should explain which section supports each claim.
+
+## Automatic capture boundary
+
+Host lifecycle capture may write raw L0 and an L2 candidate, but it should not
+turn every assistant message into Team Memory. A task-end extractor should
+publish only reusable decisions, discoveries, failures, solutions, or handoffs
+and use an idempotency key. L3/profile promotion remains a separate explicit
+operation.

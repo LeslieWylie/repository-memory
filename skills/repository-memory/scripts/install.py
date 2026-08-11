@@ -34,6 +34,10 @@ MCP_TOOLS = [
     "memory_get",
     "memory_init",
     "memory_ingest",
+    "memory_context",
+    "memory_publish",
+    "memory_feedback",
+    "memory_supersede",
 ]
 OPENCLAW_TOOLS = [f"{MCP_NAME}__{name}" for name in MCP_TOOLS]
 

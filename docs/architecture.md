@@ -10,7 +10,11 @@ Repository Memory has four deliberately separate boundaries:
    commit, path, line range, and excerpt are stored with each result.
 3. **Conversation memory** is an optional adapter. It preserves L0/L1/L2/L3
    layer identity and never becomes repository evidence.
-4. **Host integration** is a thin MCP registration and optional lifecycle
+4. **Shared Team Memory** is a user-level derived SQLite plane for reusable
+   decisions, failures, discoveries, solutions, and handoffs. Its experience
+   provenance is separate from Git citations and its lifecycle supports
+   candidate, active, stale, and superseded states.
+5. **Host integration** is a thin MCP registration and optional lifecycle
    extension. It does not contain a second ranking or storage implementation.
 
 ## Request path
@@ -25,9 +29,20 @@ MCP / CLI
   -> normalized verified/candidates contract
 ```
 
-The source adapter ranks within its own source. Results from different sources
-are kept in source groups or deterministically interleaved; scores are not
-combined into an opaque global RRF score.
+Task context path:
+
+```text
+memory_context
+  -> repository evidence retrieval
+  -> Team Memory retrieval (metadata filters + lexical/recency/reuse ranking)
+  -> sectioned context package
+  -> agent
+```
+
+The source adapter ranks within its own source. `memory_context` is the fusion
+seam, but it returns repository evidence, decisions, failures, solutions,
+discoveries, and handoffs as separate sections. Scores are not combined into
+an opaque global RRF score.
 
 ## Freshness
 
@@ -65,6 +80,16 @@ explicit ingest or opt-in capture
 An empty L2/L3 store is reported as empty or unsupported. An API endpoint being
 reachable only proves capability, not accumulated quality.
 
+Shared Team Memory follows a separate state machine:
+
+```text
+explicit publish or bounded task-end extraction
+  -> candidate
+  -> explicit review/active
+  -> feedback and reuse ranking
+  -> explicit supersede or stale transition
+```
+
 ## MCP transport
 
 The server is a stdio process. It accepts the modern metadata/discovery path
@@ -77,5 +102,5 @@ validated. Tool calls dispatch directly to the same functions used by the CLI.
 Credentials are read at runtime from user configuration, environment, or an
 OS secret store. They are not written to source indexes, MCP responses, audit
 records, or Git. The audit proxy records tool metadata, counts, freshness, and
-latency, not full query/answer bodies. The OpenClaw guard blocks repository-fact
-bypasses only when the host actually exposes the required lifecycle hooks.
+latency, not full query/answer bodies. The OpenClaw guard is advisory/output
+validation and does not block normal file, shell, Git, test, or debugging tools.

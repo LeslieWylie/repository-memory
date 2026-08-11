@@ -48,5 +48,6 @@ py-modules = [
   "models",
   "repository_memory",
   "snapshot",
+  "team_memory",
   "version",
 ]

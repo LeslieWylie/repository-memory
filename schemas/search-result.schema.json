@@ -1,11 +1,11 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/LeslieWylie/repository-memory/schema/search-result-v3.json",
+  "$id": "https://github.com/LeslieWylie/repository-memory/schema/search-result-v4.json",
   "title": "Repository Memory search result",
   "type": "object",
   "required": ["schema_version", "query", "mode", "scope", "verified", "candidates", "abstain"],
   "properties": {
-    "schema_version": { "const": 3 },
+    "schema_version": { "const": 4 },
     "query": { "type": "string" },
     "mode": { "type": "string", "enum": ["exact", "semantic", "temporal", "cross-source", "deep"] },
     "scope": { "type": "string", "enum": ["repository", "memory", "all"] },
