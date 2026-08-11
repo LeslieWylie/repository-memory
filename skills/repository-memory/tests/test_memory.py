@@ -745,6 +745,32 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertFalse(payload["abstain"])
         self.assertEqual(payload["verified"][0]["path"], "docs/atlas.md")
 
+    def test_openclaw_allowlist_is_ready_without_covering_unselected_agents(self):
+        home = Path(self.temp.name) / "openclaw-home"
+        config_path = home / ".openclaw" / "openclaw.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(json.dumps({
+            "agents": {"list": [{"id": "yaole"}, {"id": "other"}]},
+            "mcp": {"servers": {"repository-memory": {}}},
+            "plugins": {"entries": {
+                "repository-memory-autocapture": {"enabled": True, "config": {
+                    "enabled": True,
+                    "guardEnabled": True,
+                    "enforcement": "audit",
+                    "agentIds": ["yaole"],
+                }},
+                "active-memory": {"enabled": False},
+                "memmy-memory": {"enabled": False},
+            }},
+        }), encoding="utf-8")
+        with patch.dict(os.environ, {"HOME": str(home)}):
+            routing = core._openclaw_routing()
+        self.assertEqual(routing["status"], "ready")
+        self.assertEqual(routing["guard"], "audit")
+        self.assertEqual(routing["agents"]["scope"], "allowlist")
+        self.assertEqual(routing["agents"]["covered"], ["yaole"])
+        self.assertEqual(routing["agents"]["excluded"], ["other"])
+
     def test_mcp_init_is_explicit_and_ingest_accepts_session_payload(self):
         knowledge = Path(self.temp.name) / "mcp-knowledge"
         knowledge.mkdir()

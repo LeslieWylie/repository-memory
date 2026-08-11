@@ -182,13 +182,16 @@ def _openclaw_routing() -> dict[str, Any]:
     if not isinstance(allowed_agents, list) or not all(isinstance(item, str) for item in allowed_agents):
         allowed_agents = []
     covered_agents = configured_agents if not allowed_agents else [agent_id for agent_id in configured_agents if agent_id in allowed_agents]
+    excluded_agents = [] if not allowed_agents else [agent_id for agent_id in configured_agents if agent_id not in allowed_agents]
     mcp_servers = config.get("mcp", {}).get("servers", {}) if isinstance(config.get("mcp"), dict) else {}
     repository_mcp = "ready" if isinstance(mcp_servers, dict) and isinstance(mcp_servers.get("repository-memory"), dict) else "missing"
     builtin_status = "disabled" if not enabled_agent_memory else "enabled"
     active_status = "disabled" if active_memory.get("enabled") is False else "enabled"
     legacy_status = "disabled" if memmy.get("enabled") is False and plugins.get("slots", {}).get("memory") != "memmy-memory" else "legacy-active"
-    coverage_ok = bool(configured_agents) and set(covered_agents) == set(configured_agents)
-    guard_status = "enforce" if guard_enabled and coverage_ok and enforcement == "enforce" else "audit" if guard_enabled and coverage_ok else "partial" if guard_enabled else "disabled"
+    allowlist_ok = bool(configured_agents) and bool(allowed_agents) and set(allowed_agents).issubset(set(configured_agents))
+    coverage_ok = bool(configured_agents) and (not allowed_agents or set(covered_agents) == set(configured_agents))
+    guard_ready = allowlist_ok if allowed_agents else coverage_ok
+    guard_status = "enforce" if guard_enabled and guard_ready and enforcement == "enforce" else "audit" if guard_enabled and guard_ready else "partial" if guard_enabled else "disabled"
     managed_ready = repository_mcp == "ready" and builtin_status == "disabled" and active_status == "disabled" and guard_status in {"audit", "enforce"}
     return {
         "status": "ready" if managed_ready else "degraded",
@@ -200,7 +203,7 @@ def _openclaw_routing() -> dict[str, Any]:
         "guard_enforcement": enforcement if guard_enabled else "disabled",
         "legacy_memory": legacy_status,
         "active_memory": active_status,
-        "agents": {"configured": configured_agents, "covered": covered_agents},
+        "agents": {"configured": configured_agents, "covered": covered_agents, "excluded": excluded_agents, "scope": "allowlist" if allowed_agents else "all"},
     }
 
 
