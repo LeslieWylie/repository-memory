@@ -82,12 +82,13 @@ function isExplicitDirectOperation(prompt) {
 function isMaintenancePrompt(prompt) {
   if (!prompt) return false;
   if (isExplicitDirectOperation(prompt)) return true;
-  return /修复|实现|重构|审计|审核|评审|检查代码|改代码|开发|调试|(?:测试)(?:代码|用例|失败|一下|这个)|(?:验证)(?:修复|结果是否|一下|这个)|生成|写入|写日报|更新日报|(?:更新)(?:代码|分支|上去|一下|这个)|创建|修改|删除|安装|升级|(?:提交)(?:代码|变更|这个分支|到|上去|PR)|推送|合并|rebase|重启|启动|停止|排查|诊断|运行|执行|同步|拉取|交付|交了|整理|发布|部署|fix|implement|refactor|audit|review|(?:test)\s+(?:code|suite|failure)|verify\s+(?:the\s+)?(?:fix|result)|generate|write|update\s+(?:code|branch|report)|create|modify|delete|install|upgrade|commit\s+(?:changes|this|the\s+branch)|push|merge|restart|start|stop|diagnose|run|sync|deploy/i.test(prompt);
+  return /修复|实现|重构|审计|审核|评审|检查代码|改代码|开发|调试|(?:测试)(?:代码|用例|失败|一下|这个)|(?:验证)(?:修复|结果是否|一下|这个)|生成|写入|写日报|更新日报|(?:更新)(?:代码|分支|上去|一下|这个|报告)|创建|修改|删除|安装|升级|(?:提交)(?:代码|变更|这个分支|到|上去|PR)|推送|合并|rebase|重启|启动|停止|排查|诊断|交付|交了|整理|发布|部署|fix|implement|refactor|audit|review|(?:test)\s+(?:code|suite|failure)|verify\s+(?:the\s+)?(?:fix|result)|generate|write|update\s+(?:code|branch|report)|create|modify|delete|install|upgrade|commit\s+(?:changes|this|the\s+branch)|push|merge|restart|start|stop|diagnose|deploy/i.test(prompt)
+    || /(?:运行|执行)\s*(?:命令|测试|脚本|任务|用例|pytest|npm|一下)|(?:同步|拉取)\s*(?:仓库|分支|源|代码|文件|一下)|\b(?:run|sync)\s+(?:tests?|commands?|scripts?|repo(?:sitory)?|branch)/i.test(prompt);
 }
 
 function isRepositoryFactPrompt(prompt) {
   if (!prompt || isMaintenancePrompt(prompt)) return false;
-  return /记忆|知识库|仓库|代码库|实验结果|评测结果|日报|周报|历史报告|研究结论|最近在做|最近做了什么|上次|之前|进展|状态|根据记录|来源|证据|citation|repository|repo\b|experiment|evaluation|benchmark|latest|recent|history|report|according to/i.test(prompt);
+  return /记忆|知识库|仓库|代码库|实验结果|评测结果|日报|周报|历史报告|研究结论|最近|最新|运行结果|最近在做|最近做了什么|上次|之前|进展|状态|根据记录|来源|证据|citation|repository|repo\b|experiment|evaluation|benchmark|latest|recent|history|report|according to/i.test(prompt);
 }
 
 function promptPolicy(prompt) {
@@ -105,16 +106,47 @@ function bareHostMemoryTool(toolName) {
   return toolName === "memory_search" || toolName === "memory_get";
 }
 
-function directTool(toolName) {
-  const name = String(toolName || "").toLowerCase();
-  if (["read", "exec", "code_mode_exec", "write", "edit", "apply_patch", "file_read", "file_write", "file_edit", "delete", "shell", "terminal", "git"].includes(name)) return true;
-  if (/(?:^|[._-])(?:fs|filesystem|file)(?:$|[._-])/.test(name)) return true;
-  return /(?:^|[._-])(exec|shell|terminal|bash|zsh|python|read|write|edit|patch|file|git)(?:$|[._-])/.test(name);
+function directToolKind(toolName) {
+  const name = String(toolName || "").toLowerCase().trim();
+  const fileReadNames = new Set([
+    "read",
+    "file_read",
+    "read_file",
+    "filesystem.readfile",
+    "filesystem.read_file",
+    "fs.readfile",
+    "fs.read_file",
+  ]);
+  if (fileReadNames.has(name)) return "file-read";
+  if (/(?:^|[._:-])(?:filesystem|fs|file)(?:[._:-])(?:read|readfile|read_file)$/.test(name)) return "file-read";
+
+  // Only recognize an actual shell/code execution surface.  Do not classify
+  // arbitrary tools such as ``file_search`` or ``gitlab_search`` as direct
+  // access merely because their names contain a matching substring.
+  if (["exec", "shell", "terminal", "bash", "zsh", "python", "python3", "code_mode_exec", "code.exec", "git"].includes(name)) return "shell";
+  if (/(?:^|[._:-])(?:exec|shell|terminal|bash|zsh)$/.test(name)) return "shell";
+  return null;
 }
 
 function directToolInput(event) {
   const params = event?.params && typeof event.params === "object" ? event.params : {};
-  return text(params.command || params.cmd || params.script || params.code || params.input || "").trim();
+  const toolName = String(event?.toolName || "").toLowerCase();
+  const value = params.command || params.cmd || params.script || params.code || params.input || params.path || params.file || params.args || "";
+  return `${toolName === "git" && params.args ? "git " : ""}${text(value)}`.trim();
+}
+
+function isEvidenceReadCommand(command) {
+  if (!command) return false;
+  // These are high-confidence source-reading commands.  Generic exec such as
+  // pytest, npm, make, git status, or a build command remains available even
+  // during a repository-fact turn.
+  if (/(?:^|[;&|]\s*)(?:cat|sed|grep|rg|awk|head|tail|less|more|bat)\b/i.test(command)) return true;
+  if (/(?:^|[;&|]\s*)git\s+(?:show|log|grep)\b/i.test(command)) return true;
+  return /\b(?:open|read_text|read_bytes|readFile|readFileSync)\s*\(/i.test(command);
+}
+
+function isDestructiveCommand(command) {
+  return /\b(?:rm|rmdir|mkfs|shutdown|reboot|kill\s+-9|git\s+(?:reset|clean|checkout\s+--|rebase|push))\b/i.test(command);
 }
 
 function isSafeRecoveryCommand(command) {
@@ -322,7 +354,8 @@ export default {
         const key = stateKey(ctx, event);
         const state = agentState(cfg, ctx, event);
         if (bareHostMemoryTool(toolName) && state?.strict) {
-          await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "tool_blocked", tool: toolName, reason: "bare host memory backend is not repository-memory" });
+          const eventName = auditOnly(cfg) ? "tool_audited" : "tool_blocked";
+          await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: eventName, tool: toolName, reason: "bare host memory backend is not repository-memory" });
           if (auditOnly(cfg)) {
             await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "policy_warning", tool: toolName, reason: "bare host memory backend is not repository-memory" });
             return;
@@ -354,14 +387,17 @@ export default {
           state.get = true;
           return;
         }
-        if (directTool(toolName)) {
-          const command = directToolInput(event);
-          if (state.searchFailed && isSafeRecoveryCommand(command)) {
-            state.recovery = true;
-            await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "recovery_allowed", tool: toolName, reason: "repository-memory search failed; safe diagnostic/recovery command allowed" });
-            return;
-          }
-          await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "tool_blocked", tool: toolName, reason: "repository-fact request must not bypass MCP" });
+        const directKind = directToolKind(toolName);
+        const command = directToolInput(event);
+        if (directKind === "shell" && state.searchFailed && isSafeRecoveryCommand(command)) {
+          state.recovery = true;
+          await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "recovery_allowed", tool: toolName, reason: "repository-memory search failed; safe diagnostic/recovery command allowed" });
+          return;
+        }
+        const evidenceBypass = directKind === "file-read" || (directKind === "shell" && (isEvidenceReadCommand(command) || isDestructiveCommand(command)));
+        if (evidenceBypass) {
+          const eventName = auditOnly(cfg) ? "tool_audited" : "tool_blocked";
+          await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: eventName, tool: toolName, reason: "repository-fact request must not bypass MCP" });
           if (auditOnly(cfg)) {
             await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "policy_warning", tool: toolName, reason: "repository-fact request used direct file/shell access" });
             return;

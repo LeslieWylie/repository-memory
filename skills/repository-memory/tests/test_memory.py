@@ -21,7 +21,7 @@ from evaluate import evaluate_queries
 from fallback import paths, query_terms
 from memorycore import MemoryCoreClient, MemoryCoreConfig
 from mcp_server import SERVER_VERSION
-from snapshot import _snapshot_lock, fcntl, prepare_view
+from snapshot import _snapshot_lock, prepare_view, snapshot_lock_backend
 from version import VERSION
 
 from models import SourceSpec
@@ -242,8 +242,8 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertTrue(source["state"]["dirty"])
 
     def test_shared_snapshot_lock_serializes_concurrent_clients(self):
-        if fcntl is None:
-            self.skipTest("snapshot locking requires fcntl")
+        if snapshot_lock_backend() == "unavailable":
+            self.skipTest("snapshot locking backend unavailable")
         target = Path(self.temp.name) / "shared-snapshot"
         holder_entered = threading.Event()
         release_holder = threading.Event()
@@ -435,6 +435,33 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(report["strict_precision_at_1"], 1.0)
         self.assertEqual(report["negative_abstain_accuracy"], 1.0)
         self.assertEqual(report["query_quality"]["quality_counts"]["focused"], 2)
+
+    def test_evaluator_recall_counts_multiple_gold_documents_and_pins_citation_commit(self):
+        queries = Path(self.temp.name) / "multi-gold-queries.jsonl"
+        qrels = Path(self.temp.name) / "multi-gold-qrels.jsonl"
+        queries.write_text(json.dumps({"id": "q1", "query": "Atlas evidence", "intent": "exact", "quality": "focused"}) + "\n", encoding="utf-8")
+        qrels.write_text(
+            "\n".join([
+                json.dumps({"query_id": "q1", "document_id": "alpha:docs/atlas.md", "source": "alpha", "path": "docs/atlas.md", "relevance": 2}),
+                json.dumps({"query_id": "q1", "document_id": "alpha:README.md", "source": "alpha", "path": "README.md", "relevance": 1}),
+            ]) + "\n",
+            encoding="utf-8",
+        )
+        commit = subprocess.check_output(["git", "-C", str(self.alpha), "rev-parse", "HEAD"], text=True).strip()
+        verified = {
+            "id": "alpha:docs/atlas.md",
+            "citation": {"valid": True, "source": "repository", "path": "docs/atlas.md", "line_start": 1, "line_end": 2, "commit": commit},
+        }
+        with patch("evaluate.search", return_value={"verified": [verified], "candidates": [], "abstain": False, "mode": "exact"}):
+            report = evaluate_queries(self.alpha, queries, qrels, local=True)
+        self.assertEqual(report["precision_at_1"], 1.0)
+        self.assertEqual(report["recall_at_5"], 0.5)
+        self.assertEqual(report["recall_at_5_micro"], 0.5)
+        self.assertEqual(report["citation_parseability"], 1.0)
+        mismatched = {**verified, "citation": {**verified["citation"], "commit": "wrong"}}
+        with patch("evaluate.search", return_value={"verified": [mismatched], "candidates": [], "abstain": False, "mode": "exact"}):
+            mismatched_report = evaluate_queries(self.alpha, queries, qrels, local=True)
+        self.assertEqual(mismatched_report["citation_parseability"], 0.0)
 
     def test_memory_layer_metadata_is_preserved_but_citation_still_controls_verification(self):
         view = prepare_view(SourceSpec("alpha", self.alpha, "alpha"), local=True)

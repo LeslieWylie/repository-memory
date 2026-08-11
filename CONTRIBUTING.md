@@ -9,6 +9,14 @@ turn a related or stale result into a verified fact.
 Python 3.10 or newer and Git are required. Node.js 22 or newer is needed for
 the OpenClaw extension checks.
 
+The project also builds a standard wheel and installs a cross-platform
+`repository-memory` console command:
+
+```bash
+python -m pip install .
+repository-memory --help
+```
+
 ```bash
 python -m pip install pytest pytest-cov
 python -m pytest -q --cov=skills/repository-memory/scripts --cov-branch
@@ -33,4 +41,5 @@ python skills/repository-memory/scripts/eval_gate.py \
 6. Document compatibility-impacting changes in `CHANGELOG.md`.
 
 Pull requests should state the tested operating systems, Python/Node
-versions, and whether the public regression gate was run.
+versions, whether the public regression gate was run, and whether the wheel
+smoke test was run.

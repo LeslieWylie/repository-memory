@@ -13,6 +13,11 @@ they report their version. `pyproject.toml` and the plugin manifest repeat the
 same value because packaging and JSON manifests require static metadata. CI
 should fail a release review if those values diverge.
 
+The Python distribution is a standard wheel with a
+`repository-memory` console entry point. The legacy Skill directory remains
+the source layout used by the installer, so existing OpenClaw/Codex/Claude
+installations continue to use the same runtime files.
+
 The MCP server advertises `2026-07-28` first. It retains compatibility with
 the older initialize/Content-Length protocol revisions listed by
 `mcp_server.py`; compatibility is a migration path, not a second retrieval

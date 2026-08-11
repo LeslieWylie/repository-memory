@@ -170,13 +170,14 @@ server is not bound to a port.
 The OpenClaw extension is optional. It can:
 
 1. require the repository-memory MCP route for project-fact turns;
-2. audit the bare built-in memory tool and direct-file fallback by default, or
-   block them when explicit enforcement mode is enabled;
+2. audit the bare built-in memory tool and high-confidence direct-file fallback
+   by default, or block those bypasses when explicit enforcement mode is enabled;
 3. audit tool metadata without storing full prompts or answers;
 4. capture bounded user/assistant text after a completed turn into L0;
 5. leave L2 as a reviewable candidate and never write L3 automatically.
 
-Normal coding tasks remain free to use the host's normal tools. A host without
+Normal coding, testing, build, Git-status, and patch tasks remain free to use
+the host's normal tools. A host without
 tool lifecycle hooks can still use the Skill/MCP contract, but cannot claim
 that direct-file access is technically blocked.
 

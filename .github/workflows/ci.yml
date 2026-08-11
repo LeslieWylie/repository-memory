@@ -46,6 +46,9 @@ jobs:
           --revision HEAD
           --local
 
+      - name: Build standard wheel
+        run: python -m pip wheel . --no-deps --wheel-dir "${{ runner.temp }}/repository-memory-wheel"
+
       - name: Validate JSON and whitespace
         shell: bash
         run: |

@@ -80,6 +80,16 @@ const commitFactExec = await hooks.get("before_tool_call")({ toolName: "exec", p
 assert.equal(commitFactExec.block, true);
 const alternateRead = await hooks.get("before_tool_call")({ toolName: "filesystem.readFile", params: { path: "report.md" } }, commitFactCtx);
 assert.equal(alternateRead.block, true);
+const ordinaryExecDuringFact = await hooks.get("before_tool_call")({ toolName: "exec", params: { command: "pytest -q" } }, commitFactCtx);
+assert.equal(ordinaryExecDuringFact, undefined);
+const statusDuringFact = await hooks.get("before_tool_call")({ toolName: "exec", params: { command: "git status --short" } }, commitFactCtx);
+assert.equal(statusDuringFact, undefined);
+const searchToolIsNotAFileRead = await hooks.get("before_tool_call")({ toolName: "file_search", params: { query: "report" } }, commitFactCtx);
+assert.equal(searchToolIsNotAFileRead, undefined);
+const recentRuntimeFactCtx = { agentId: "yaole", sessionKey: "recent-runtime-fact-1" };
+await hooks.get("before_agent_run")({ prompt: "查看最近运行结果" }, recentRuntimeFactCtx);
+const recentRuntimeRead = await hooks.get("before_tool_call")({ toolName: "exec", params: { command: "cat report.md" } }, recentRuntimeFactCtx);
+assert.equal(recentRuntimeRead.block, true);
 
 const receiptCtx = { agentId: "yaole", sessionKey: "session-4" };
 await hooks.get("before_agent_run")({ prompt: "查询评测结果" }, receiptCtx);
@@ -155,4 +165,6 @@ assert.match(audit, /result_shape/);
 assert.match(audit, /"verified":1/);
 assert.match(audit, /"citations":1/);
 assert.match(audit, /recovery_allowed/);
+const auditMode = await readFile(join(auditDir, "audit-mode.jsonl"), "utf8");
+assert.match(auditMode, /tool_audited/);
 console.log("openclaw guard ok");

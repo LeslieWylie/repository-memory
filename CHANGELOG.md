@@ -8,6 +8,13 @@ revision is a separate compatibility identifier; see
 ## [Unreleased]
 
 - Keep unreleased changes here until a tagged release is prepared.
+- Narrow host guard enforcement to explicit file reads, source-reading
+  commands, and destructive commands; generic execution and maintenance tools
+  remain available.
+- Strengthen evaluator qrels validation, citation commit pinning, and
+  multi-gold Recall@5 accounting.
+- Add a standard wheel/console entry point and a Windows `msvcrt` snapshot
+  lock fallback.
 
 ## [0.2.0] - 2026-08-11
 

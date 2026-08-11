@@ -26,8 +26,9 @@ In either mode it should:
 - block a bare host memory search for repository-fact requests;
 - keep three policies separate: `repository-fact`, `maintenance`, and
   `ordinary`;
-- in `enforce`, block direct file/shell fallback for `repository-fact` requests, including
-  alternate read/write/terminal tool names rather than only `read` and `exec`;
+- in `enforce`, block only high-confidence direct file reads or source-reading
+  shell commands for `repository-fact` requests. Generic `exec`, tests,
+  builds, `git status`, patch tools, and search tools remain available;
 - leave maintenance work such as `git log` plus an explicitly requested report
   write available. A word such as “提交记录” is a fact-query noun, not a
   maintenance permission;
@@ -38,8 +39,9 @@ In either mode it should:
   freshness, and latency;
 - let a query with no verified evidence finish as an explicit abstention.
 
-The guard is not a general shell sandbox. In audit mode it is an observability
-layer; in enforce mode it is a routing guard. Hosts should still expose
+The guard is not a general shell sandbox and does not attempt to classify every
+possible script as a file read. In audit mode it is an observability layer; in
+enforce mode it is a narrow routing guard. Hosts should still expose
 ordinary tool permission controls separately.
 
 Host enforcement is not portable by implication. If a host has no tool-call
