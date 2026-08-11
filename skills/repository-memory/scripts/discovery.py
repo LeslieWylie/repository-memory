@@ -330,18 +330,25 @@ def adapter_config(spec: SourceSpec) -> dict[str, Any]:
 
 
 def configured_adapter(spec: SourceSpec) -> Path | None:
-    if os.environ.get("REPOSITORY_MEMORY_DISABLE_ADAPTER", "").lower() in {"1", "true", "yes"}:
-        return None
     values = adapter_config(spec)
-    candidates: list[Path] = []
+    explicitly_configured: list[Path] = []
     if spec.adapter:
-        candidates.append(Path(spec.adapter).expanduser())
+        explicitly_configured.append(Path(spec.adapter).expanduser())
+    for key in ADAPTER_CONFIG_KEYS:
+        if values.get(key):
+            explicitly_configured.append(Path(str(values[key])).expanduser())
+
+    # CI and shared hosts use this switch to prevent accidental discovery of
+    # a developer's private adapter.  An adapter explicitly attached to the
+    # selected source remains valid: tests and users that deliberately opt in
+    # must not be silently converted to the local fallback.
+    disabled = os.environ.get("REPOSITORY_MEMORY_DISABLE_ADAPTER", "").lower() in {"1", "true", "yes"}
+    candidates: list[Path] = list(explicitly_configured)
+    if disabled:
+        return _first_executable(candidates)
     for env_name in ADAPTER_ENVS:
         if os.environ.get(env_name):
             candidates.append(Path(os.environ[env_name]).expanduser())
-    for key in ADAPTER_CONFIG_KEYS:
-        if values.get(key):
-            candidates.append(Path(str(values[key])).expanduser())
 
     # Do not let an unrelated checkout next to the current directory become a
     # backend for an arbitrary document root.  Explicit config/env adapters
@@ -361,6 +368,10 @@ def configured_adapter(spec: SourceSpec) -> Path | None:
         if found:
             candidates.append(Path(found))
 
+    return _first_executable(candidates)
+
+
+def _first_executable(candidates: list[Path]) -> Path | None:
     seen: set[str] = set()
     for candidate in candidates:
         try:

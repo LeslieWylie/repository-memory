@@ -432,9 +432,11 @@ def _fallback_is_stale(view: SourceView, local: bool) -> bool:
     falls back to a dirty local worktree must not be promoted to ``verified``.
     """
 
-    if local:
-        return False
-    return view.freshness.get("state") not in {"fresh"}
+    # A clean local HEAD is still a concrete, line-addressable Git revision.
+    # It is not remotely fresh, but it is not stale merely because no remote
+    # exists.  Only an uncommitted local worktree is unsafe to verify when the
+    # caller did not explicitly request --local.
+    return bool(not local and view.dirty and view.commit_type == "local_worktree")
 
 
 def _sync_if_needed(adapter: Adapter, view: SourceView, deep: bool = False) -> tuple[dict[str, Any] | None, str | None]:
