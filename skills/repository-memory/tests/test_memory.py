@@ -410,6 +410,18 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(report["metrics"]["recall_at_5"], 1.0)
         self.assertEqual(report["metrics"]["negative_abstain_accuracy"], 1.0)
         self.assertFalse(report["canonical_repo_changed"])
+        command = [
+            sys.executable,
+            str(SCRIPTS / "repository-memory.py"),
+            "team-evaluate",
+            "--records", str(root / "eval/public/team_memory/records.jsonl"),
+            "--queries", str(root / "eval/public/team_memory/queries.jsonl"),
+            "--qrels", str(root / "eval/public/team_memory/qrels.jsonl"),
+            "--gate", "--json",
+        ]
+        gated = subprocess.run(command, text=True, capture_output=True, check=False)
+        self.assertEqual(gated.returncode, 0, gated.stderr)
+        self.assertTrue(json.loads(gated.stdout)["gate"]["passed"])
 
 
     def test_mcp_stdio_matches_cli_contract(self):

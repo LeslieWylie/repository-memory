@@ -43,7 +43,7 @@ repository-memory team-export --output <bundle.json> --json
 repository-memory team-import --input <bundle.json> --json
 repository-memory memorycore promote-l3 --candidate <autocapture:L2:id> --accept --json
 repository-memory evaluate --queries <queries.jsonl> --qrels <qrels.jsonl> [--revision <commit>] [--scope repository|memory|all] --json
-repository-memory team-evaluate --records <records.jsonl> --queries <queries.jsonl> --qrels <qrels.jsonl> --json
+repository-memory team-evaluate --records <records.jsonl> --queries <queries.jsonl> --qrels <qrels.jsonl> [--gate] --json
 repository-memory memorycore configure|start|stop|status
 repository-memory mcp
 ```

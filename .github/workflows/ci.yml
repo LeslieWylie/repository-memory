@@ -46,6 +46,15 @@ jobs:
           --revision HEAD
           --local
 
+      - name: Run Team Memory retrieval gate
+        run: >-
+          python skills/repository-memory/scripts/repository-memory.py team-evaluate
+          --records eval/public/team_memory/records.jsonl
+          --queries eval/public/team_memory/queries.jsonl
+          --qrels eval/public/team_memory/qrels.jsonl
+          --gate
+          --json
+
       - name: Build standard wheel
         run: python -m pip wheel . --no-deps --wheel-dir "${{ runner.temp }}/repository-memory-wheel"
 

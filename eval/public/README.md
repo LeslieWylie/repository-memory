@@ -36,9 +36,10 @@ with:
 python skills/repository-memory/scripts/repository-memory.py team-evaluate \
   --records eval/public/team_memory/records.jsonl \
   --queries eval/public/team_memory/queries.jsonl \
-  --qrels eval/public/team_memory/qrels.jsonl --json
+  --qrels eval/public/team_memory/qrels.jsonl --gate --json
 ```
 
 It measures Team Memory P@1, MRR@5, Recall@5, negative abstention, candidate
-contamination, and latency in a temporary database. It does not use or modify
-the user-level Team Memory store.
+contamination, and latency in a temporary database. `--gate` requires P@1,
+Recall@5, and negative abstention to be 1.0 and candidate contamination to be
+0. It does not use or modify the user-level Team Memory store.

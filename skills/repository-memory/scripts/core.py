@@ -1337,7 +1337,7 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser = sub.add_parser("init"); init_parser.add_argument("--path", required=True); init_parser.add_argument("--id", dest="source_id"); init_parser.add_argument("--repository"); init_parser.add_argument("--profile"); init_parser.add_argument("--local-only", action="store_true"); init_parser.add_argument("--no-sync", action="store_true"); init_parser.add_argument("--json", action="store_true")
     source_parser = sub.add_parser("source"); source_parser.add_argument("action", choices=("add", "list", "remove")); source_parser.add_argument("--path"); source_parser.add_argument("--id", dest="source_id"); source_parser.add_argument("--repository"); source_parser.add_argument("--profile"); source_parser.add_argument("--local-only", action="store_true"); source_parser.add_argument("--no-sync", action="store_true"); source_parser.add_argument("--json", action="store_true")
     evaluate_parser = common("evaluate"); evaluate_parser.add_argument("--queries", required=True); evaluate_parser.add_argument("--qrels", required=True); evaluate_parser.add_argument("--limit", type=int, default=5); evaluate_parser.add_argument("--deep", action="store_true"); evaluate_parser.add_argument("--local", action="store_true"); evaluate_parser.add_argument("--scope", choices=("repository", "memory", "all"), default="repository"); evaluate_parser.add_argument("--revision"); evaluate_parser.add_argument("--fallback-only", action="store_true"); evaluate_parser.add_argument("--json", action="store_true")
-    team_evaluate_parser = common("team-evaluate"); team_evaluate_parser.add_argument("--records", required=True); team_evaluate_parser.add_argument("--queries", required=True); team_evaluate_parser.add_argument("--qrels", required=True); team_evaluate_parser.add_argument("--limit", type=int, default=5); team_evaluate_parser.add_argument("--json", action="store_true")
+    team_evaluate_parser = common("team-evaluate"); team_evaluate_parser.add_argument("--records", required=True); team_evaluate_parser.add_argument("--queries", required=True); team_evaluate_parser.add_argument("--qrels", required=True); team_evaluate_parser.add_argument("--limit", type=int, default=5); team_evaluate_parser.add_argument("--gate", action="store_true"); team_evaluate_parser.add_argument("--min-p1", type=float, default=1.0); team_evaluate_parser.add_argument("--min-recall", type=float, default=1.0); team_evaluate_parser.add_argument("--min-negative", type=float, default=1.0); team_evaluate_parser.add_argument("--max-candidate-contamination", type=float, default=0.0); team_evaluate_parser.add_argument("--json", action="store_true")
     memorycore = sub.add_parser("memorycore")
     memorycore.add_argument("action", choices=["configure", "install", "start", "stop", "status", "promote-l3"])
     memorycore.add_argument("--memorycore-root")
@@ -1433,6 +1433,7 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
                     arguments = {**arguments, "root": configured_root}
                 return _mcp_dispatch(name, arguments)
             return serve(dispatch)
+        gate_failed = False
         root = None if args.command in {"init", "source", "doctor", "sync", "search", "get", "explain", "feedback", "promote", "publish", "team-export", "team-import", "team-evaluate", "context", "supersede", "ingest-session", "capture-turn"} else resolve_root(root_arg)
         if args.command in {"init", "source"} and root_arg:
             root = resolve_root(root_arg)
@@ -1460,6 +1461,20 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
             from team_memory_eval import evaluate_team_memory
 
             value = evaluate_team_memory(Path(args.records).expanduser(), Path(args.queries).expanduser(), Path(args.qrels).expanduser(), limit=args.limit)
+            if args.gate:
+                metrics = value["metrics"]
+                failures = []
+                if metrics["precision_at_1"] < args.min_p1:
+                    failures.append(f"precision_at_1 {metrics['precision_at_1']:.4f} < {args.min_p1:.4f}")
+                if metrics["recall_at_5"] < args.min_recall:
+                    failures.append(f"recall_at_5 {metrics['recall_at_5']:.4f} < {args.min_recall:.4f}")
+                if metrics["negative_abstain_accuracy"] < args.min_negative:
+                    failures.append(f"negative_abstain_accuracy {metrics['negative_abstain_accuracy']:.4f} < {args.min_negative:.4f}")
+                if metrics["candidate_contamination"] > args.max_candidate_contamination:
+                    failures.append(f"candidate_contamination {metrics['candidate_contamination']:.4f} > {args.max_candidate_contamination:.4f}")
+                gate_failed = bool(failures)
+                value["ok"] = not gate_failed
+                value["gate"] = {"passed": not gate_failed, "failures": failures, "thresholds": {"min_p1": args.min_p1, "min_recall": args.min_recall, "min_negative": args.min_negative, "max_candidate_contamination": args.max_candidate_contamination}}
         elif args.command == "context":
             value = memory_context(root if root_arg else None, args.query, limit=args.limit, source_id=getattr(args, "source", None), repo=args.repo, issue=args.issue, branch=args.branch, agent=args.agent, local=args.local)
         elif args.command == "supersede":
@@ -1516,7 +1531,7 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
         else:
             raise RuntimeError(f"unknown command: {args.command}")
         print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
-        return 0
+        return 1 if gate_failed else 0
     except (OSError, RuntimeError, TypeError, AdapterError) as exc:
         print(json.dumps({"schema_version": SCHEMA_VERSION, "ok": False, "error": str(exc)}, ensure_ascii=False, indent=2))
         return 2
