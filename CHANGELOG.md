@@ -17,6 +17,9 @@ revision is a separate compatibility identifier; see
 - Rename context retrieval from `hybrid-lexical` to the accurate
   `multi-source-lexical`; repository and Team Memory recall run in parallel but
   keep scores and provenance separate.
+- Add causal Team Memory revisions (`revision`, `origin_node`,
+  `parent_revision`), conflict-aware bundle merge, automatic migration for
+  older SQLite databases, and explicit candidate activation after review.
 - Change the OpenClaw guard to advisory/output-audit behavior; it no longer
   blocks normal file, shell, Git, test, or debugging tools.
 - Strengthen evaluator qrels validation, citation commit pinning, and

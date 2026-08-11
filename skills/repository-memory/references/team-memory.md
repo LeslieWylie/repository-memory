@@ -38,6 +38,8 @@ candidate -> active -> superseded
 `memory_supersede` publishes a replacement and marks the old record
 `superseded`; search excludes superseded and stale records by default. This
 prevents a later correction from competing with an obsolete decision.
+`memory_team_activate` is the explicit review operation for a captured
+candidate; ordinary capture never promotes it automatically.
 
 `memory_feedback` accepts `helpful`, `not_helpful`, `stale`, or `wrong`. The
 feedback affects reuse ranking and lowers confidence for stale/wrong reports.
@@ -62,9 +64,11 @@ team-export --output <bundle.json>
 team-import --input <bundle.json>
 ```
 
-Import is an idempotent merge keyed by stable memory id and updated timestamp;
-it reports conflicts instead of silently choosing incompatible equal-version
-content. This is file-based synchronization, not a hosted database service.
+Import is an idempotent merge keyed by stable memory id and causal revision.
+Only an incoming child whose `parent_revision` matches the local revision is
+applied automatically. Concurrent branches and stale revisions are reported,
+not selected by wall-clock last-write-wins. This is file-based
+synchronization, not a hosted database service.
 
 ## Context hydration
 

@@ -41,6 +41,7 @@ repository-memory ingest-session --input <json-or-jsonl> --json
 repository-memory capture-turn --input <bounded-turn.json> --json  # lifecycle adapter only
 repository-memory team-export --output <bundle.json> --json
 repository-memory team-import --input <bundle.json> --json
+repository-memory team-activate --id <team-memory-id> [--reviewer <agent>] --json
 repository-memory memorycore promote-l3 --candidate <autocapture:L2:id> --accept --json
 repository-memory evaluate --queries <queries.jsonl> --qrels <qrels.jsonl> [--revision <commit>] [--scope repository|memory|all] --json
 repository-memory team-evaluate --records <records.jsonl> --queries <queries.jsonl> --qrels <qrels.jsonl> [--gate] --json
@@ -67,6 +68,7 @@ memory_init
 memory_ingest
 memory_context
 memory_team_sync
+memory_team_activate
 memory_publish
 memory_feedback
 memory_supersede

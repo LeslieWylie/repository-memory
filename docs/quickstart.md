@@ -79,6 +79,7 @@ the source directly to bypass a failed search.
 
 ```bash
 repository-memory publish --input memory.json --status candidate --json
+repository-memory team-activate --id team:decision:<id> --reviewer reviewer-1 --json
 repository-memory feedback team:decision:<id> --rating helpful --note "reused" --json
 repository-memory team-export --output /tmp/team-memory.json --json
 repository-memory team-import --input /tmp/team-memory.json --json

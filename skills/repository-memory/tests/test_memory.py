@@ -397,6 +397,41 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(imported["imported"]["inserted"], 20)
         self.assertEqual(TeamMemoryStore(imported_db).health()["record_count"], 20)
 
+    def test_team_memory_activation_and_causal_merge_conflict(self):
+        base_path = Path(self.temp.name) / "base.sqlite3"
+        node_a = TeamMemoryStore(base_path, node_id="node-a")
+        candidate = node_a.publish({
+            "id": "team:decision:causal",
+            "type": "decision",
+            "title": "Causal decision",
+            "content": "Use one isolated worktree per issue.",
+            "status": "candidate",
+        })
+        memory_id = candidate["memory"]["id"]
+        activated = node_a.activate(memory_id, reviewer="reviewer-a")
+        self.assertEqual(activated["status"], "active")
+        self.assertEqual(activated["memory"]["revision"], 2)
+        self.assertEqual(activated["memory"]["parent_revision"], "node-a:1")
+
+        node_b = TeamMemoryStore(Path(self.temp.name) / "node-b.sqlite3", node_id="node-b")
+        base_bundle = node_a.export_bundle()
+        self.assertEqual(base_bundle["schema_version"], 2)
+        self.assertEqual(node_b.import_bundle(base_bundle)["imported"]["inserted"], 1)
+        node_a.feedback(memory_id, "wrong", "A rejected it", agent="reviewer-a")
+        node_b.feedback(memory_id, "stale", "B has not confirmed expiry", agent="reviewer-b")
+        conflict = node_a.import_bundle(node_b.export_bundle())
+        self.assertEqual(conflict["imported"]["conflicts"], 1)
+        self.assertEqual(node_a.get(memory_id)["result"]["status"], "stale")
+
+        receiver = TeamMemoryStore(Path(self.temp.name) / "receiver.sqlite3", node_id="node-r")
+        receiver.import_bundle(base_bundle)
+        child = TeamMemoryStore(Path(self.temp.name) / "child.sqlite3", node_id="node-c")
+        child.import_bundle(base_bundle)
+        child.feedback(memory_id, "wrong", "causal child", agent="reviewer-c")
+        applied = receiver.import_bundle(child.export_bundle())
+        self.assertEqual(applied["imported"]["updated"], 1)
+        self.assertEqual(receiver.get(memory_id)["result"]["status"], "stale")
+
     def test_team_memory_public_benchmark_is_isolated_and_measures_top1(self):
         from team_memory_eval import evaluate_team_memory
 
@@ -444,7 +479,7 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(responses[0]["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "repository-memory")
         self.assertEqual(responses[0]["result"]["resultType"], "complete")
         self.assertEqual(responses[1]["result"]["resultType"], "complete")
-        self.assertEqual({tool["name"] for tool in responses[1]["result"]["tools"]}, {"memory_doctor", "memory_sync", "memory_search", "memory_get", "memory_init", "memory_ingest", "memory_context", "memory_team_sync", "memory_publish", "memory_feedback", "memory_supersede"})
+        self.assertEqual({tool["name"] for tool in responses[1]["result"]["tools"]}, {"memory_doctor", "memory_sync", "memory_search", "memory_get", "memory_init", "memory_ingest", "memory_context", "memory_team_sync", "memory_team_activate", "memory_publish", "memory_feedback", "memory_supersede"})
         payload = responses[2]["result"]["structuredContent"]
         self.assertEqual(responses[2]["result"]["resultType"], "complete")
         self.assertIn("verified", payload)

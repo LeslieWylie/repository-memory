@@ -145,6 +145,7 @@ memory_context     # task-start hydration
 memory_publish     # explicit decision/failure/solution/handoff write
 memory_feedback    # helpful/not_helpful/stale/wrong reuse feedback
 memory_supersede   # explicit correction and lifecycle transition
+memory_team_activate # explicit candidate review -> active
 ```
 
 Records use the lifecycle `candidate -> active -> superseded|stale` and are
@@ -152,7 +153,10 @@ stored in a user-level SQLite cache. SQLite is the default backend behind a
 `TeamMemoryBackend` seam; it uses WAL, a bounded busy timeout, and retryable
 transactions for concurrent local agents. Records contain `type`, `scope`,
 `provenance`, `confidence`, `author_agent`, validity windows, and reuse
-feedback. They are not a second Git repository and are never written into the
+feedback plus causal `revision`, `origin_node`, and `parent_revision` fields.
+Bundle import only auto-applies a causally based child revision; concurrent
+branches are reported as conflicts instead of being resolved by wall-clock
+time. They are not a second Git repository and are never written into the
 canonical source tree.
 
 For cross-machine or container handoff, use an explicit portable bundle:

@@ -1196,6 +1196,15 @@ def publish_memory(input_path: str, *, status: str | None = None) -> dict[str, A
     return {"schema_version": SCHEMA_VERSION, "ok": True, "published": written, "count": len(written), "canonical_repo_changed": False}
 
 
+def activate_memory(memory_id: str, reviewer: str | None = None) -> dict[str, Any]:
+    """Explicitly move one Team Memory candidate into the active plane."""
+
+    result = team_memory_store().activate(memory_id, reviewer=reviewer)
+    result["schema_version"] = SCHEMA_VERSION
+    result["write_operation"] = "explicit-review"
+    return result
+
+
 def export_team_memory(output_path: str) -> dict[str, Any]:
     """Export the user-level Team Memory plane as an explicit sync bundle."""
 
@@ -1328,6 +1337,7 @@ def build_parser() -> argparse.ArgumentParser:
     feedback_parser = common("feedback"); feedback_parser.add_argument("result_id"); feedback_parser.add_argument("--note", required=True); feedback_parser.add_argument("--rating"); feedback_parser.add_argument("--json", action="store_true")
     promote_parser = common("promote"); promote_parser.add_argument("--input", required=True); promote_parser.add_argument("--json", action="store_true")
     publish_parser = common("publish"); publish_parser.add_argument("--input", required=True); publish_parser.add_argument("--status", choices=("candidate", "active"), default="candidate"); publish_parser.add_argument("--json", action="store_true")
+    activate_parser = common("team-activate"); activate_parser.add_argument("--id", required=True); activate_parser.add_argument("--reviewer"); activate_parser.add_argument("--json", action="store_true")
     export_parser = common("team-export"); export_parser.add_argument("--output", required=True); export_parser.add_argument("--json", action="store_true")
     import_parser = common("team-import"); import_parser.add_argument("--input", required=True); import_parser.add_argument("--json", action="store_true")
     context_parser = common("context"); context_parser.add_argument("query"); context_parser.add_argument("--limit", type=int, default=5); context_parser.add_argument("--repo"); context_parser.add_argument("--issue"); context_parser.add_argument("--branch"); context_parser.add_argument("--agent"); context_parser.add_argument("--local", action="store_true"); context_parser.add_argument("--json", action="store_true")
@@ -1381,6 +1391,8 @@ def _mcp_dispatch(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError("memory_team_sync import requires input")
             return import_team_memory(source_path)
         return {"schema_version": SCHEMA_VERSION, "ok": True, "operation": "team-memory-status", "backend": team_memory_store().health(), "canonical_repo_changed": False}
+    if name == "memory_team_activate":
+        return activate_memory(str(arguments.get("id") or ""), str(arguments.get("reviewer") or "") or None)
     if name == "memory_publish":
         if "memory" not in arguments:
             raise ValueError("memory_publish requires memory")
@@ -1434,7 +1446,7 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
                 return _mcp_dispatch(name, arguments)
             return serve(dispatch)
         gate_failed = False
-        root = None if args.command in {"init", "source", "doctor", "sync", "search", "get", "explain", "feedback", "promote", "publish", "team-export", "team-import", "team-evaluate", "context", "supersede", "ingest-session", "capture-turn"} else resolve_root(root_arg)
+        root = None if args.command in {"init", "source", "doctor", "sync", "search", "get", "explain", "feedback", "promote", "publish", "team-activate", "team-export", "team-import", "team-evaluate", "context", "supersede", "ingest-session", "capture-turn"} else resolve_root(root_arg)
         if args.command in {"init", "source"} and root_arg:
             root = resolve_root(root_arg)
         if args.command == "doctor":
@@ -1453,6 +1465,8 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
             value = promote(root, args.input)
         elif args.command == "publish":
             value = publish_memory(args.input, status=args.status)
+        elif args.command == "team-activate":
+            value = activate_memory(args.id, args.reviewer)
         elif args.command == "team-export":
             value = export_team_memory(args.output)
         elif args.command == "team-import":

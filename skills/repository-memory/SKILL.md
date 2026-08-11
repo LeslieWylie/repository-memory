@@ -102,6 +102,7 @@ an explicit task-end workflow asks for a write. New Team Memory defaults to
 entrypoint when the host exposes it; CLI and MCP return the same contract.
 When agents run on different hosts, use the explicit `team-export` and
 `team-import` bundle commands (or `memory_team_sync`) to transfer Team Memory;
+review candidates explicitly with `team-activate`/`memory_team_activate`, and
 do not claim that a local SQLite file is automatically cross-machine shared.
 
 When the host exposes the audited MCP registration, tool calls are recorded as

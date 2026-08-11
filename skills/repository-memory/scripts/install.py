@@ -36,6 +36,7 @@ MCP_TOOLS = [
     "memory_ingest",
     "memory_context",
     "memory_team_sync",
+    "memory_team_activate",
     "memory_publish",
     "memory_feedback",
     "memory_supersede",
