@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import urllib.error
 import urllib.request
@@ -211,7 +212,13 @@ class Adapter:
         if not self.executable:
             raise AdapterError("adapter executable unavailable")
         values = self._settings()
-        command = ["node", str(self.executable)] if self.executable.suffix == ".mjs" else [str(self.executable)]
+        suffix = self.executable.suffix.lower()
+        if suffix == ".mjs":
+            command = ["node", str(self.executable)]
+        elif suffix == ".py":
+            command = [sys.executable, str(self.executable)]
+        else:
+            command = [str(self.executable)]
         env = os.environ.copy()
         env.update({
             "REPOSITORY_MEMORY_SOURCE_ROOT": str(self.source.path),

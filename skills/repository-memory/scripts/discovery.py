@@ -381,7 +381,11 @@ def _first_executable(candidates: list[Path]) -> Path | None:
         if str(resolved) in seen:
             continue
         seen.add(str(resolved))
-        if resolved.is_file() and (resolved.suffix == ".mjs" or os.access(resolved, os.X_OK)):
+        # Windows does not expose Unix execute bits for a configured Python
+        # adapter.  A deliberate .py adapter is still runnable through the
+        # current interpreter; .mjs remains runnable through Node.
+        runnable_script = resolved.suffix.lower() in {".mjs", ".py"}
+        if resolved.is_file() and (runnable_script or os.access(resolved, os.X_OK)):
             return resolved
     return None
 

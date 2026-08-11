@@ -45,7 +45,9 @@ OPENCLAW_TOOLS = [f"{MCP_NAME}__{name}" for name in MCP_TOOLS]
 
 
 def _home() -> Path:
-    return Path.home().resolve()
+    # HOME is also used by isolated host tests and by portable agent profiles;
+    # USERPROFILE is the native Windows equivalent when HOME is absent.
+    return Path(os.environ.get("HOME") or os.environ.get("USERPROFILE") or Path.home()).expanduser().resolve()
 
 
 def _data_home() -> Path:

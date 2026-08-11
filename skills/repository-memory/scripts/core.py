@@ -136,7 +136,8 @@ def _openclaw_routing() -> dict[str, Any]:
     state_dir = os.environ.get("OPENCLAW_STATE_DIR")
     if state_dir:
         candidates.append(Path(state_dir).expanduser() / "openclaw.json")
-    candidates.append(Path.home() / ".openclaw" / "openclaw.json")
+    home = Path(os.environ.get("HOME") or os.environ.get("USERPROFILE") or Path.home()).expanduser()
+    candidates.append(home / ".openclaw" / "openclaw.json")
     config_path = next((path for path in candidates if path.is_file()), None)
     if config_path is None:
         return {
