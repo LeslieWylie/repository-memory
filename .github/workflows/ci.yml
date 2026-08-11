@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "agent/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.10", "3.12", "3.13"]
+    env:
+      # A public checkout must never inherit a developer's private adapter.
+      REPOSITORY_MEMORY_DISABLE_ADAPTER: "1"
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip pytest pytest-cov
+
+      - name: Run Python tests with coverage report
+        run: python -m pytest -q --cov=skills/repository-memory/scripts --cov-branch --cov-report=term-missing
+
+      - name: Run public retrieval regression gate
+        run: >-
+          python skills/repository-memory/scripts/eval_gate.py
+          --root .
+          --queries eval/public/queries.jsonl
+          --qrels eval/public/qrels.jsonl
+          --revision HEAD
+          --local
+
+      - name: Validate JSON and whitespace
+        shell: bash
+        run: |
+          python -m json.tool skills/repository-memory/openclaw-extension/openclaw.plugin.json >/dev/null
+          python -m json.tool examples/openclaw-profile.json >/dev/null
+          git diff --check
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Check OpenClaw extension syntax
+        run: node --check skills/repository-memory/openclaw-extension/index.mjs
+
+      - name: Run OpenClaw guard contract tests
+        run: node skills/repository-memory/tests/test_openclaw_guard.mjs

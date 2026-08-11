@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/LeslieWylie/repository-memory/schema/search-result-v3.json",
+  "title": "Repository Memory search result",
+  "type": "object",
+  "required": ["schema_version", "query", "mode", "scope", "verified", "candidates", "abstain"],
+  "properties": {
+    "schema_version": { "const": 3 },
+    "query": { "type": "string" },
+    "mode": { "type": "string", "enum": ["exact", "semantic", "temporal", "cross-source", "deep"] },
+    "scope": { "type": "string", "enum": ["repository", "memory", "all"] },
+    "verified": { "type": "array", "items": { "$ref": "#/$defs/result" } },
+    "candidates": { "type": "array", "items": { "$ref": "#/$defs/result" } },
+    "groups": { "type": "object" },
+    "abstain": { "type": "boolean" },
+    "freshness": { "type": "object" },
+    "diagnostics": { "type": "object" }
+  },
+  "$defs": {
+    "result": {
+      "type": "object",
+      "required": ["id", "source", "evidence_status", "citation"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "source": { "type": "string", "minLength": 1 },
+        "repository": { "type": ["string", "null"] },
+        "commit": { "type": ["string", "null"] },
+        "path": { "type": ["string", "null"] },
+        "line_start": { "type": ["integer", "null"], "minimum": 1 },
+        "line_end": { "type": ["integer", "null"], "minimum": 1 },
+        "excerpt": { "type": ["string", "null"] },
+        "evidence_status": { "type": "string" },
+        "generated": { "type": "boolean" },
+        "freshness": { "type": ["object", "null"] },
+        "related": { "type": "array" },
+        "citation": { "type": "object" },
+        "support": { "type": "object" }
+      }
+    }
+  }
+}

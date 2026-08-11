@@ -1,0 +1,7 @@
+{"id":"q-readme-contract","query":"citation-first repository memory verified candidates abstain","intent":"exact","quality":"focused","source_scope":"repository-memory"}
+{"id":"q-mcp-modern","query":"MCP transport stdio modern metadata discovery","intent":"exact","quality":"focused","source_scope":"repository-memory"}
+{"id":"q-result-groups","query":"repository memory conversation memory separate groups","intent":"cross-source","quality":"focused","source_scope":"repository-memory"}
+{"id":"q-four-layers","query":"memory state machine human review explicit accept profile core","intent":"exact","quality":"focused","source_scope":"repository-memory"}
+{"id":"q-compound-evidence","query":"canonical sources derived indexes disposable","intent":"cross-source","quality":"focused","source_scope":"repository-memory"}
+{"id":"q-negative","query":"fictional ZZZQWE repository that was never indexed","intent":"negative","quality":"focused","expected_abstain":true,"source_scope":"repository-memory"}
+{"id":"q-cjk-negative","query":"不存在的中文项目 ZZZQWE 最近在干什么","intent":"negative","quality":"focused","expected_abstain":true,"source_scope":"repository-memory"}

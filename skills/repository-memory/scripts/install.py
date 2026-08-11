@@ -20,6 +20,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from version import VERSION
+
 SKILL_NAME = "repository-memory"
 MCP_NAME = "repository-memory"
 OPENCLAW_PLUGIN_ID = "repository-memory-autocapture"
@@ -384,7 +386,7 @@ def _verify(canonical: Path, require_repository: bool) -> dict[str, Any]:
 
     modern_meta = {
         "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-        "io.modelcontextprotocol/clientInfo": {"name": "repository-memory-installer", "version": "2.0.0"},
+        "io.modelcontextprotocol/clientInfo": {"name": "repository-memory-installer", "version": VERSION},
         "io.modelcontextprotocol/clientCapabilities": {},
     }
     modern_requests = [

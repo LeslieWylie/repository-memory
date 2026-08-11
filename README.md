@@ -192,6 +192,12 @@ See [docs/quickstart.md](docs/quickstart.md),
 [docs/architecture.md](docs/architecture.md), and
 [docs/troubleshooting.md](docs/troubleshooting.md).
 
+Project maintenance and release boundaries are documented in
+[CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md),
+[CHANGELOG.md](CHANGELOG.md), and
+[docs/compatibility.md](docs/compatibility.md). The privacy-free public
+retrieval regression set lives in [eval/public](eval/public/README.md).
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

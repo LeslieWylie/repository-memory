@@ -16,12 +16,14 @@ import sys
 from collections.abc import Callable, Iterator
 from typing import Any
 
+from version import VERSION
+
 
 MODERN_PROTOCOL = "2026-07-28"
 LEGACY_PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 SUPPORTED_PROTOCOLS = (MODERN_PROTOCOL, *LEGACY_PROTOCOLS)
 SERVER_NAME = "repository-memory"
-SERVER_VERSION = "2.0.0"
+SERVER_VERSION = VERSION
 
 
 def _tool_schema() -> list[dict[str, Any]]:
