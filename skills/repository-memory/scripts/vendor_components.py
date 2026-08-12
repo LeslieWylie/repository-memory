@@ -41,6 +41,9 @@ def report() -> dict[str, Any]:
         "upstream_repository": manifest.get("upstream_repository"),
         "upstream_commit": manifest.get("upstream_commit"),
         "import_method": manifest.get("import_method"),
+        "tracked_source_count": manifest.get("tracked_source_count"),
+        "import_scope": manifest.get("import_scope", []),
+        "runtime_generated_excluded": manifest.get("runtime_generated_excluded", []),
         "dirty_worktree_changes_excluded": manifest.get("dirty_worktree_changes_excluded") is True,
         "file_count": files,
         "components": {
