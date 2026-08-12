@@ -249,6 +249,14 @@ class SQLiteTeamMemoryBackend:
 
     def health(self) -> dict[str, Any]:
         connection = self._connect()
+        total = 0
+        by_status: dict[str, int] = {}
+        by_type: dict[str, int] = {}
+        feedback = 0
+        revisions = 0
+        expired = 0
+        fts = False
+        retention_details: list[dict[str, Any]] = []
         try:
             total = int(connection.execute("SELECT COUNT(*) FROM memories").fetchone()[0])
             by_status = {str(row[0]): int(row[1]) for row in connection.execute("SELECT status, COUNT(*) FROM memories GROUP BY status")}
@@ -257,7 +265,6 @@ class SQLiteTeamMemoryBackend:
             revisions = int(connection.execute("SELECT COUNT(*) FROM memory_revisions").fetchone()[0])
             expired = sum(1 for row in connection.execute("SELECT valid_until FROM memories WHERE status = 'active' AND valid_until IS NOT NULL") if self._expired(row[0]))
             fts = self._fts_available(connection)
-            retention_details: list[dict[str, Any]] = []
             for mem_row in connection.execute("SELECT id, revision, origin_node FROM memories"):
                 mem_id = mem_row["id"]
                 rev_count = int(connection.execute("SELECT COUNT(*) FROM memory_revisions WHERE memory_id = ?", (mem_id,)).fetchone()[0])
