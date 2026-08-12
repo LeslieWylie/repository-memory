@@ -20,7 +20,7 @@ import core
 from citation import locate, validate
 from evaluate import evaluate_queries
 from fallback import paths, query_terms
-from memorycore import MemoryCoreClient, MemoryCoreConfig
+from memorycore import MemoryCoreClient, MemoryCoreConfig, MemoryCoreError
 from mcp_server import SERVER_VERSION
 from snapshot import _snapshot_lock, prepare_view, snapshot_lock_backend
 from team_memory import TeamMemoryStore
@@ -397,6 +397,97 @@ class RepositoryMemoryTest(unittest.TestCase):
         imported = core.import_team_memory(str(bundle_path))
         self.assertEqual(imported["imported"]["inserted"], 20)
         self.assertEqual(TeamMemoryStore(imported_db).health()["record_count"], 20)
+
+    def test_team_memory_import_replays_feedback(self):
+        """Cross-machine feedback import recalculates confidence/status; duplicate is idempotent."""
+        a_path = Path(self.temp.name) / "feedback-a.sqlite3"
+        node_a = TeamMemoryStore(a_path, node_id="node-a")
+        pub = node_a.publish({
+            "type": "decision", "title": "Import replay target",
+            "content": "Used to verify feedback replay on cross-machine import.",
+            "status": "active", "confidence": 0.9,
+        }, default_status="active")
+        mid = pub["memory"]["id"]
+        self.assertEqual(node_a.get(mid)["result"]["status"], "active")
+        self.assertAlmostEqual(node_a.get(mid)["result"]["confidence"], 0.9)
+
+        # Feedbacks that should reduce confidence / trigger lifecycle transitions
+        node_a.feedback(mid, "wrong", "rejected on A", agent="reviewer-a", feedback_id="fb-1")
+        a_after = node_a.get(mid)["result"]
+        self.assertEqual(a_after["status"], "stale")
+        self.assertAlmostEqual(a_after["confidence"], 0.8)
+        bundle = node_a.export_bundle()
+
+        # Machine B: same initial state, import bundle → should replay transition
+        b_path = Path(self.temp.name) / "feedback-b.sqlite3"
+        node_b = TeamMemoryStore(b_path, node_id="node-b")
+        pub_b = node_b.publish({
+            "type": "decision", "title": "Import replay target",
+            "content": "Used to verify feedback replay on cross-machine import.",
+            "status": "active", "confidence": 0.9,
+        }, default_status="active")
+        self.assertEqual(pub_b["memory"]["id"], mid)
+        self.assertEqual(node_b.get(mid)["result"]["status"], "active")
+        self.assertAlmostEqual(node_b.get(mid)["result"]["confidence"], 0.9)
+
+        result = node_b.import_bundle(bundle)
+        self.assertEqual(result["imported"]["feedback_added"], 1)
+        self.assertEqual(result["imported"]["feedback_replayed"], 1)
+        b_after = node_b.get(mid)["result"]
+        self.assertEqual(b_after["status"], "stale")
+        self.assertAlmostEqual(b_after["confidence"], 0.8)
+
+        # Duplicate import must not double-de-rank
+        dup = node_b.import_bundle(bundle)
+        self.assertEqual(dup["imported"]["feedback_added"], 0)
+        self.assertEqual(dup["imported"]["feedback_replayed"], 0)
+        b_dup = node_b.get(mid)["result"]
+        self.assertEqual(b_dup["status"], "stale")
+        self.assertAlmostEqual(b_dup["confidence"], 0.8)
+        self.assertEqual(b_dup["revision"], b_after["revision"])
+
+        # "stale" rating with 2 agents triggers status transition on import
+        c_path = Path(self.temp.name) / "feedback-c.sqlite3"
+        node_c = TeamMemoryStore(c_path, node_id="node-c")
+        node_c.publish({
+            "type": "decision", "title": "Stale-by-import",
+            "content": "Will receive stale feedback via import from two agents.",
+            "status": "active", "confidence": 0.9,
+        }, default_status="active")
+
+        bundle_a = TeamMemoryStore(Path(self.temp.name) / "fb-stale-a.sqlite3", node_id="agent-a").publish({
+            "type": "decision", "title": "Stale-by-import",
+            "content": "Will receive stale feedback via import from two agents.",
+            "status": "active", "confidence": 0.9,
+        }, default_status="active")
+        # Build a bundle with "stale" feedback from agent-x
+        tmp_x_path = Path(self.temp.name) / "tmp-x.sqlite3"
+        node_x = TeamMemoryStore(tmp_x_path, node_id="node-x")
+        node_x.publish({
+            "type": "decision", "title": "Stale-by-import",
+            "content": "Will receive stale feedback via import from two agents.",
+            "status": "active", "confidence": 0.9,
+        }, default_status="active")
+        node_x.feedback(bundle_a["memory"]["id"], "stale", "old", agent="agent-x", feedback_id="sfb-1")
+        r1 = node_c.import_bundle(node_x.export_bundle())
+        self.assertEqual(r1["imported"]["feedback_replayed"], 1)
+        c_after_1 = node_c.get(bundle_a["memory"]["id"])["result"]
+        self.assertEqual(c_after_1["status"], "active")  # only 1 agent, not stale yet
+        self.assertAlmostEqual(c_after_1["confidence"], 0.8)
+
+        tmp_y_path = Path(self.temp.name) / "tmp-y.sqlite3"
+        node_y = TeamMemoryStore(tmp_y_path, node_id="node-y")
+        node_y.publish({
+            "type": "decision", "title": "Stale-by-import",
+            "content": "Will receive stale feedback via import from two agents.",
+            "status": "active", "confidence": 0.9,
+        }, default_status="active")
+        node_y.feedback(bundle_a["memory"]["id"], "stale", "also old", agent="agent-y", feedback_id="sfb-2")
+        r2 = node_c.import_bundle(node_y.export_bundle())
+        self.assertEqual(r2["imported"]["feedback_replayed"], 1)
+        c_after_2 = node_c.get(bundle_a["memory"]["id"])["result"]
+        self.assertEqual(c_after_2["status"], "stale")  # 2 agents → stale
+        self.assertAlmostEqual(c_after_2["confidence"], 0.7)
 
     def test_team_memory_activation_and_causal_merge_conflict(self):
         base_path = Path(self.temp.name) / "base.sqlite3"
@@ -780,7 +871,7 @@ class RepositoryMemoryTest(unittest.TestCase):
             self.assertEqual(normalized["source"], "memorycore")
             self.assertIsNone(normalized["path"])
 
-    def test_memorycore_doctor_probes_each_supported_layer(self):
+    def test_memorycore_doctor_reports_empty_layers_without_claiming_population(self):
         config = MemoryCoreConfig(endpoint="http://127.0.0.1:8420", api_key=None, team_id="team", agent_id="agent", user_id="user")
         client = MemoryCoreClient(config)
         responses = iter([
@@ -793,7 +884,63 @@ class RepositoryMemoryTest(unittest.TestCase):
         with patch.object(client, "_request", side_effect=lambda *_args, **_kwargs: next(responses)):
             report = client.health(refresh=True, probe_layers=True)
         self.assertEqual(set(report["layers"]), {"L0", "L1", "L2", "L3"})
-        self.assertTrue(all(item["reachable"] for item in report["layers"].values()))
+        for layer in ("L0", "L1", "L2", "L3"):
+            state = report["layers"][layer]
+            self.assertEqual(state["capability"], "supported")
+            self.assertEqual(state["api_status"], "ready")
+            self.assertEqual(state["population"], "empty")
+            self.assertEqual(state["readback"], "verified")
+
+    def test_memorycore_doctor_maps_present_l0_l1_and_empty_l2_l3(self):
+        config = MemoryCoreConfig(endpoint="http://127.0.0.1:8420", api_key=None, team_id="team", agent_id="agent", user_id="user")
+        client = MemoryCoreClient(config)
+        responses = iter([
+            {"code": 0, "data": {"status": "ok"}},
+            {"code": 0, "data": {"messages": [{"id": "message-1", "content": "raw"}], "total": 1}},
+            {"code": 0, "data": {"items": [{"id": "atomic-1", "content": "fact"}], "total": 1}},
+            {"code": 0, "data": {"entries": [], "total": 0}},
+            {"code": 0, "data": {"content": ""}},
+        ])
+        with patch.object(client, "_request", side_effect=lambda *_args, **_kwargs: next(responses)):
+            layers = client.health(refresh=True, probe_layers=True)["layers"]
+        self.assertEqual(layers["L0"]["population"], "present")
+        self.assertEqual(layers["L0"]["record_count"], 1)
+        self.assertEqual(layers["L1"]["population"], "present")
+        self.assertEqual(layers["L1"]["record_count"], 1)
+        self.assertEqual(layers["L2"]["population"], "empty")
+        self.assertEqual(layers["L3"]["population"], "empty")
+
+    def test_memorycore_doctor_preserves_pending_and_unknown_responses(self):
+        config = MemoryCoreConfig(endpoint="http://127.0.0.1:8420", api_key=None, team_id="team", agent_id="agent", user_id="user")
+        client = MemoryCoreClient(config)
+        responses = iter([
+            {"code": 0, "data": {"status": "ok"}},
+            {"code": 0, "data": {"messages": [], "total": 0}},
+            {"code": 0, "data": {"status": "pending", "items": [], "total": 0}},
+            {"code": 0, "data": {}},
+            {"code": 0, "data": {"status": "pending", "content": ""}},
+        ])
+        with patch.object(client, "_request", side_effect=lambda *_args, **_kwargs: next(responses)):
+            layers = client.health(refresh=True, probe_layers=True)["layers"]
+        self.assertEqual(layers["L1"]["population"], "empty")
+        self.assertEqual(layers["L1"]["readback"], "pending")
+        self.assertEqual(layers["L2"]["api_status"], "ready")
+        self.assertEqual(layers["L2"]["population"], "unknown")
+        self.assertEqual(layers["L2"]["readback"], "unknown")
+        self.assertEqual(layers["L3"]["population"], "empty")
+        self.assertEqual(layers["L3"]["readback"], "pending")
+
+    def test_memorycore_doctor_marks_layer_population_unknown_when_unreachable(self):
+        config = MemoryCoreConfig(endpoint="http://127.0.0.1:8420", api_key=None, team_id="team", agent_id="agent", user_id="user")
+        client = MemoryCoreClient(config)
+        with patch.object(client, "_request", side_effect=MemoryCoreError("service unavailable")):
+            report = client.health(refresh=True, probe_layers=True)
+        self.assertEqual(report["status"], "unreachable")
+        for state in report["layers"].values():
+            self.assertEqual(state["capability"], "supported")
+            self.assertEqual(state["api_status"], "unreachable")
+            self.assertEqual(state["population"], "unknown")
+            self.assertEqual(state["readback"], "unknown")
 
     def test_document_verification_is_independent_from_claim_coverage(self):
         composite = self.alpha / "docs" / "composite.md"

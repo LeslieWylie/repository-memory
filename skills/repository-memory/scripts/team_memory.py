@@ -255,10 +255,34 @@ class SQLiteTeamMemoryBackend:
             by_type = {str(row[0]): int(row[1]) for row in connection.execute("SELECT memory_type, COUNT(*) FROM memories GROUP BY memory_type")}
             feedback = int(connection.execute("SELECT COUNT(*) FROM memory_feedback").fetchone()[0])
             revisions = int(connection.execute("SELECT COUNT(*) FROM memory_revisions").fetchone()[0])
-            active_expired = sum(1 for row in connection.execute("SELECT valid_until FROM memories WHERE status = 'active' AND valid_until IS NOT NULL") if self._expired(row[0]))
+            expired = sum(1 for row in connection.execute("SELECT valid_until FROM memories WHERE status = 'active' AND valid_until IS NOT NULL") if self._expired(row[0]))
             fts = self._fts_available(connection)
-        finally:
-            connection.close()
+        except (IndexError, TypeError):
+            revisions = 0
+            expired = 0
+            fts = False
+
+        # Retention diagnostics
+        retention_details: list[dict[str, Any]] = []
+        try:
+            for mem_row in connection.execute("SELECT id, revision, origin_node FROM memories"):
+                mem_id = mem_row["id"]
+                rev_count = int(connection.execute("SELECT COUNT(*) FROM memory_revisions WHERE memory_id = ?", (mem_id,)).fetchone()[0])
+                current_chain = 0
+                cursor = self._revision_id(mem_row["revision"], mem_row["origin_node"])
+                seen: set[str] = set()
+                while cursor and cursor not in seen:
+                    current_chain += 1
+                    seen.add(cursor)
+                    parent = connection.execute(
+                        "SELECT parent_revision FROM memory_revisions WHERE memory_id = ? AND revision_id = ?",
+                        (mem_id, cursor),
+                    ).fetchone()
+                    cursor = str(parent[0]) if parent and parent[0] else ""
+                retention_details.append({"id": mem_id, "total_revisions": rev_count, "current_ancestor_chain": current_chain})
+        except Exception:
+            pass
+        retention = {"total_revisions": revisions, "revision_records": retention_details}
         return {
             "backend": self.backend_name,
             "backend_kind": "local",
@@ -271,7 +295,8 @@ class SQLiteTeamMemoryBackend:
             "by_type": by_type,
             "feedback_count": feedback,
             "revision_count": revisions,
-            "active_expired": active_expired,
+            "retention": retention,
+            "active_expired": expired,
             "index": "fts5" if fts else "sqlite-scan",
             "retrieval_strategy": "keyword-only",
             "semantic_available": False,
@@ -617,7 +642,7 @@ class SQLiteTeamMemoryBackend:
         feedback = bundle.get("feedback") if isinstance(bundle.get("feedback"), list) else []
 
         def operation(connection: sqlite3.Connection) -> dict[str, Any]:
-            inserted = updated = skipped = conflicts = stale_ignored = feedback_added = revisions_inserted = revisions_skipped = 0
+            inserted = updated = skipped = conflicts = stale_ignored = feedback_added = feedback_replayed = revisions_inserted = revisions_skipped = 0
             conflict_records: list[dict[str, Any]] = []
             mutable_fields = ("memory_type", "title", "content", "summary", "scope", "provenance", "confidence", "status", "supersedes", "superseded_by", "valid_from", "valid_until", "author_agent", "reviewed_by", "activated_at")
             for incoming in revisions:
@@ -716,10 +741,114 @@ class SQLiteTeamMemoryBackend:
                     continue
                 connection.execute("INSERT INTO memory_feedback (memory_id, rating, note, agent, created_at, feedback_id, origin_node) VALUES (?, ?, ?, ?, ?, ?, ?)", (item.get("memory_id"), item.get("rating"), item.get("note") or "", item.get("agent"), item.get("created_at") or _now(), feedback_id, item.get("origin_node") or "legacy"))
                 feedback_added += 1
-            return {"inserted": inserted, "updated": updated, "skipped": skipped, "stale_ignored": stale_ignored, "conflicts": conflicts, "conflict_records": conflict_records, "feedback_added": feedback_added, "revisions_inserted": revisions_inserted, "revisions_skipped": revisions_skipped}
+                # Replay feedback transition: update confidence/status per local feedback() rules.
+                # Revision is NOT bumped here — the imported record carries the correct
+                # final revision from the source node so the ancestor chain stays valid.
+                memory_id = str(item.get("memory_id"))
+                rating = str(item.get("rating") or "").strip().lower()
+                if rating in {"stale", "wrong"} and memory_id:
+                    if connection.execute("SELECT 1 FROM memories WHERE id = ?", (memory_id,)).fetchone():
+                        connection.execute("UPDATE memories SET confidence = MAX(0, confidence - 0.1) WHERE id = ?", (memory_id,))
+                        if rating == "wrong":
+                            connection.execute("UPDATE memories SET status = 'stale' WHERE id = ? AND status NOT IN ('superseded', 'stale')", (memory_id,))
+                        else:
+                            agent_rows = connection.execute("SELECT DISTINCT agent FROM memory_feedback WHERE memory_id = ? AND rating = 'stale' AND agent IS NOT NULL AND TRIM(agent) != ''", (memory_id,)).fetchall()
+                            agents = {str(row[0]).strip() for row in agent_rows}
+                            if len(agents) >= 2:
+                                connection.execute("UPDATE memories SET status = 'stale' WHERE id = ? AND status = 'active'", (memory_id,))
+                        feedback_replayed += 1
+            return {"inserted": inserted, "updated": updated, "skipped": skipped, "stale_ignored": stale_ignored, "conflicts": conflicts, "conflict_records": conflict_records, "feedback_added": feedback_added, "feedback_replayed": feedback_replayed, "revisions_inserted": revisions_inserted, "revisions_skipped": revisions_skipped}
 
         result = self._write(operation)
         return {"schema_version": 3, "ok": True, "imported": result, "canonical_repo_changed": False}
+
+
+
+    def compact(self, keep: int = 1) -> dict[str, Any]:
+        """Remove old revision records beyond ``keep`` per memory.
+
+        Default ``keep=1``: preserve only the most recent revision and the
+        current record's ancestor chain.  Never deletes ancestors needed by
+        the current record.
+
+        After compaction, a future import that arrives with a ``parent_revision``
+        that was deleted is reported as a conflict (the existing ``_is_ancestor``
+        check returns ``False``), not silently accepted.
+        """
+
+        if keep < 1:
+            raise ValueError(f"keep must be >= 1, got {keep}")
+
+        def operation(connection: sqlite3.Connection) -> dict[str, Any]:
+            affected = 0
+            purged = 0
+            orphaned = 0
+            protected: set[str] = set()
+            for row in connection.execute("SELECT id, revision, origin_node FROM memories"):
+                memory_id = row["id"]
+                current_id = self._revision_id(row["revision"], row["origin_node"])
+                # Walk the full ancestor chain of the current record --
+                # every node must be kept.
+                cursor = current_id
+                seen: set[str] = set()
+                while cursor and cursor not in seen:
+                    protected.add(f"{memory_id}::{cursor}")
+                    seen.add(cursor)
+                    parent = connection.execute(
+                        "SELECT parent_revision FROM memory_revisions WHERE memory_id = ? AND revision_id = ?",
+                        (memory_id, cursor),
+                    ).fetchone()
+                    cursor = str(parent[0]) if parent and parent[0] else ""
+
+            for row in connection.execute(
+                "SELECT memory_id, revision_id, revision FROM memory_revisions ORDER BY memory_id, revision DESC"
+            ):
+                key = f"{row['memory_id']}::{row['revision_id']}"
+                if key in protected:
+                    continue
+                # Keep the N most recent unprotected revisions.
+                affected += 1
+                if affected <= keep:
+                    continue
+                purged += 1
+                connection.execute(
+                    "DELETE FROM memory_revisions WHERE memory_id = ? AND revision_id = ?",
+                    (row["memory_id"], row["revision_id"]),
+                )
+
+            # Nullify parent_revision in any descendant whose parent was purged.
+            for memory_id, in connection.execute("SELECT id FROM memories"):
+                for rev_row in connection.execute(
+                    "SELECT revision_id, parent_revision FROM memory_revisions WHERE memory_id = ? AND parent_revision IS NOT NULL",
+                    (memory_id,),
+                ):
+                    parent_key = f"{memory_id}::{rev_row['parent_revision']}"
+                    if parent_key not in protected and not connection.execute(
+                        "SELECT 1 FROM memory_revisions WHERE memory_id = ? AND revision_id = ?",
+                        (memory_id, rev_row["parent_revision"]),
+                    ).fetchone():
+                        connection.execute(
+                            "UPDATE memory_revisions SET parent_revision = NULL WHERE memory_id = ? AND revision_id = ?",
+                            (memory_id, rev_row["revision_id"]),
+                        )
+                        orphaned += 1
+
+            remaining = int(
+                connection.execute("SELECT COUNT(*) FROM memory_revisions").fetchone()[0]
+            )
+            return {
+                "purged": purged,
+                "protected_ancestors": len(protected),
+                "orphaned_descendants": orphaned,
+                "remaining_revisions": remaining,
+                "keep": keep,
+            }
+
+        result = self._write(operation)
+        result["schema_version"] = 3
+        result["ok"] = True
+        result["canonical_repo_changed"] = False
+        return result
 
 
 TeamMemoryStore = SQLiteTeamMemoryBackend
