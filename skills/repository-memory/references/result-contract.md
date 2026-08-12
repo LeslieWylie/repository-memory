@@ -9,6 +9,7 @@ Search responses use this shape:
   "mode": "exact|semantic|temporal|cross-source|deep",
   "scope": "repository|memory|all",
   "verified": [],
+  "answerable": [],
   "candidates": [],
   "groups": {},
   "abstain": false,
@@ -41,16 +42,26 @@ claims whose meaning depends on those distinctions.
 `verified` is document-level: the runtime resolved the cited path, commit, line
 range, and excerpt, or a native memory backend returned a stable layer/id/evidence
 tuple with no disqualifying status. It does not mean every claim in the query
-is supported by one excerpt. `candidates` contains incomplete, stale,
-generated, inferred, pending, or merely related material. Agents must not
-silently promote candidates to facts.
+is supported by one excerpt.
+
+`answerable` is the safe answer surface. It contains only verified results whose
+evidence window has `support.claim_support=direct`. `results` is an alias for
+`answerable`, not for every verified document. A response may therefore contain
+verified documents while still returning `abstain=true`; this means retrieval
+found real citations but no returned excerpt supports the complete claim. Use
+`get`/`explain` with the citation's commit and line range, or answer only the
+directly supported subclaims.
+
+`candidates` contains incomplete, stale, generated, inferred, pending, or
+merely related material. Agents must not silently promote candidates to facts.
 
 For `scope=all`, `groups.repository` and `groups.memory` are independent result
 sets. Top-level `verified`/`candidates` are intentionally empty; consume the
 group matching the claim type. The default `scope=repository` keeps the
 backwards-compatible top-level aliases.
 
-`results` may appear as a backwards-compatible alias for `verified`; new callers should use `verified` and `candidates`.
+`results` is the safe answer alias for `answerable`; use `verified` only for
+document retrieval diagnostics and evaluation.
 
 MemoryCore can be used without any repository source. In that case `doctor`
 reports `repository.status=not_configured`, while `scope=memory` still returns

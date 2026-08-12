@@ -22,9 +22,9 @@ SECRET_NAME = re.compile(r"(^|/)(\.env(?:\.|$)|.*\.(?:pem|key|p12|pfx|secret|sec
 SECRET_CONTENT = re.compile(r"-----BEGIN .*PRIVATE KEY-----|(?:api[_-]?key|access[_-]?token|password|secret)\s*[:=]\s*['\"]?[A-Za-z0-9_\-/.+=]{16,}|\bsk-[A-Za-z0-9_-]{16,}", re.IGNORECASE)
 DATE_RE = re.compile(r"20\d{2}[-/]\d{1,2}(?:[-/]\d{1,2})?|20\d{2}-W\d{1,2}", re.IGNORECASE)
 GENERIC_SUPPORT_TERMS = {"note", "report", "weekly", "paper", "model", "card", "update", "result"}
-QUERY_BOUNDARY = re.compile(r"最近|最新|目前|当前|本周|本月|今天|昨天|正在|在做|在干|做什么|干什么|干啥|干嘛|进展|情况")
+QUERY_BOUNDARY = re.compile(r"最近|最新|上次|之前|以前|历史|目前|当前|本周|本月|今天|昨天|正在|在做|在干|做什么|干什么|干啥|干嘛|进展|情况")
 QUERY_STOP_TERMS = {
-    "最近", "最新", "目前", "当前", "本周", "本月", "今天", "昨天", "正在", "在做", "在干",
+    "最近", "最新", "上次", "之前", "以前", "历史", "目前", "当前", "本周", "本月", "今天", "昨天", "正在", "在做", "在干",
     "做什么", "干什么", "干啥", "干嘛", "啥", "嘛", "在", "进展", "情况", "什么", "哪些", "如何", "吗", "呢",
 }
 GENERIC_LAYER_ALIASES = {
@@ -120,25 +120,49 @@ def _evidence_window(text: str, terms: list[str], max_lines: int = 12) -> tuple[
     matching = [index for index, score in enumerate(line_scores) if score]
     if not matching:
         start = 0
+        end = min(len(file_lines), start + max_lines)
     else:
         best = max(matching, key=lambda index: (line_scores[index], -index))
-        start = max(0, best - max_lines // 3)
-        # Include nearby supporting lines when the document keeps a compact
-        # card/section together, but never let a huge document become a cite.
-        end_hint = min(len(file_lines), start + max_lines)
-        nearby = [index for index in matching if start <= index < end_hint]
-        if nearby:
-            start = max(0, min(start, min(nearby)))
-    end = min(len(file_lines), start + max_lines)
+        span_start, span_end = min(matching), max(matching)
+        # A compact card or report section can put different query signals on
+        # different lines.  Cite the whole local span when it is bounded,
+        # instead of anchoring on one line and incorrectly labelling the
+        # document ``partial`` merely because the excerpt was too narrow.
+        # The expanded bound is still finite; widely separated matches remain
+        # partial and require an explicit get/explain follow-up.
+        if span_end - span_start + 1 <= max_lines * 2:
+            start = max(0, span_start - max_lines // 4)
+            end = min(len(file_lines), span_end + max_lines // 4 + 1)
+        else:
+            start = max(0, best - max_lines // 3)
+            end = min(len(file_lines), start + max_lines)
+            # Include nearby supporting lines when the document keeps a
+            # compact card/section together, but never let a huge document
+            # become a cite.
+            nearby = [index for index in matching if start <= index < end]
+            if nearby:
+                start = max(0, min(start, min(nearby)))
+                end = min(len(file_lines), start + max_lines)
     return "\n".join(file_lines[start:end]), start + 1, end
 
 
 def _claim_support(query_terms: list[str], excerpt: str, line_start: int, line_end: int) -> dict[str, Any]:
-    support_terms = list(dict.fromkeys(
+    raw_support_terms = list(dict.fromkeys(
         term for term in query_terms
         if (len(term) >= 3 or (len(term) >= 2 and all("\u3400" <= char <= "\u9fff" for char in term)))
         and term not in GENERIC_SUPPORT_TERMS
     ))
+    # CJK token expansion deliberately adds short n-grams for recall.  Those
+    # n-grams are not independent claims: if a longer CJK term contains one,
+    # keep only the longest form for claim support so a hit on "评测结果" is
+    # not downgraded merely because "评测" and "结果" were also generated.
+    support_terms = [
+        term for term in raw_support_terms
+        if not (
+            all("\u3400" <= char <= "\u9fff" for char in term)
+            and any(len(other) > len(term) and term in other for other in raw_support_terms)
+        )
+    ]
     excerpt_value = excerpt.casefold()
     matched = [term for term in support_terms if term in excerpt_value]
     unmatched = [term for term in support_terms if term not in excerpt_value]
@@ -178,7 +202,7 @@ def _preferred_layers(query: str, available_layers: set[str]) -> set[str]:
     for layer in available_layers:
         if _layer_matches(layer, expanded_terms):
             layers.add(layer)
-    temporal_request = re.search(r"latest|recent|最新|最近|本周|本月|昨天|today|yesterday", value, re.IGNORECASE)
+    temporal_request = re.search(r"latest|recent|最新|最近|上次|之前|以前|历史|本周|本月|昨天|today|yesterday", value, re.IGNORECASE)
     if temporal_request and re.search(r"结论|finding|findings|evidence|summary|评估证据", value, re.IGNORECASE):
         report_layers = {
             layer for layer in available_layers
@@ -209,7 +233,7 @@ def _preferred_layers(query: str, available_layers: set[str]) -> set[str]:
             layers.update(paper_layers)
         if paper_layers and survey_layers and layers & paper_layers:
             layers.update(survey_layers)
-    if re.search(r"latest|recent|最近|最新|本周|本月|昨天|today|yesterday", value, re.IGNORECASE):
+    if re.search(r"latest|recent|最近|最新|上次|之前|以前|历史|本周|本月|昨天|today|yesterday", value, re.IGNORECASE):
         # ``recent`` alone is a topic-time request (for example "最近的模型
         # 评审"), not a personal standup request.  Only route to standup when
         # the query has an explicit activity/person cue.
@@ -277,7 +301,7 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
     ))
     terms = [term for term in terms if term not in {"what", "latest", "recent", "最近", "最新", "什么", "source", "evidence", "citation", "definition", "and", "or", "the", "a", "an", "relationship"}]
     date_terms = [term for term in terms if DATE_RE.search(term)]
-    latest = bool(re.search(r"latest|recent|最近|最新|本周|本月", query, re.IGNORECASE)) or bool(date_terms)
+    latest = bool(re.search(r"latest|recent|最近|最新|上次|之前|以前|历史|本周|本月", query, re.IGNORECASE)) or bool(date_terms)
     generic_temporal_terms = {"note", "report", "weekly", "paper", "model", "card", "update", "result"}
     specific_terms = [term for term in terms if term not in generic_temporal_terms]
     catalog_query = bool(

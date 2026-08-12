@@ -63,8 +63,8 @@ explicitly requests a write.
 2. If no source is configured, ask for or discover the user's intended knowledge directory, then run `init --path <directory> --json`. Repeat `source add --path <directory> --id <stable-id>` for additional repositories or document roots. This writes only user config and derived cache.
 3. Run `sync --json` when the doctor reports a missing/stale index or the source is not fresh.
 4. For a task that may benefit from prior agent work, call `memory_context(query)` first. It returns repository evidence plus shared decisions, failures, solutions, discoveries, and handoffs with separate provenance. Its current mode is `multi-source-lexical`: the lanes run in parallel but are not score-fused. Use `search "<question>" --scope repository --json` for a repository-only lookup, or `--scope memory` when the native conversation layers are explicitly needed.
-5. Inspect `verified`, `candidates`, `support`, `freshness`, and `diagnostics`; use `get` or `explain` for the complete evidence window and pass the result's citation `commit` when available.
-6. Cite only `verified` results with a valid citation. A verified document proves that the document citation is real; `support.claim_support=partial|unknown` means the answer must abstain from the unsupported part of a composite claim.
+5. Inspect `answerable`, `verified`, `candidates`, `support`, `freshness`, and `diagnostics`; use `get` or `explain` with the result's citation `commit`, `line_start`, and `line_end` when available. Never treat a verified-but-partial document as a complete answer.
+6. Use `answerable`/`results` as the answer surface. `verified` is a document-level retrieval lane used for diagnostics and evaluation; it only proves the citation is real. If `answerable` is empty or `abstain=true`, do not answer the full claim. `support.claim_support=partial|unknown` means the answer must abstain from the unsupported part and may only report a directly supported subclaim after `get`/`explain`.
 
 For a project-fact turn, the auditable call sequence is:
 

@@ -210,14 +210,33 @@ function resultCounts(value) {
   const contextEvidence = Array.isArray(result.context?.repository_evidence) ? result.context.repository_evidence : [];
   const groups = result.groups && typeof result.groups === "object" ? Object.values(result.groups) : [];
   const groupedVerified = groups.flatMap((group) => Array.isArray(group?.verified) ? group.verified : []);
+  const groupedAnswerable = groups.flatMap((group) => Array.isArray(group?.answerable) ? group.answerable : []);
   const items = groupedVerified.length ? groupedVerified : contextEvidence.length ? contextEvidence : verified;
+  // New runtimes expose ``answerable`` separately from document-level
+  // ``verified``.  Keep the fallback for older MCP payloads so this extension
+  // remains compatible during a rolling install, but never fall back when the
+  // field is explicitly present and empty.
+  const answerable = Array.isArray(result.answerable)
+    ? result.answerable
+    : groupedAnswerable.length
+      ? groupedAnswerable
+      : items;
   const citations = items.filter((item) => item?.citation?.valid === true || item?.citation_valid === true).length;
   const freshnessValue = result.freshness;
   const freshness = freshnessValue && typeof freshnessValue === "object"
     ? (freshnessValue.state || [...new Set(Object.values(freshnessValue).map((item) => item?.state).filter(Boolean))].sort())
     : freshnessValue || null;
   const failed = result.ok === false || Boolean(result.error) || result.status === "error";
-  return { verified: items.length, citations, abstain: result.abstain === true, freshness, failed };
+  const claimAbstain = result.claim_abstain === true || (items.length > 0 && answerable.length === 0);
+  return {
+    verified: items.length,
+    answerable: answerable.length,
+    citations,
+    abstain: result.abstain === true || claimAbstain,
+    claimAbstain,
+    freshness,
+    failed,
+  };
 }
 
 function resultShape(value) {
@@ -337,8 +356,10 @@ export default {
           sync: false,
           recovery: false,
           verified: 0,
+          answerable: 0,
           citations: 0,
           abstain: false,
+          claimAbstain: false,
           revisionRequested: false,
           startedAt: Date.now(),
         });
@@ -403,22 +424,26 @@ export default {
         const repoSearch = repoTool(cfg, toolName, "memory_search");
         const contextTool = repoTool(cfg, toolName, "memory_context");
         const result = event?.result ?? event?.output ?? event?.resultText;
-        const counts = repoSearch || contextTool ? resultCounts(result) : { verified: 0, citations: 0, abstain: false, freshness: null, failed: false };
+        const counts = repoSearch || contextTool ? resultCounts(result) : { verified: 0, answerable: 0, citations: 0, abstain: false, claimAbstain: false, freshness: null, failed: false };
         if ((repoSearch || contextTool) && event?.error) counts.failed = true;
         if ((repoSearch || contextTool) && state) {
           state.searchCompleted = true;
           state.searchFailed = counts.failed;
           state.verified = counts.verified;
+          state.answerable = counts.answerable;
           state.citations = counts.citations;
           state.abstain = counts.abstain;
+          state.claimAbstain = counts.claimAbstain;
         }
         if (state && repoTool(cfg, toolName, "memory_context")) {
           state.context = true;
           state.searchCompleted = true;
           state.searchFailed = counts.failed;
           state.verified = counts.verified;
+          state.answerable = counts.answerable;
           state.citations = counts.citations;
           state.abstain = counts.abstain;
+          state.claimAbstain = counts.claimAbstain;
         }
         if (state && repoTool(cfg, toolName, "memory_doctor")) {
           const doctorCounts = resultCounts(result);
@@ -436,8 +461,10 @@ export default {
           scope: repoSearch ? "repository" : null,
           outcome: event?.error ? "error" : "completed",
           verified: counts.verified,
+          answerable: counts.answerable,
           citations: counts.citations,
           abstain: counts.abstain,
+          claim_abstain: counts.claimAbstain,
           freshness: counts.freshness,
           failed: counts.failed,
           result_shape: resultShape(event?.result ?? event?.output ?? event?.resultText),
@@ -452,12 +479,13 @@ export default {
         const missingReceipt = Boolean(answer) && state.verified > 0 && !hasEvidenceReceipt(answer);
         const missingRetrieval = Boolean(answer) && !state.searchCompleted && !hasExplicitAbstention(answer);
         const emptyRetrieval = Boolean(answer) && state.searchCompleted && state.verified === 0 && !state.abstain && !hasExplicitAbstention(answer);
-        if (missingReceipt || missingRetrieval || emptyRetrieval) {
+        const unsupportedClaim = Boolean(answer) && state.verified > 0 && state.answerable === 0 && !hasExplicitAbstention(answer);
+        if (missingReceipt || missingRetrieval || emptyRetrieval || unsupportedClaim) {
           await appendAudit(cfg, {
             agent: optional(ctx?.agentId) || "main",
             run_id: optional(ctx?.runId) || null,
             event: "finalize_warning",
-            reason: missingReceipt ? "repository-memory answer receipt incomplete" : missingRetrieval ? "repository-fact answer had no observed shared-memory retrieval" : "repository-memory answer had no verified result or explicit abstention",
+            reason: missingReceipt ? "repository-memory answer receipt incomplete" : missingRetrieval ? "repository-fact answer had no observed shared-memory retrieval" : unsupportedClaim ? "verified citations did not support the complete claim; answer must abstain or narrow the claim" : "repository-memory answer had no verified result or explicit abstention",
             search_failed: state.searchFailed === true,
           });
         }
@@ -484,8 +512,10 @@ export default {
         get: state?.get === true,
         recovery: state?.recovery === true,
         verified: Number(state?.verified || 0),
+        answerable: Number(state?.answerable || 0),
         citations: Number(state?.citations || 0),
         abstain: state?.abstain === true,
+        claim_abstain: state?.claimAbstain === true,
         latency_ms: state?.startedAt ? Math.max(0, Date.now() - state.startedAt) : null,
       });
       const payload = {

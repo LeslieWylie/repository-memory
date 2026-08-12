@@ -124,10 +124,13 @@ Every search response has two layers:
 - `candidates`: related or incomplete material, including stale, generated,
   inferred, pending, dirty, or citation-incomplete results.
 
-Agents should answer from `verified` only. A document-level verified result
-does not prove every part of a compound claim. Check `support.claim_support`
-and use `get` or `explain` for the full evidence window before making a claim
-marked `partial` or `unknown`.
+Agents should answer from `answerable` (also returned as `results`) only.
+`verified` is the document-retrieval/evaluation lane: it proves that a citation
+is real, not that one excerpt supports every part of a compound claim. If
+`verified` is populated but `answerable` is empty, the runtime must abstain or
+narrow the answer. Check `support.claim_support` and use `get` or `explain`
+with the returned commit and line range before making a claim marked
+`partial` or `unknown`.
 
 The runtime does not require embeddings. When no semantic provider is
 configured, doctor and search say `retrieval_mode=lexical` and

@@ -253,7 +253,7 @@ def _discover_views(root: Path | None, source_id: str | None, scope: str, local:
 
 
 def _empty(query: str, mode: str, source_views: list[SourceView], reason: str, *, scope: str = "repository", backend: str | None = None) -> dict[str, Any]:
-    groups = {name: {"verified": [], "candidates": [], "results": [], "abstain": True} for name in ("repository", "memory")}
+    groups = {name: {"verified": [], "answerable": [], "candidates": [], "results": [], "abstain": True} for name in ("repository", "memory")}
     return {
         "schema_version": SCHEMA_VERSION,
         "query": query,
@@ -261,6 +261,7 @@ def _empty(query: str, mode: str, source_views: list[SourceView], reason: str, *
         "scope": scope,
         "sources": [_source_payload(view) for view in source_views],
         "verified": [] if scope == "all" else groups[scope]["verified"],
+        "answerable": [] if scope == "all" else groups[scope]["answerable"],
         "candidates": [] if scope == "all" else groups[scope]["candidates"],
         "results": [] if scope == "all" else groups[scope]["results"],
         "groups": groups if scope == "all" else None,
@@ -405,6 +406,23 @@ def _split_results(items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], l
     return verified, candidates
 
 
+def _answerable_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return citations whose excerpt supports the complete query claim.
+
+    ``verified`` is deliberately document-level: it means the citation points
+    at a real, fresh, non-pending document.  That is useful for recall and
+    qrels evaluation, but it is not permission to answer a composite question.
+    Only ``direct`` claim support is answerable without an additional evidence
+    lookup.  Partial/unknown hits remain visible as verified documents and
+    candidates for diagnostics, while the top-level result abstains.
+    """
+
+    return [
+        item for item in items
+        if str((item.get("support") or {}).get("claim_support") or "") == "direct"
+    ]
+
+
 def _fallback_items(view: SourceView, query: str, limit: int, deep: bool, *, stale: bool = False) -> list[dict[str, Any]]:
     try:
         view.metadata["local_index"] = ensure_local_index(view, deep)
@@ -501,6 +519,9 @@ def _package_search(query: str, mode: str, scope: str, views: list[SourceView], 
     memory_ready = any(entry.get("memory", {}).get("status") == "ready" for entry in diagnostics if isinstance(entry.get("memory"), dict))
     retrieval_mode = "grouped" if scope == "all" else "keyword-only" if scope == "memory" and memory_ready else "lexical"
     result_count = sum(len(group.get("verified", [])) for group in groups.values()) if scope == "all" else len(selected["verified"])
+    answerable_count = sum(len(group.get("answerable", [])) for group in groups.values()) if scope == "all" else len(selected.get("answerable", []))
+    answerable = [] if scope == "all" else selected.get("answerable", [])[:limit]
+    abstain = answerable_count == 0
     candidate_count = sum(len(group.get("candidates", [])) for group in groups.values()) if scope == "all" else len(selected["candidates"])
     return {
         "schema_version": SCHEMA_VERSION,
@@ -511,15 +532,20 @@ def _package_search(query: str, mode: str, scope: str, views: list[SourceView], 
         "sources": [_source_payload(view) for view in views],
         "verified": selected["verified"][:limit],
         "candidates": selected["candidates"][:limit],
-        "results": selected["verified"][:limit],
+        # ``results`` is the safe answer surface.  Keep ``verified`` separate
+        # for document-level retrieval metrics and citation diagnostics.
+        "results": answerable,
+        "answerable": answerable,
         "groups": groups if scope == "all" else None,
-        "abstain": not any(group.get("verified") for group in (groups.values() if scope == "all" else [selected])),
+        "abstain": abstain,
         "freshness": {view.spec.id: view.freshness for view in views},
         "diagnostics": {
             "scope": scope,
             "adapters": diagnostics,
             "result_count": result_count,
+            "answerable_count": answerable_count,
             "candidate_count": candidate_count,
+            "claim_abstain": abstain and result_count > 0,
             "retrieval_mode": retrieval_mode,
             "semantic_available": False if memory_ready else None,
             "query_terms": query_terms(query),
@@ -564,8 +590,9 @@ def search(root: Path | None, query: str, limit: int = 5, deep: bool = False, so
     for group in groups.values():
         group["verified"] = group["verified"][:limit]
         group["candidates"] = group["candidates"][:limit]
-        group["results"] = group["verified"]
-        group["abstain"] = not group["verified"]
+        group["answerable"] = _answerable_items(group["verified"])
+        group["results"] = group["answerable"]
+        group["abstain"] = not group["answerable"]
     return _package_search(query, mode, scope, views, groups, diagnostics, limit)
 
 
@@ -945,7 +972,14 @@ def _memory_get_result(result_id: str, explain: bool = False) -> dict[str, Any]:
     return result
 
 
-def get_result(root: Path | None, result_id: str, explain: bool = False, expected_commit: str | None = None) -> dict[str, Any]:
+def get_result(
+    root: Path | None,
+    result_id: str,
+    explain: bool = False,
+    expected_commit: str | None = None,
+    line_start: int | None = None,
+    line_end: int | None = None,
+) -> dict[str, Any]:
     if result_id.startswith("team:"):
         value = team_memory_store().get(result_id)
         if explain:
@@ -971,11 +1005,20 @@ def get_result(root: Path | None, result_id: str, explain: bool = False, expecte
                 safe_document = _safe_document(view.path, relative)
                 if safe_document:
                     _document, content_lines = safe_document
-                    # get/explain intentionally returns a larger evidence
-                    # window than search, while remaining bounded for giant
-                    # generated documents.
-                    window = content_lines[:200]
-                    start, end = 1, len(window)
+                    # A search result can pass its citation locator back to
+                    # get/explain.  Prefer that exact evidence window so a
+                    # large standup/report does not silently return lines
+                    # 1-200 for a hit at line 455.  Without a locator retain
+                    # the bounded first-window compatibility behavior.
+                    requested_start = max(1, int(line_start or 1))
+                    requested_end = max(requested_start, int(line_end or min(200, len(content_lines))))
+                    if line_start is not None or line_end is not None:
+                        start = min(requested_start, len(content_lines) or 1)
+                        end = min(requested_end, len(content_lines) or start)
+                        window = content_lines[start - 1:end]
+                    else:
+                        window = content_lines[:200]
+                        start, end = 1, len(window)
                     dirty_local = view.dirty and view.commit_type == "local_worktree"
                     citation = {
                         "source": "repository",
@@ -1002,7 +1045,7 @@ def get_result(root: Path | None, result_id: str, explain: bool = False, expecte
                         "line_start": start,
                         "line_end": end,
                         "excerpt": "\n".join(window),
-                        "evidence_window": {"line_start": start, "line_end": end, "truncated": len(content_lines) > len(window)},
+                        "evidence_window": {"line_start": start, "line_end": end, "requested_line_start": line_start, "requested_line_end": line_end, "truncated": len(content_lines) > len(window)},
                         "support": {"matched_terms": [], "unmatched_terms": [], "coverage": 1.0, "claim_support": "unknown", "supporting_spans": []},
                         "citation": citation,
                         "evidence_status": "stale" if dirty_local else "secondary",
@@ -1335,8 +1378,8 @@ def build_parser() -> argparse.ArgumentParser:
     common("doctor").add_argument("--json", action="store_true")
     sync = common("sync"); sync.add_argument("--deep", action="store_true"); sync.add_argument("--local", action="store_true"); sync.add_argument("--all", action="store_true"); sync.add_argument("--json", action="store_true")
     search_parser = common("search"); search_parser.add_argument("query"); search_parser.add_argument("--limit", type=int, default=5); search_parser.add_argument("--deep", action="store_true"); search_parser.add_argument("--local", action="store_true"); search_parser.add_argument("--scope", choices=("repository", "memory", "all"), default="repository"); search_parser.add_argument("--json", action="store_true")
-    get_parser = common("get"); get_parser.add_argument("result_id"); get_parser.add_argument("--commit"); get_parser.add_argument("--json", action="store_true")
-    explain_parser = common("explain"); explain_parser.add_argument("result_id"); explain_parser.add_argument("--commit"); explain_parser.add_argument("--json", action="store_true")
+    get_parser = common("get"); get_parser.add_argument("result_id"); get_parser.add_argument("--commit"); get_parser.add_argument("--line-start", type=int); get_parser.add_argument("--line-end", type=int); get_parser.add_argument("--json", action="store_true")
+    explain_parser = common("explain"); explain_parser.add_argument("result_id"); explain_parser.add_argument("--commit"); explain_parser.add_argument("--line-start", type=int); explain_parser.add_argument("--line-end", type=int); explain_parser.add_argument("--json", action="store_true")
     feedback_parser = common("feedback"); feedback_parser.add_argument("result_id"); feedback_parser.add_argument("--note", required=True); feedback_parser.add_argument("--rating"); feedback_parser.add_argument("--feedback-id"); feedback_parser.add_argument("--json", action="store_true")
     promote_parser = common("promote"); promote_parser.add_argument("--input", required=True); promote_parser.add_argument("--json", action="store_true")
     publish_parser = common("publish"); publish_parser.add_argument("--input", required=True); publish_parser.add_argument("--status", choices=("candidate", "active"), default="candidate"); publish_parser.add_argument("--json", action="store_true")
@@ -1379,7 +1422,13 @@ def _mcp_dispatch(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     if name == "memory_search":
         return search(root, str(arguments.get("query") or ""), int(arguments.get("limit") or 5), bool(arguments.get("deep")), source, bool(arguments.get("local")), str(arguments.get("scope") or "repository"))
     if name == "memory_get":
-        return get_result(root, str(arguments.get("id") or ""), expected_commit=str(arguments.get("commit") or "") or None)
+        return get_result(
+            root,
+            str(arguments.get("id") or ""),
+            expected_commit=str(arguments.get("commit") or "") or None,
+            line_start=int(arguments["line_start"]) if arguments.get("line_start") is not None else None,
+            line_end=int(arguments["line_end"]) if arguments.get("line_end") is not None else None,
+        )
     if name == "memory_context":
         return memory_context(root, str(arguments.get("query") or ""), limit=int(arguments.get("limit") or 5), source_id=source, repo=str(arguments.get("repo") or "") or None, issue=str(arguments.get("issue") or "") or None, branch=str(arguments.get("branch") or "") or None, agent=str(arguments.get("agent") or "") or None, local=bool(arguments.get("local")))
     if name == "memory_team_sync":
@@ -1460,9 +1509,9 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
         elif args.command == "search":
             value = search(root if root_arg else None, args.query, args.limit, args.deep, getattr(args, "source", None), args.local, args.scope)
         elif args.command == "get":
-            value = get_result(root if root_arg else None, args.result_id, expected_commit=args.commit)
+            value = get_result(root if root_arg else None, args.result_id, expected_commit=args.commit, line_start=args.line_start, line_end=args.line_end)
         elif args.command == "explain":
-            value = get_result(root if root_arg else None, args.result_id, explain=True, expected_commit=args.commit)
+            value = get_result(root if root_arg else None, args.result_id, explain=True, expected_commit=args.commit, line_start=args.line_start, line_end=args.line_end)
         elif args.command == "feedback":
             value = feedback(root, args.result_id, args.note, args.rating, args.feedback_id)
         elif args.command == "promote":

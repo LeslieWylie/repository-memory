@@ -116,7 +116,8 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertFalse(result["abstain"])
         self.assertEqual({item["source"] for item in result["verified"]}, {"alpha", "beta"})
         self.assertEqual(result["verified"][0]["citation"]["valid"], True)
-        self.assertEqual(result["results"], result["verified"])
+        self.assertEqual(result["results"], result["answerable"])
+        self.assertEqual(len(result["answerable"]), len(result["verified"]))
 
         pending = core.search(None, "pending candidate", limit=5)
         self.assertTrue(pending["abstain"])
@@ -970,7 +971,7 @@ class RepositoryMemoryTest(unittest.TestCase):
 
     def test_document_verification_is_independent_from_claim_coverage(self):
         composite = self.alpha / "docs" / "composite.md"
-        composite.write_text("# Composite\nAtlas and alpha are introduced here.\n" + ("context line\n" * 14) + "beta is documented in the same record.\n", encoding="utf-8")
+        composite.write_text("# Composite\nAtlas and alpha are introduced here.\n" + ("context line\n" * 30) + "beta is documented in the same record.\n", encoding="utf-8")
         subprocess.run(["git", "-C", str(self.alpha), "add", str(composite)], check=True)
         subprocess.run(["git", "-C", str(self.alpha), "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "composite"], check=True)
         self.write_config({"sources": [{"id": "alpha", "root": str(self.alpha)}]})
@@ -981,6 +982,9 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(hit["support"]["claim_support"], "partial")
         self.assertIn("beta", hit["support"]["unmatched_terms"])
         self.assertGreaterEqual(hit["line_end"], hit["line_start"])
+        self.assertTrue(result["abstain"])
+        self.assertEqual(result["answerable"], [])
+        self.assertTrue(result["diagnostics"]["claim_abstain"])
 
     def test_unrelated_adapter_excerpt_cannot_become_verified(self):
         view = prepare_view(SourceSpec("alpha", self.alpha, "alpha"), local=True)
@@ -1020,6 +1024,19 @@ class RepositoryMemoryTest(unittest.TestCase):
         mismatch = core.get_result(self.alpha, "alpha:docs/atlas.md", expected_commit="different-commit")
         self.assertFalse(mismatch["found"])
         self.assertEqual(mismatch["errors"][0]["expected_commit"], "different-commit")
+
+    def test_get_can_pin_search_line_window(self):
+        document = self.alpha / "docs" / "long.md"
+        document.write_text("\n".join([f"line {index}" for index in range(1, 31)]) + "\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.alpha), "add", str(document)], check=True)
+        subprocess.run(["git", "-C", str(self.alpha), "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "long"], check=True)
+        self.write_config({"sources": [{"id": "alpha", "root": str(self.alpha)}]})
+        fetched = core.get_result(self.alpha, "alpha:docs/long.md", line_start=21, line_end=23)
+        self.assertTrue(fetched["found"])
+        self.assertEqual(fetched["result"]["citation"]["line_start"], 21)
+        self.assertEqual(fetched["result"]["citation"]["line_end"], 23)
+        self.assertEqual(fetched["result"]["evidence_window"], {"line_start": 21, "line_end": 23, "requested_line_start": 21, "requested_line_end": 23, "truncated": True})
+        self.assertEqual(fetched["result"]["excerpt"], "line 21\nline 22\nline 23")
 
     def test_scope_routes_repository_and_memory_without_score_fusion(self):
         native = Mock()

@@ -33,8 +33,8 @@ repository-memory source add --path <knowledge-directory> [--id <stable-id>] [--
 repository-memory source list --json
 repository-memory sync [--source <id>|--all] [--local] --json
 repository-memory search "<query>" [--source <id>] [--scope repository|memory|all] [--deep] [--local] --json
-repository-memory get "<result-id>" [--commit <citation-commit>] --json
-repository-memory explain "<result-id>" [--commit <citation-commit>] --json
+repository-memory get "<result-id>" [--commit <citation-commit>] [--line-start N --line-end N] --json
+repository-memory explain "<result-id>" [--commit <citation-commit>] [--line-start N --line-end N] --json
 repository-memory feedback "<result-id>" --note "..." [--feedback-id <stable-id>] --json
 repository-memory promote --input <file> --json
 repository-memory ingest-session --input <json-or-jsonl> --json
@@ -95,6 +95,15 @@ backend's `supported_layers`/`reachable` fields describe capability and
 readiness, not the amount or quality of stored memory.
 
 `sync` updates only remote snapshots and derived indexes. It does not pull, commit, push, or overwrite the working tree. Use `--local` only when local checkout state is intentionally desired. For an intentionally detached or offline snapshot, register the source with `--local-only`; this makes the configured local commit the declared source of truth and reports `commit_type=local_worktree` with `freshness.state=fresh` when the checkout is clean. It does not claim that the snapshot is the latest remote revision. Dirty local-only sources remain `dirty` and are not verified.
+
+`verified` means the document citation is real and traceable; it does not mean
+the excerpt supports every part of a composite question. The answer-safe
+surface is `answerable` (also returned as `results`), which contains only
+directly supported claims. If `verified` is non-empty but `answerable` is
+empty, preserve the citations for diagnosis/evaluation and abstain from the
+complete claim. Pass the returned commit and line range to `get`/`explain` to
+inspect the exact evidence window instead of silently reading a document's
+first page.
 
 `evaluate --revision` evaluates an immutable detached snapshot in the user
 cache and records the evaluated commit, branch, qrels revision, scope, and

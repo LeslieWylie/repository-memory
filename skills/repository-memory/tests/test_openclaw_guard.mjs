@@ -136,6 +136,20 @@ await hooks.get("before_tool_call")({ toolName: "repository-memory__memory_get",
 const weakReceipt = await hooks.get("before_agent_finalize")({ finalText: "来源是评测报告，结果是 90%" }, weakReceiptCtx);
 assert.equal(weakReceipt, undefined);
 
+// A real citation can still be insufficient for the complete compound claim.
+// The guard must observe that distinction and record a claim-level abstention;
+// it remains advisory and does not block ordinary host tools.
+const partialCtx = { agentId: "yaole", sessionKey: "partial-claim-1" };
+await hooks.get("before_agent_run")({ prompt: "查询复合评测结果" }, partialCtx);
+await hooks.get("before_tool_call")({ toolName: "repository-memory__memory_doctor", params: {} }, partialCtx);
+await hooks.get("after_tool_call")({ toolName: "repository-memory__memory_doctor", result: { status: "ready" } }, partialCtx);
+await hooks.get("before_tool_call")({ toolName: "repository-memory__memory_search", params: { query: "复合评测结果" } }, partialCtx);
+await hooks.get("after_tool_call")({
+  toolName: "repository-memory__memory_search",
+  result: { verified: [{ citation: { valid: true } }], answerable: [], candidates: [], abstain: true, claim_abstain: true, freshness: { state: "fresh" } },
+}, partialCtx);
+await hooks.get("before_agent_finalize")({ finalText: "评测结果是 90%，可以直接下结论" }, partialCtx);
+
 // Operational default: audit routing/citation violations without deadlocking
 // useful diagnostics when a backend is slow or incomplete.
 const auditCtx = { agentId: "yaole", sessionKey: "audit-1" };
@@ -163,6 +177,8 @@ assert.doesNotMatch(audit, /tool_blocked/);
 assert.match(audit, /tool_completed/);
 assert.match(audit, /result_shape/);
 assert.match(audit, /"verified":1/);
+assert.match(audit, /"answerable":0/);
+assert.match(audit, /claim_abstain/);
 assert.match(audit, /"citations":1/);
 assert.match(audit, /recovery_allowed/);
 const auditMode = await readFile(join(auditDir, "audit-mode.jsonl"), "utf8");
