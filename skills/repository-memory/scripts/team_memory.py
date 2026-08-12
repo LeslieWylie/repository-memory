@@ -275,7 +275,7 @@ class SQLiteTeamMemoryBackend:
                 retention_details.append({"id": mem_id, "total_revisions": rev_count, "current_ancestor_chain": current_chain})
         finally:
             connection.close()
-        retention = {"total_revisions": revisions, "revision_records": retention_details}
+        retention = {item["id"]: {key: value for key, value in item.items() if key != "id"} for item in retention_details}
         return {
             "backend": self.backend_name,
             "backend_kind": "local",
@@ -289,6 +289,7 @@ class SQLiteTeamMemoryBackend:
             "feedback_count": feedback,
             "revision_count": revisions,
             "retention": retention,
+            "retention_summary": {"total_revisions": revisions, "revision_records": retention_details},
             "active_expired": expired,
             "index": "fts5" if fts else "sqlite-scan",
             "retrieval_strategy": "keyword-only",
@@ -637,6 +638,7 @@ class SQLiteTeamMemoryBackend:
         def operation(connection: sqlite3.Connection) -> dict[str, Any]:
             inserted = updated = skipped = conflicts = stale_ignored = feedback_added = feedback_replayed = revisions_inserted = revisions_skipped = 0
             conflict_records: list[dict[str, Any]] = []
+            incoming_confidence: dict[str, float] = {}
             mutable_fields = ("memory_type", "title", "content", "summary", "scope", "provenance", "confidence", "status", "supersedes", "superseded_by", "valid_from", "valid_until", "author_agent", "reviewed_by", "activated_at")
             for incoming in revisions:
                 if not isinstance(incoming, dict) or not str(incoming.get("memory_id") or "").startswith("team:"):
@@ -665,7 +667,7 @@ class SQLiteTeamMemoryBackend:
                     conflict_records.append({
                         "id": incoming["memory_id"],
                         "revision_id": revision_id,
-                        "reason": "incoming revision parent is not retained; causal history is incomplete",
+                        "reason": "parent_revision not found locally; causal history is incomplete",
                         "missing_parent": parent_revision,
                     })
                     continue
@@ -698,7 +700,7 @@ class SQLiteTeamMemoryBackend:
                     conflicts += 1
                     conflict_records.append({
                         "id": record["id"],
-                        "reason": "incoming record parent is not retained; causal history is incomplete",
+                        "reason": "parent_revision not found locally; causal history is incomplete",
                         "missing_parent": record_parent,
                     })
                     continue
@@ -713,6 +715,7 @@ class SQLiteTeamMemoryBackend:
                         body = "\n".join((str(record["title"]), str(record["summary"]), str(record["content"]), str(record["scope"]), str(record["provenance"])))
                         connection.execute("INSERT OR REPLACE INTO memories_fts (id, body) VALUES (?, ?)", (record["id"], body))
                     self._append_revision(connection, connection.execute("SELECT * FROM memories WHERE id = ?", (record["id"],)).fetchone())
+                    incoming_confidence[record["id"]] = float(record["confidence"])
                     inserted += 1
                 else:
                     current_revision = int(existing["revision"] or 1)
@@ -721,6 +724,7 @@ class SQLiteTeamMemoryBackend:
                     current_revision_id = self._revision_id(current_revision, current_origin)
                     same_content = all(existing[field] == record[field] for field in mutable_fields)
                     if record["revision"] == current_revision and record["origin_node"] == current_origin and same_content:
+                        incoming_confidence[record["id"]] = float(record["confidence"])
                         skipped += 1
                         continue
                     if record["revision"] < current_revision:
@@ -728,6 +732,7 @@ class SQLiteTeamMemoryBackend:
                         continue
                     if record["revision"] == current_revision:
                         if same_content:
+                            incoming_confidence[record["id"]] = float(record["confidence"])
                             skipped += 1
                             continue
                         conflicts += 1
@@ -746,6 +751,7 @@ class SQLiteTeamMemoryBackend:
                         body = "\n".join((str(record["title"]), str(record["summary"]), str(record["content"]), str(record["scope"]), str(record["provenance"])))
                         connection.execute("INSERT INTO memories_fts (id, body) VALUES (?, ?)", (record["id"], body))
                     self._append_revision(connection, connection.execute("SELECT * FROM memories WHERE id = ?", (record["id"],)).fetchone())
+                    incoming_confidence[record["id"]] = float(record["confidence"])
                     updated += 1
             for item in feedback:
                 if not isinstance(item, dict) or not item.get("memory_id"):
@@ -766,7 +772,15 @@ class SQLiteTeamMemoryBackend:
                 rating = str(item.get("rating") or "").strip().lower()
                 if rating in {"stale", "wrong"} and memory_id:
                     if connection.execute("SELECT 1 FROM memories WHERE id = ?", (memory_id,)).fetchone():
-                        connection.execute("UPDATE memories SET confidence = MAX(0, confidence - 0.1) WHERE id = ?", (memory_id,))
+                        if memory_id in incoming_confidence:
+                            # The bundled record already contains the source
+                            # node's aggregate confidence.  Use it as a floor
+                            # so importing the same feedback does not subtract
+                            # twice, while locally existing feedback can still
+                            # trigger the status transition below.
+                            connection.execute("UPDATE memories SET confidence = MIN(confidence, ?) WHERE id = ?", (incoming_confidence[memory_id], memory_id))
+                        else:
+                            connection.execute("UPDATE memories SET confidence = MAX(0, confidence - 0.1) WHERE id = ?", (memory_id,))
                         if rating == "wrong":
                             connection.execute("UPDATE memories SET status = 'stale' WHERE id = ? AND status NOT IN ('superseded', 'stale')", (memory_id,))
                         else:
