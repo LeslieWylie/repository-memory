@@ -21,6 +21,8 @@ from typing import Any
 from urllib import error, request
 from urllib.parse import urlsplit, urlunsplit
 
+from models import MEMORY_LAYERS, memory_layer_state
+
 
 class MemoryCoreError(RuntimeError):
     """A safe, user-actionable MemoryCore error."""
@@ -250,6 +252,55 @@ class MemoryCoreClient:
         data = value.get("data")
         return data if isinstance(data, dict) else value
 
+    @staticmethod
+    def _explicit_readback(payload: dict[str, Any]) -> str | None:
+        """Map only backend-provided lifecycle signals into read-back state."""
+
+        value = payload.get("readback")
+        if isinstance(value, dict):
+            value = value.get("status")
+        if payload.get("readback_status") is not None:
+            value = payload.get("readback_status")
+        elif value is None:
+            value = payload.get("status")
+        if payload.get("pending") is True:
+            return "pending"
+        normalized = str(value or "").strip().lower()
+        if normalized in {"pending", "processing", "queued"}:
+            return "pending"
+        if normalized in {"verified", "complete", "completed"}:
+            return "verified"
+        if normalized == "unknown":
+            return "unknown"
+        return None
+
+    @staticmethod
+    def _collection_population(payload: dict[str, Any], *keys: str) -> tuple[str, int | None, int | None, bool]:
+        """Return population/counts only when the adapter response proves them."""
+
+        values: list[Any] | None = None
+        for key in keys:
+            if key in payload:
+                raw = payload.get(key)
+                if isinstance(raw, list):
+                    values = raw
+                    break
+        total = payload.get("total")
+        total_count = total if isinstance(total, int) and not isinstance(total, bool) and total >= 0 else None
+        sampled_count = len(values) if values is not None else None
+        if total_count is not None:
+            return ("present" if total_count else "empty", total_count, sampled_count, True)
+        if values is not None:
+            return ("present" if values else "empty", len(values), len(values), True)
+        return "unknown", None, sampled_count, False
+
+    @classmethod
+    def _readback_state(cls, payload: dict[str, Any], shape_known: bool) -> str:
+        explicit = cls._explicit_readback(payload)
+        if explicit is not None:
+            return explicit
+        return "verified" if shape_known else "unknown"
+
     def health(self, refresh: bool = False, probe_layers: bool = False) -> dict[str, Any]:
         if self._health is not None and not refresh and (not probe_layers or "layers" in self._health):
             return dict(self._health)
@@ -258,7 +309,7 @@ class MemoryCoreClient:
         model_ref = _first_string(memory_config.get("llm_model"))
         model_name = model_ref.rsplit("/", 1)[-1] if model_ref else None
         result: dict[str, Any] = {
-            "supported_layers": ["L0", "L1", "L2", "L3"],
+            "supported_layers": list(MEMORY_LAYERS),
             "configured": self.config.configured,
             "reachable": False,
             "status": "not_configured" if not self.config.configured else "unreachable",
@@ -274,7 +325,10 @@ class MemoryCoreClient:
             },
         }
         if not self.config.configured:
-            result["layers"] = {layer: {"status": "not_configured", "reachable": False} for layer in result["supported_layers"]}
+            result["layers"] = {
+                layer: memory_layer_state("supported", "not_configured", "unknown", "unknown")
+                for layer in result["supported_layers"]
+            }
             self._health = result
             return dict(result)
         try:
@@ -293,53 +347,66 @@ class MemoryCoreClient:
                     try:
                         probe_response = self._data(self._request("POST", endpoint, self._scoped(body)))
                         if layer in {"L0", "L1"}:
-                            values = probe_response.get("messages" if layer == "L0" else "items", [])
-                            values = values if isinstance(values, list) else []
-                            count = len(values)
-                            data_status = "present" if count else "empty"
-                            layer_status[layer] = {
-                                "status": "ready",
-                                "reachable": True,
-                                "endpoint": endpoint,
-                                "data_status": data_status,
-                                "record_count_sampled": count,
-                                "readback_verified": True,
-                            }
+                            population, count, sampled, shape_known = self._collection_population(
+                                probe_response,
+                                "messages" if layer == "L0" else "items",
+                            )
+                            details = {"endpoint": endpoint}
+                            if count is not None:
+                                details["record_count"] = count
+                            if sampled is not None:
+                                details["record_count_sampled"] = sampled
+                            layer_status[layer] = memory_layer_state(
+                                "supported", "ready", population,
+                                self._readback_state(probe_response, shape_known), **details,
+                            )
                         elif layer == "L2":
-                            entries = probe_response.get("entries") or probe_response.get("items") or []
-                            entries = entries if isinstance(entries, list) else []
-                            accepted = sum(1 for item in entries if isinstance(item, dict) and item.get("accepted") is True)
-                            pending = max(0, len(entries) - accepted)
-                            layer_status[layer] = {
-                                "status": "ready",
-                                "reachable": True,
-                                "endpoint": endpoint,
-                                "data_status": "empty" if not entries else "accepted" if accepted else "candidate",
-                                "record_count": len(entries),
-                                "accepted_count": accepted,
-                                "pending_count": pending,
-                                "readback_verified": True,
-                            }
+                            entries_value = probe_response.get("entries") if "entries" in probe_response else probe_response.get("items")
+                            entries = entries_value if isinstance(entries_value, list) else None
+                            population, count, sampled, shape_known = self._collection_population(probe_response, "entries", "items")
+                            details = {"endpoint": endpoint}
+                            if count is not None:
+                                details["record_count"] = count
+                            if sampled is not None:
+                                details["record_count_sampled"] = sampled
+                            if entries is not None:
+                                accepted = sum(1 for item in entries if isinstance(item, dict) and item.get("accepted") is True)
+                                pending = max(0, len(entries) - accepted)
+                                details["accepted_count_sampled"] = accepted
+                                details["pending_count_sampled"] = pending
+                                if count == len(entries):
+                                    details["accepted_count"] = accepted
+                                    details["pending_count"] = pending
+                            layer_status[layer] = memory_layer_state(
+                                "supported", "ready", population,
+                                self._readback_state(probe_response, shape_known), **details,
+                            )
                         else:
-                            content = str(probe_response.get("content") or "").strip()
+                            content_known = "content" in probe_response
+                            content = str(probe_response.get("content") or "").strip() if content_known else ""
                             metadata = probe_response.get("metadata") if isinstance(probe_response.get("metadata"), dict) else {}
                             accepted = probe_response.get("accepted") is True or metadata.get("status") == "accepted" or metadata.get("accepted") is True
-                            layer_status[layer] = {
-                                "status": "ready",
-                                "reachable": True,
-                                "endpoint": endpoint,
-                                "data_status": "accepted" if accepted else "present" if content else "empty",
-                                "record_count": 1 if content else 0,
-                                "accepted": bool(accepted),
-                                "readback_verified": True,
-                            }
+                            population = "present" if content else "empty" if content_known else "unknown"
+                            details = {"endpoint": endpoint, "accepted": bool(accepted)}
+                            if content_known:
+                                details["record_count"] = 1 if content else 0
+                            layer_status[layer] = memory_layer_state(
+                                "supported", "ready", population,
+                                self._readback_state(probe_response, content_known), **details,
+                            )
                     except MemoryCoreError as exc:
-                        layer_status[layer] = {"status": "unavailable", "reachable": False, "endpoint": endpoint, "error": str(exc)}
+                        layer_status[layer] = memory_layer_state(
+                            "supported", "unreachable", "unknown", "unknown",
+                            endpoint=endpoint, error=str(exc),
+                        )
                 result["layers"] = layer_status
         except MemoryCoreError as exc:
             result.update({"error": str(exc)})
             if probe_layers:
-                result["layers"] = {layer: {"status": "unreachable", "reachable": False} for layer in result["supported_layers"]}
+                result["layers"] = {
+                    layer: memory_layer_state("supported", "unreachable", "unknown", "unknown")
+                    for layer in result["supported_layers"]
+                }
         self._health = result
         return dict(result)
 

@@ -187,7 +187,11 @@ repository evidence:
 
 An API being reachable is not the same as having useful data. Doctor reports
 capability, reachability, record counts, pending candidates, and read-back
-verification separately.
+verification separately. Every `memory.layers.L*` entry uses the same four-way
+contract: `capability`, `api_status`, `population`, and `readback`. Population
+is only `present` when the layer's actual query/read response returns records
+or content; unsupported, unreachable, malformed, or unprobed states remain
+`unknown` rather than being inferred from global health.
 
 MemoryCore is optional and is not bundled in this repository. Its endpoint,
 model, provider, and credentials are discovered from user configuration or

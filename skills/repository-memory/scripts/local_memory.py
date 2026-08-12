@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from discovery import data_root
+from models import MEMORY_LAYERS, memory_layer_state
 
 SECRET_CONTENT = re.compile(
     r"-----BEGIN .*PRIVATE KEY-----|(?:api[_-]?key|access[_-]?token|password|secret)\s*[:=]\s*['\"]?[A-Za-z0-9_\-/.+=]{16,}|\bsk-[A-Za-z0-9_-]{16,}",
@@ -100,6 +101,10 @@ class LocalMemoryStore:
         connection = self._connect()
         try:
             count = int(connection.execute("SELECT COUNT(*) FROM records").fetchone()[0])
+            counts = {
+                str(row[0]): int(row[1])
+                for row in connection.execute("SELECT layer, COUNT(*) FROM records GROUP BY layer").fetchall()
+            }
             fts = self._fts_available(connection)
         finally:
             connection.close()
@@ -114,10 +119,15 @@ class LocalMemoryStore:
             "index": "fts5" if fts else "sqlite-scan",
             "embedding": {"available": False, "strategy": "keyword-only"},
             "layers": {
-                "L0": {"status": "ready", "reachable": True, "persistent": True},
-                "L1": {"status": "ready", "reachable": True, "persistent": True},
-                "L2": {"status": "unsupported", "reachable": False, "persistent": False},
-                "L3": {"status": "unsupported", "reachable": False, "persistent": False},
+                layer: memory_layer_state(
+                    "supported" if layer in {"L0", "L1"} else "unsupported",
+                    "ready" if layer in {"L0", "L1"} else "unsupported",
+                    "present" if counts.get(layer, 0) else "empty" if layer in {"L0", "L1"} else "unknown",
+                    "verified" if layer in {"L0", "L1"} else "unknown",
+                    persistent=layer in {"L0", "L1"},
+                    **({"record_count": counts.get(layer, 0)} if layer in {"L0", "L1"} else {}),
+                )
+                for layer in MEMORY_LAYERS
             },
         }
 

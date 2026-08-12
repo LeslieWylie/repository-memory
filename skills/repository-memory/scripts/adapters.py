@@ -19,7 +19,7 @@ from discovery import adapter_config, adapter_protocol, configured_adapter
 from local_memory import local_memory_store
 from memorycore import MemoryCoreError, native_memory_client
 
-from models import SourceView
+from models import MEMORY_LAYERS, SourceView, memory_layer_state
 
 SECRET_NAME_RE = __import__("re").compile(r"(^|/)(\.env(?:\.|$)|.*\.(?:pem|key|p12|pfx|secret|secrets?))$", __import__("re").I)
 SECRET_CONTENT_RE = __import__("re").compile(r"-----BEGIN .*PRIVATE KEY-----|(?:api[_-]?key|access[_-]?token|password|secret)\s*[:=]\s*['\"]?[A-Za-z0-9_\-/.+=]{16,}|\bsk-[A-Za-z0-9_-]{16,}", __import__("re").I)
@@ -147,6 +147,14 @@ class Adapter:
             "configured": bool(endpoint),
             "reachable": False if not endpoint else None,
             "status": "not_configured" if not endpoint else "unknown",
+            "layers": {
+                layer: memory_layer_state(
+                    "supported" if layer in supported else "unsupported",
+                    "not_configured" if layer in supported else "unsupported",
+                    "unknown", "unknown",
+                )
+                for layer in MEMORY_LAYERS
+            },
         }
         if not endpoint:
             if self.protocol == "local-fallback":
@@ -168,6 +176,15 @@ class Adapter:
                 result.update({"reachable": 200 <= response.status < 400, "status": "ready" if response.status < 400 else "error"})
         except (OSError, urllib.error.URLError, ValueError) as exc:
             result.update({"reachable": False, "status": "unreachable", "error": str(exc).replace(str(endpoint), safe_endpoint)[:240]})
+        layer_api_status = "unknown" if result.get("reachable") is True else "unreachable"
+        result["layers"] = {
+            layer: memory_layer_state(
+                "supported" if layer in supported else "unsupported",
+                layer_api_status if layer in supported else "unsupported",
+                "unknown", "unknown",
+            )
+            for layer in MEMORY_LAYERS
+        }
         self._memory_probe = result
         if result.get("reachable") is True:
             return result

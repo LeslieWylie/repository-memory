@@ -29,6 +29,9 @@ revision is a separate compatibility identifier; see
   multi-gold Recall@5 accounting.
 - Add a standard wheel/console entry point and a Windows `msvcrt` snapshot
   lock fallback.
+- Separate each doctor memory layer's adapter capability, API readiness, data
+  population, and read-back state so supported/reachable layers are never
+  reported as populated without records from the layer response.
 
 ## [0.2.0] - 2026-08-11
 

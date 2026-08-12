@@ -942,6 +942,32 @@ class RepositoryMemoryTest(unittest.TestCase):
             self.assertEqual(state["population"], "unknown")
             self.assertEqual(state["readback"], "unknown")
 
+    def test_memorycore_doctor_isolates_one_unreachable_layer_api(self):
+        config = MemoryCoreConfig(endpoint="http://127.0.0.1:8420", api_key=None, team_id="team", agent_id="agent", user_id="user")
+        client = MemoryCoreClient(config)
+        responses = iter([
+            {"code": 0, "data": {"status": "ok"}},
+            {"code": 0, "data": {"messages": [], "total": 0}},
+            MemoryCoreError("atomic API unavailable"),
+            {"code": 0, "data": {"entries": [], "total": 0}},
+            {"code": 0, "data": {"content": ""}},
+        ])
+
+        def respond(*_args, **_kwargs):
+            value = next(responses)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        with patch.object(client, "_request", side_effect=respond):
+            layers = client.health(refresh=True, probe_layers=True)["layers"]
+        self.assertEqual(layers["L0"]["api_status"], "ready")
+        self.assertEqual(layers["L1"]["api_status"], "unreachable")
+        self.assertEqual(layers["L1"]["population"], "unknown")
+        self.assertEqual(layers["L1"]["readback"], "unknown")
+        self.assertEqual(layers["L2"]["api_status"], "ready")
+        self.assertEqual(layers["L3"]["api_status"], "ready")
+
     def test_document_verification_is_independent_from_claim_coverage(self):
         composite = self.alpha / "docs" / "composite.md"
         composite.write_text("# Composite\nAtlas and alpha are introduced here.\n" + ("context line\n" * 14) + "beta is documented in the same record.\n", encoding="utf-8")
@@ -1228,6 +1254,11 @@ class RepositoryMemoryTest(unittest.TestCase):
     def test_local_memory_fallback_is_durable_without_native_backend(self):
         self.write_config({})
         os.environ["REPOSITORY_MEMORY_AUTODISCOVER"] = "0"
+        empty_memory = core.doctor(None)["memory"]
+        self.assertEqual(empty_memory["layers"]["L0"]["population"], "empty")
+        self.assertEqual(empty_memory["layers"]["L1"]["population"], "empty")
+        self.assertEqual(empty_memory["layers"]["L2"]["capability"], "unsupported")
+        self.assertEqual(empty_memory["layers"]["L2"]["population"], "unknown")
         session = Path(self.temp.name) / "local-session.json"
         session.write_text(json.dumps({
             "session_id": "local-session",
@@ -1237,6 +1268,8 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertTrue(ingested["ok"])
         self.assertEqual(ingested["source"], "local-memory")
         self.assertEqual(ingested["memory"]["supported_layers"], ["L0", "L1"])
+        self.assertEqual(ingested["memory"]["layers"]["L0"]["population"], "present")
+        self.assertEqual(ingested["memory"]["layers"]["L1"]["population"], "present")
         found = core.search(None, "portable local memory", scope="memory")
         self.assertFalse(found["abstain"])
         self.assertEqual(found["verified"][0]["source"], "local-memory")
