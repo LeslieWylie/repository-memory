@@ -36,7 +36,7 @@ or registered its MCP. Before claiming that setup is complete:
    actual adapter, sources, index, freshness, MemoryCore layers, and semantic
    capability.
 3. If no repository source is configured and the operator supplied a Git root,
-   call `memory_init` with that path. Otherwise ask which repository is the
+   call the CLI `init --path <root>` with that path. Otherwise ask which repository is the
    intended knowledge source. Do not silently register an arbitrary current
    directory.
 4. If the selected source is stale or missing an index, call `memory_sync` and
@@ -62,7 +62,7 @@ explicitly requests a write.
 1. Run `doctor --json` before the first query or when the environment changes.
 2. If no source is configured, ask for or discover the user's intended knowledge directory, then run `init --path <directory> --json`. Repeat `source add --path <directory> --id <stable-id>` for additional repositories or document roots. This writes only user config and derived cache.
 3. Run `sync --json` when the doctor reports a missing/stale index or the source is not fresh.
-4. For a task that may benefit from prior agent work, call `memory_context(query)` first. It returns repository evidence plus shared decisions, failures, solutions, discoveries, and handoffs with separate provenance. Its current mode is `multi-source-lexical`: the lanes run in parallel but are not score-fused. Use `search "<question>" --scope repository --json` for a repository-only lookup, or `--scope memory` when the native conversation layers are explicitly needed.
+4. For a task that may benefit from prior agent work, use the CLI `memory_context(query)` when the richer team-memory context is explicitly needed. Through MCP, use `memory_search` with `scope=repository`, `scope=memory`, or `scope=all`; the MCP surface intentionally exposes only read/diagnostic tools and does not expose the write or team-context mutation APIs.
 5. Inspect `answerable`, `verified`, `candidates`, `support`, `freshness`, and `diagnostics`; use `get` or `explain` with the result's citation `commit`, `line_start`, and `line_end` when available. Never treat a verified-but-partial document as a complete answer.
 6. Use `answerable`/`results` as the answer surface. `verified` is a document-level retrieval lane used for diagnostics and evaluation; it only proves the citation is real. If `answerable` is empty or `abstain=true`, do not answer the full claim. `support.claim_support=partial|unknown` means the answer must abstain from the unsupported part and may only report a directly supported subclaim after `get`/`explain`.
 
@@ -95,11 +95,12 @@ pass only the query and, when needed, a known source id.
 
 `candidates` are leads, not facts. Generated, inferred, pending, stale, dirty, or citation-incomplete repository results require source verification. Team Memory uses its own lifecycle: `active` records are experience/decision context with provenance, while `candidate`, `stale`, and `superseded` records are not facts. `memory_context` keeps the sections separate and never makes a team recollection look like a Git citation.
 
-Normal use is read-only. Only run `memory_publish`, `memory_feedback`,
+Normal use is read-only. Only run the CLI `memory_publish`, `memory_feedback`,
 `memory_supersede`, `feedback`, `promote`, or `memory_ingest` when the user or
 an explicit task-end workflow asks for a write. New Team Memory defaults to
-`candidate`; promotion/replacement is explicit. Use the local stdio MCP
-entrypoint when the host exposes it; CLI and MCP return the same contract.
+`candidate`; promotion/replacement is explicit. The local stdio MCP entrypoint
+exposes only `memory_doctor`, `memory_sync`, `memory_search`, and `memory_get`;
+CLI and MCP return the same read/query contract.
 When agents run on different hosts, use the explicit `team-export` and
 `team-import` bundle commands (or `memory_team_sync`) to transfer Team Memory;
 review candidates explicitly with `team-activate`/`memory_team_activate`, and
@@ -110,8 +111,10 @@ metadata-only request/response events. Treat `audit_verified` evidence from the
 host trace as stronger than a model-written receipt.
 
 If the user explicitly asks to import a conversation or session, use the CLI
-`ingest-session` path or the explicit MCP `memory_ingest` tool. Treat its output
-as a write operation and check the reported memory-layer and pipeline status.
+`ingest-session` path. Treat its output as a write operation and check the
+reported memory-layer and pipeline status. `memory_ingest` remains an internal
+runtime dispatch for tests/host lifecycle code and is deliberately not exposed
+through the public MCP tool list.
 An installed lifecycle extension may separately capture a completed host turn;
 that capture is still a write and must be reported as L0 verified, L1
 pending/verified, and L2 candidate until a human accepts it. It never writes

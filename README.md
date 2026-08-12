@@ -18,9 +18,10 @@ It ships as one generic Skill with a shared Python runtime:
 - a metadata-only audit proxy and an advisory guard that validates evidence
   receipts without blocking normal coding, shell, Git, or debugging tools.
 
-The mainline is a shared Team Memory plane. Agents can explicitly publish and
-reuse compact decisions, failures, discoveries, solutions, and handoffs; the
-runtime keeps that experience provenance separate from Git citations.
+The mainline is citation-first repository retrieval. An optional user-level
+Team Memory plane can store compact decisions, failures, discoveries, solutions,
+and handoffs, but it remains separate from Git citations and is never required
+for repository search.
 
 The repository itself is the source of truth. Indexes, snapshots, audit logs,
 conversation data, and credentials stay in user-level data/config/cache
@@ -53,9 +54,10 @@ flowchart LR
 `scope=repository` searches Git-backed evidence only. `scope=memory` searches
 the configured conversation-memory plane. `scope=all` returns two separate
 groups; it never fuses scores or turns a conversation into a Git citation.
-For multi-agent work, `memory_context` is the preferred task-start call: it
-packages repository evidence and Team Memory sections together without making
-experience look like a Git citation.
+For multi-agent work, the CLI `memory_context` command can package repository
+evidence and Team Memory sections together without making experience look like
+a Git citation. The public MCP surface remains deliberately read-only and uses
+`memory_search` with an explicit `scope` when native memory is needed.
 
 ## Install
 
@@ -133,11 +135,10 @@ with the returned commit and line range before making a claim marked
 `partial` or `unknown`.
 
 The runtime does not require embeddings. When no semantic provider is
-configured, doctor and search say `retrieval_mode=lexical` and
+configured, doctor and search say `retrieval_mode=keyword-only` and
 `semantic_available=false`; this is a supported fallback, not a hidden
-semantic claim. `memory_context` reports `retrieval_mode=multi-source-lexical`:
-repository and Team Memory recall run in parallel, then remain in separate
-provenance sections. No black-box cross-backend RRF is used.
+semantic claim. `scope=all` returns repository and MemoryCore lanes in separate
+groups. No black-box cross-backend RRF is used.
 
 ## Shared Team Memory
 
@@ -204,34 +205,30 @@ the conservative local fallback with clearly reported layer support.
 
 ## MCP
 
-The server uses local stdio and supports the modern MCP discovery/metadata
+The server uses local stdio and advertises the modern MCP discovery/metadata
 path first, while retaining a small compatibility handshake for hosts that
-have not migrated yet. Current tool names are:
+have not migrated yet. The public tool list is intentionally limited to
+read/diagnostic operations:
 
 ```text
 memory_doctor
 memory_sync
 memory_search
 memory_get
-memory_init       # explicit source setup
-memory_ingest     # explicit write
-memory_context    # task context: repository + Team Memory
-memory_team_sync  # explicit Team Memory bundle status/export/import
-memory_publish    # explicit shared memory write
-memory_feedback   # reuse feedback
-memory_supersede  # explicit correction
 ```
 
-The MCP and CLI call the same runtime and return the same JSON contract. The
-server is not bound to a port.
+Use the CLI for `init`, `source add`, `ingest-session`, `feedback`, Team Memory
+publish/activate, and `memorycore promote-l3`. The MCP and CLI share the same
+runtime and return the same read/query contract; the server is not bound to a
+port.
 
 ## OpenClaw capture and guard
 
 The OpenClaw extension is optional. It can:
 
 1. observe whether project-fact turns use the repository-memory MCP route;
-2. audit the bare built-in memory tool and high-confidence direct-file fallback
-   without blocking normal tool use;
+2. audit the bare built-in memory tool and direct-file fallback without
+   blocking normal tool use;
 3. audit tool metadata without storing full prompts or answers;
 4. capture bounded user/assistant text after a completed turn into L0;
 5. leave L2 as a reviewable candidate and never write L3 automatically.
@@ -246,7 +243,7 @@ that direct-file access is technically blocked.
 This project contains generic runtime code, fixtures, and documentation only.
 It intentionally does not contain private repositories, organization-specific
 evaluation sets, credentials, model names, internal hostnames, or user data.
-Use `memory_init`/`source add` to attach the repositories that are appropriate
+Use `init`/`source add` to attach the repositories that are appropriate
 for your own environment.
 
 See [docs/quickstart.md](docs/quickstart.md),

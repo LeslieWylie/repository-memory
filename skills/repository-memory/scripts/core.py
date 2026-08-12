@@ -48,7 +48,11 @@ from fallback import search as fallback_search
 from local_index import ensure as ensure_local_index
 from local_index import status as local_index_status
 from mcp_server import serve
-from memorycore import native_memory_client
+from memorycore import (
+    _lifecycle_status as _native_lifecycle_status,
+    _with_lifecycle_markers as _with_native_lifecycle,
+    native_memory_client,
+)
 from snapshot import prepare_view
 from team_memory import team_memory_store
 
@@ -101,7 +105,16 @@ def _safe_document(root: Path, relative: str) -> tuple[Path, list[str]] | None:
 
 def _source_payload(view: SourceView) -> dict[str, Any]:
     memory_only = view.commit_type == "memorycore"
-    return {"id": view.spec.id, "repository": None if memory_only else view.spec.repository, "root": None if memory_only else str(view.spec.root), "path": None if memory_only else str(view.path), "branch": view.branch, "remote": view.remote_url, "commit": view.commit, "commit_type": view.commit_type, "freshness": view.freshness}
+    return {"id": view.spec.id, "repository": None if memory_only else view.spec.repository, "root": None if memory_only else str(view.spec.root), "path": None if memory_only else str(view.path), "branch": view.branch, "remote": view.remote_url, "commit": view.commit, "commit_type": view.commit_type, "freshness": _freshness(view)}
+
+
+def _freshness(view: SourceView) -> dict[str, Any]:
+    """Return source freshness without treating a live memory store as stale."""
+
+    value = view.freshness
+    if view.commit_type == "memorycore":
+        return {**value, "state": "memorycore"}
+    return value
 
 
 def _memory_view() -> SourceView:
@@ -266,7 +279,7 @@ def _empty(query: str, mode: str, source_views: list[SourceView], reason: str, *
         "results": [] if scope == "all" else groups[scope]["results"],
         "groups": groups if scope == "all" else None,
         "abstain": True,
-        "freshness": {view.spec.id: view.freshness for view in source_views},
+        "freshness": {view.spec.id: _freshness(view) for view in source_views},
         "diagnostics": {"scope": scope, "adapter": backend, "result_count": 0, "reason": reason},
     }
 
@@ -331,6 +344,31 @@ def normalize_item(item: dict[str, Any], view: SourceView, source_type: str, que
     citation_repository = citation.get("repository") or item.get("repository") or item.get("_repository") or metadata.get("repository") or (None if native else view.spec.repository)
     memory_layer = item.get("memory_layer") or item.get("layer") or item.get("level") or metadata.get("memory_layer") or metadata.get("layer") or metadata.get("level") or citation.get("layer")
     memory_type = item.get("memory_type") or item.get("type") or metadata.get("memory_type") or metadata.get("type") or citation.get("memory_type")
+    accepted = citation.get("accepted", item.get("accepted"))
+    generated = bool(citation.get("generated", item.get("generated", False)))
+    if native:
+        # Native records have a backend read-back state in addition to the
+        # evidence status used by the result splitter.  Keep both explicit so
+        # an accepted L2/L3 record cannot be confused with a merely readable
+        # generated record.
+        if accepted is True:
+            lifecycle_status = "accepted"
+        elif status in {"candidate", "pending", "inferred", "generated", "stale"}:
+            lifecycle_status = status
+        elif generated:
+            lifecycle_status = "generated"
+        else:
+            lifecycle_status = "verified"
+    else:
+        lifecycle_status = status
+    linked_evidence = item.get("linked_evidence") or citation.get("linked_evidence") or []
+    provenance = item.get("provenance") or citation.get("provenance") or linked_evidence or {
+        "source": memory_backend if native else view.spec.id,
+        "repository": citation_repository,
+        "commit": commit,
+        "path": path,
+        "locator": citation.get("locator") or ({"start_line": start, "end_line": end} if start else None),
+    }
     support = item.get("support") if isinstance(item.get("support"), dict) else None
     if support is None and query is not None:
         support = _claim_support(query_terms(query), str(excerpt or ""), start or 1, end or start or 1)
@@ -350,10 +388,21 @@ def normalize_item(item: dict[str, Any], view: SourceView, source_type: str, que
         "excerpt": excerpt,
         "support": support,
         "evidence_status": status,
-        "generated": bool(citation.get("generated", item.get("generated", False))),
-        "accepted": citation.get("accepted", item.get("accepted")),
+        "generated": generated,
+        "accepted": accepted,
+        "layer": memory_layer,
+        "status": lifecycle_status,
+        "provenance": provenance,
+        "readback": {
+            "verified": bool(checked.get("valid")) and not bool(checked.get("stale")),
+            "status": "verified" if checked.get("valid") and not checked.get("stale") else ("stale" if checked.get("stale") else "invalid"),
+            "source": memory_backend if native else view.spec.id,
+            "memory_id": memory_id,
+            "layer": memory_layer,
+            "receipt": "native-memorycore-readback" if native else "repository-citation-readback",
+        },
         "related": item.get("related") or item.get("links") or [],
-        "linked_evidence": item.get("linked_evidence") or citation.get("linked_evidence") or [],
+        "linked_evidence": linked_evidence,
         "memory": {
             "layer": memory_layer,
             "type": memory_type,
@@ -375,8 +424,9 @@ def normalize_item(item: dict[str, Any], view: SourceView, source_type: str, que
             "line_end": end,
             "evidence": citation.get("evidence") or excerpt,
             "locator": citation.get("locator") or ({"start_line": start, "end_line": end} if start else None),
-            "generated": bool(citation.get("generated", item.get("generated", False))),
-            "accepted": citation.get("accepted", item.get("accepted")),
+            "generated": generated,
+            "accepted": accepted,
+            "provenance": provenance,
             "layer": memory_layer,
             "memory_type": memory_type,
             "linked_evidence": item.get("linked_evidence") or citation.get("linked_evidence") or [],
@@ -538,7 +588,7 @@ def _package_search(query: str, mode: str, scope: str, views: list[SourceView], 
         "answerable": answerable,
         "groups": groups if scope == "all" else None,
         "abstain": abstain,
-        "freshness": {view.spec.id: view.freshness for view in views},
+        "freshness": {view.spec.id: _freshness(view) for view in views},
         "diagnostics": {
             "scope": scope,
             "adapters": diagnostics,
@@ -759,8 +809,9 @@ def capture_turn(root: Path | None, payload: Any, source_id: str | None = None) 
     """Capture one completed OpenClaw turn without exposing a write MCP tool.
 
     L0 is written and verified through the configured adapter.  L1 is observed
-    asynchronously.  A durable turn creates only an L2 ``candidate``.  L3 is
-    intentionally untouched and can only be changed by an explicit promotion.
+    asynchronously.  Native L2 is produced by the MemoryCore pipeline and is
+    only reported when a scenario is read back.  L3 is intentionally untouched
+    and can only be changed by an explicit promotion.
     """
 
     from autocapture import candidate_markdown, candidate_path, candidate_store_path, normalize_turn, should_create_candidate
@@ -782,6 +833,19 @@ def capture_turn(root: Path | None, payload: Any, source_id: str | None = None) 
     if _capture_seen(key):
         return {"schema_version": SCHEMA_VERSION, "ok": True, "duplicate": True, "idempotency_key": key, "canonical_repo_changed": False}
 
+    native_scenarios_before: dict[str, str] = {}
+    native_accepted_before: dict[str, str] = {}
+    if native.configured:
+        try:
+            native_scenarios_before = native.scenario_snapshot()
+            for scenario_path in native_scenarios_before:
+                record = native.read_scenario(scenario_path)
+                content = str(record.get("content") or "")
+                if _native_lifecycle_status(content, "generated") == "accepted":
+                    native_accepted_before[scenario_path] = content
+        except Exception:
+            native_scenarios_before = {}
+            native_accepted_before = {}
     session_payload = {"sessions": [{"sessionKey": turn["session_id"], "messages": turn["messages"]}]}
     l0_result = ingest_session_payload(root, session_payload, source_id)
     native_result = l0_result.get("result") if isinstance(l0_result.get("result"), dict) else {}
@@ -805,42 +869,62 @@ def capture_turn(root: Path | None, payload: Any, source_id: str | None = None) 
                 break
             time.sleep(0.25)
 
-    candidate: dict[str, Any] = {"created": False, "status": "skipped", "reason": "not durable"}
+    candidate: dict[str, Any] = {"created": False, "status": "skipped", "reason": "not durable", "backend": "native-pipeline"}
     if should_create_candidate(turn) and native.configured and l0["l0_verified"]:
-        path = candidate_path(turn)
-        content = candidate_markdown(turn, l0, l1)
-        try:
-            native.write_scenario(path, content, summary="OpenClaw completed-turn candidate")
-            observed = native.read_scenario(path)
-            observed_content = str(observed.get("content") or "")
+        # Do not call scenario/write here: the native endpoint is update-only
+        # and a fabricated local file is not an L2 memory.  L2 creation belongs
+        # to the MemoryCore scene extractor triggered by conversation/add.
+        observed = native.wait_for_scenario(native_scenarios_before, timeout=float(os.environ.get("REPOSITORY_MEMORY_L2_WAIT", "8")))
+        if observed:
+            path = str(observed.get("path") or "")
+            observed_content = str((observed.get("record") or {}).get("content") or "")
+            accepted_before = native_accepted_before.get(path)
+            if accepted_before and observed.get("status") != "accepted" and observed_content != accepted_before:
+                # The native pipeline is allowed to propose an update, but it
+                # must not silently revoke an explicitly accepted scenario.
+                # Preserve the accepted native record and put the new turn in
+                # the normal user-level pending candidate store instead.
+                native.write_scenario(path, accepted_before, summary="Preserved accepted repository-memory L2 scenario")
+                restored = native.read_scenario(path)
+                if _native_lifecycle_status(str(restored.get("content") or ""), "generated") != "accepted":
+                    raise RuntimeError("accepted native L2 scenario could not be restored after pipeline update")
+                relative_candidate = candidate_path(turn)
+                candidate_file = candidate_store_path(data_root(), relative_candidate, identity)
+                candidate_file.parent.mkdir(parents=True, exist_ok=True)
+                candidate_file.write_text(candidate_markdown(turn, l0, l1), encoding="utf-8")
+                candidate = {
+                    "created": True,
+                    "status": "pending",
+                    "verified": False,
+                    "backend": "local-candidate",
+                    "path": relative_candidate,
+                    "id": f"autocapture:L2:{relative_candidate}",
+                    "evidence_status": "pending",
+                    "native_path": path,
+                    "native_update_preserved": True,
+                    "reason": "native pipeline proposed an update to an accepted scenario; explicit re-review is required",
+                }
+            else:
+                candidate = {
+                    "created": True,
+                    "status": "candidate" if observed.get("status") != "accepted" else "accepted",
+                    "verified": bool(observed_content),
+                    "backend": "memorycore",
+                    "path": path,
+                    "id": f"memorycore:L2:{path}",
+                    "evidence_status": observed.get("status") or "generated",
+                }
+        else:
             candidate = {
-                "created": True,
-                "status": "candidate",
-                "verified": observed_content == content,
-                "path": path,
-                "id": f"memorycore:L2:{path}",
-                "evidence_status": "pending",
-            }
-        except Exception as exc:  # candidate failure must not hide a verified L0 write
-            # The native API only updates an existing scenario file; a fresh
-            # L2 candidate therefore lives in the user-level derived store
-            # until the native scene extractor or an explicit reviewer adopts
-            # it.  It remains a candidate and is never returned as verified.
-            local_path = candidate_store_path(data_root(), path, native.config.identity)
-            local_path.parent.mkdir(parents=True, exist_ok=True)
-            local_path.write_text(content, encoding="utf-8")
-            candidate = {
-                "created": True,
-                "status": "candidate",
-                "verified": True,
-                "backend": "local_pending",
-                "native_error": str(exc)[:240],
-                "path": path,
-                "id": f"autocapture:L2:{path}",
+                "created": False,
+                "status": "pending",
+                "backend": "native-pipeline",
+                "reason": "native scene extraction has not produced a read-back scenario within the observation window",
                 "evidence_status": "pending",
             }
     elif not native.configured:
-        candidate["reason"] = "MemoryCore not configured; no L2 candidate backend"
+        candidate["backend"] = "native-pipeline"
+        candidate["reason"] = "MemoryCore not configured; native L2 pipeline unavailable"
     elif not l0["l0_verified"]:
         candidate["reason"] = "L0 was not verified"
 
@@ -896,24 +980,31 @@ def capture_turn(root: Path | None, payload: Any, source_id: str | None = None) 
 
 
 def promote_l3(candidate_id: str) -> dict[str, Any]:
-    """Explicitly accept one L2 candidate into the native L3 profile."""
+    """Explicitly accept one native L2 scenario and write/read back L3."""
 
-    from autocapture import candidate_store_path
-
-    if not candidate_id or not candidate_id.startswith("autocapture:L2:"):
-        raise RuntimeError("promote-l3 only accepts an autocapture L2 candidate id")
+    if not candidate_id or not candidate_id.startswith("memorycore:L2:"):
+        raise RuntimeError("promote-l3 requires a native memorycore:L2 id; local pending candidates are not promotable")
     native = native_memory_client()
     if not native.configured:
         raise RuntimeError("MemoryCore is not configured")
+    path = candidate_id.split(":", 2)[-1]
     candidate = native.get(candidate_id)
     memory = candidate.get("memory") if isinstance(candidate.get("memory"), dict) else {}
     content = str(memory.get("content") or "").strip()
     if not content:
-        raise RuntimeError("candidate has no content")
-    accepted = (
-        content.replace("status: candidate", "status: accepted", 1)
-        .replace("layer: L2", "layer: L3", 1)
-        .replace("evidence_status: pending", "evidence_status: accepted", 1)
+        raise RuntimeError("native L2 scenario has no content")
+    accepted_l2 = _with_native_lifecycle(content, status="accepted", layer="L2", source_l2=path)
+    native.write_scenario(path, accepted_l2, summary="Explicitly accepted repository-memory L2 scenario")
+    l2_readback = native.read_scenario(path)
+    l2_content = str(l2_readback.get("content") or "")
+    if _native_lifecycle_status(l2_content) != "accepted":
+        raise RuntimeError("native L2 scenario write did not read back as accepted")
+
+    accepted = _with_native_lifecycle(
+        "# Repository Memory Profile\n\n" + l2_content,
+        status="accepted",
+        layer="L3",
+        source_l2=path,
     )
     current = native.read_core()
     previous = str(current.get("content") or "").strip()
@@ -921,24 +1012,18 @@ def promote_l3(candidate_id: str) -> dict[str, Any]:
     native.write_core(combined)
     verified = native.read_core()
     verified_content = str(verified.get("content") or "")
-
-    relative = candidate_id.split(":", 2)[-1]
-    local_path = candidate_store_path(data_root(), relative, native.config.identity)
-    # Keep accepted records outside ``candidates`` so the default pending
-    # search cannot surface an already-promoted L2 document a second time.
-    promoted_path = local_path.parent.parent.parent / "promoted" / local_path.name
-    if local_path.is_file():
-        promoted_path.parent.mkdir(parents=True, exist_ok=True)
-        local_path.replace(promoted_path)
+    if _native_lifecycle_status(verified_content) != "accepted" or path not in verified_content:
+        raise RuntimeError("native L3 core write did not read back as accepted")
     return {
         "schema_version": SCHEMA_VERSION,
-        "ok": accepted in verified_content,
+        "ok": True,
         "candidate": candidate_id,
+        "l2": {"id": candidate_id, "path": path, "status": "accepted", "readback": True},
         "layer": "L3",
         "id": "memorycore:L3:profile",
         "status": "accepted",
-        "verified": accepted in verified_content,
-        "candidate_archived": str(promoted_path) if promoted_path.is_file() else None,
+        "verified": True,
+        "readback": True,
         "canonical_repo_changed": False,
     }
 
@@ -966,7 +1051,60 @@ def _memory_get_result(result_id: str, explain: bool = False) -> dict[str, Any]:
             "reason": "memory result not found or MemoryCore unavailable",
         }
     backend = "local-memory" if result_id.startswith("autocapture:") else memory.get("backend") or ("memorycore" if adapter.native_memory.configured else "local-memory")
-    result = {"schema_version": SCHEMA_VERSION, "found": True, "id": result_id, "source": backend, "repository": None, "commit": None, "result": value, "freshness": memory}
+    raw_layer = value.get("layer") if isinstance(value, dict) else None
+    if not raw_layer:
+        match = re.match(r"^(?:memorycore|local|autocapture):(L[0-3]):", result_id)
+        raw_layer = match.group(1) if match else None
+    layer = str(raw_layer or "") or None
+    payload = value.get("memory") if isinstance(value, dict) and isinstance(value.get("memory"), dict) else (value if isinstance(value, dict) else {})
+    content = str(payload.get("content") or payload.get("text") or payload.get("excerpt") or "")
+    citation = value.get("citation") if isinstance(value, dict) and isinstance(value.get("citation"), dict) else {}
+    memory_id = str(citation.get("memory_id") or payload.get("id") or (result_id.split(":", 2)[-1] if ":" in result_id else result_id))
+    memory_path = citation.get("path") or payload.get("path")
+    if not memory_path and layer == "L2":
+        memory_path = f"scenario/{memory_id}"
+    if not memory_path and layer == "L3":
+        memory_path = "core/profile"
+    accepted = bool(citation.get("accepted") is True or payload.get("accepted") is True or _native_lifecycle_status(content, "") == "accepted")
+    generated = bool(citation.get("generated") is True or payload.get("generated") is True or _native_lifecycle_status(content, "") == "generated")
+    if layer in {"L2", "L3"}:
+        status = "accepted" if accepted else (_native_lifecycle_status(content, "generated" if generated else "pending"))
+    else:
+        status = "verified"
+    provenance = value.get("provenance") if isinstance(value, dict) else None
+    provenance = provenance or citation.get("provenance") or value.get("linked_evidence") if isinstance(value, dict) else None
+    provenance = provenance or {
+        "source": backend,
+        "repository": None,
+        "commit": None,
+        "path": memory_path,
+        "locator": citation.get("locator"),
+    }
+    readback = {
+        "verified": True,
+        "status": "verified",
+        "source": backend,
+        "memory_id": memory_id,
+        "layer": layer,
+        "receipt": "native-memorycore-readback" if backend == "memorycore" else "local-memory-readback",
+    }
+    result = {
+        "schema_version": SCHEMA_VERSION,
+        "found": True,
+        "id": result_id,
+        "source": backend,
+        "repository": None,
+        "commit": None,
+        "layer": layer,
+        "memory_id": memory_id,
+        "status": status,
+        "generated": generated,
+        "accepted": accepted,
+        "provenance": provenance,
+        "readback": readback,
+        "result": value,
+        "freshness": memory,
+    }
     if explain:
         result["doctor"] = doctor(None)
     return result
@@ -1050,8 +1188,25 @@ def get_result(
                         "citation": citation,
                         "evidence_status": "stale" if dirty_local else "secondary",
                         "freshness": view.freshness,
+                        "layer": "repository",
+                        "status": "stale" if dirty_local else "verified",
+                        "provenance": {
+                            "source": spec.id,
+                            "repository": spec.repository,
+                            "commit": view.commit,
+                            "path": relative,
+                            "locator": {"start_line": start, "end_line": end},
+                        },
+                        "readback": {
+                            "verified": not dirty_local,
+                            "status": "stale" if dirty_local else "verified",
+                            "source": spec.id,
+                            "memory_id": result_id,
+                            "layer": "repository",
+                            "receipt": "repository-citation-readback",
+                        },
                     }
-                    result = {"schema_version": SCHEMA_VERSION, "found": True, "id": result_id, "source": spec.id, "repository": spec.repository, "commit": view.commit, "result": value, "freshness": view.freshness}
+                    result = {"schema_version": SCHEMA_VERSION, "found": True, "id": result_id, "source": spec.id, "repository": spec.repository, "commit": view.commit, "layer": "repository", "memory_id": result_id, "status": "stale" if dirty_local else "verified", "provenance": value["provenance"], "readback": value["readback"], "result": value, "freshness": view.freshness}
                     if explain:
                         result["doctor"] = doctor(root, source_id=spec.id)
                     return result
@@ -1405,6 +1560,7 @@ def build_parser() -> argparse.ArgumentParser:
     memorycore.add_argument("--team-id")
     memorycore.add_argument("--agent-id")
     memorycore.add_argument("--user-id")
+    memorycore.add_argument("--pipeline-mode", choices=("native", "fast"))
     memorycore.add_argument("--candidate")
     memorycore.add_argument("--accept", action="store_true")
     memorycore.add_argument("--json", action="store_true")
@@ -1593,7 +1749,7 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
 
             service_args = [args.action]
             if args.action == "configure":
-                for name in ("memorycore_root", "endpoint", "llm_base_url", "state_dir", "team_id", "agent_id", "user_id"):
+                for name in ("memorycore_root", "endpoint", "llm_base_url", "state_dir", "team_id", "agent_id", "user_id", "pipeline_mode"):
                     value = getattr(args, name, None)
                     if value:
                         service_args.extend([f"--{name.replace('_', '-')}", str(value)])

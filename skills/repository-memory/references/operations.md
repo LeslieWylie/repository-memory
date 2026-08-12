@@ -16,9 +16,9 @@ Before running a query, establish which interface is actually available:
    configuration file or a model-written receipt.
 3. Call `memory_doctor` or `doctor --json` and retain its real adapter/source,
    index, freshness, MemoryCore, and semantic fields.
-4. Call `memory_init` only after the operator has supplied the repository root.
-   Do not register an arbitrary current directory merely to make doctor look
-   ready.
+4. Call the CLI `init --path <root>` only after the operator has supplied the
+   repository root. Do not register an arbitrary current directory merely to
+   make doctor look ready.
 5. Call `memory_sync` for a missing/stale index, then repeat doctor. Finish
    setup with one positive citation query and one fabricated negative query.
 
@@ -57,35 +57,27 @@ and latency, but not full queries, excerpts, or response bodies. Use host
 transcripts or this audit stream to verify actual MCP usage; a model-written
 receipt alone is not proof.
 
-The MCP entrypoint uses local stdio and exposes the read/query tools plus
-explicit setup and session-ingest tools with the same JSON contract:
+The MCP entrypoint uses local stdio and exposes only the read/diagnostic tools
+with the same JSON contract. Explicit setup, session ingest, review, feedback,
+and promotion remain CLI operations so an agent cannot mutate memory merely by
+having access to the query MCP:
 
 ```text
 memory_doctor
 memory_sync
 memory_search
 memory_get
-memory_init
-memory_ingest
-memory_context
-memory_team_sync
-memory_team_activate
-memory_publish
-memory_feedback
-memory_supersede
 ```
 
-`memory_init` registers a user-provided knowledge directory and builds a
-disposable local lexical index. It may be called repeatedly for different
-sources; source IDs are stable handles, not assumptions about a particular
-repository. It never edits canonical documents. `memory_ingest` is an explicit
-write and accepts a session object or JSONL value; it is not part of ordinary
-retrieval.
+Use the CLI `init`, `source add`, `ingest-session`, `feedback`, `promote`, and
+the team-memory commands for explicit writes. They may update user config,
+derived cache, or user-level memory state, but never canonical documents unless
+the operator separately commits an approved repository change.
 
-`team-export`/`team-import` and `memory_team_sync` move the user-level Team
-Memory plane as an explicit JSON bundle. They are idempotent merge operations,
-not repository snapshot sync and not a claim that a hosted cross-machine
-service exists.
+`team-export`/`team-import` move the user-level Team Memory plane as an explicit
+JSON bundle. They are idempotent merge operations, not repository snapshot sync
+and not a claim that a hosted cross-machine service exists. The corresponding
+Team Memory MCP write/sync tools are intentionally not in the public tool list.
 
 The native ingest response is intentionally conservative: it can verify the
 durable L0 conversation write while reporting L1 extraction as `pending` or

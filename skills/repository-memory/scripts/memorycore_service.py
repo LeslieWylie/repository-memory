@@ -13,6 +13,7 @@ import argparse
 import getpass
 import json
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -33,6 +34,8 @@ from memorycore import (
 # operational identifier, not part of the Skill/agent contract; deployments
 # may override it without changing the repository.
 LABEL = os.environ.get("REPOSITORY_MEMORY_LAUNCHD_LABEL", "com.repository-memorycore")
+LEGACY_LABELS = tuple(value for value in os.environ.get("REPOSITORY_MEMORY_LEGACY_LABELS", "com.mlamp.rlvr-memorycore").split(",") if value.strip())
+RUNTIME_PATCH = Path(__file__).resolve().parent / "vendor-patches" / "tencentdb-memorycore-local-timer-instance.patch"
 
 
 def _config() -> dict[str, Any]:
@@ -83,6 +86,76 @@ def _candidate_roots() -> list[Path]:
 
 def discover_root() -> Path | None:
     return _candidate_roots()[0] if _candidate_roots() else None
+
+
+def _pipeline_patch_state(root: Path) -> dict[str, Any]:
+    """Return whether the local MemoryCore timer-instance fix is applied.
+
+    Standalone MemoryCore stores L1 data under the configured instance, but an
+    older local timer callback dropped that instance when it created the L2
+    task.  The patch is kept in this Skill and applied to the discovered
+    checkout; MemoryCore itself is not copied into this repository.
+    """
+    checks = {
+        "timer_entry_instance": (root / "src" / "core" / "state" / "types.ts", "export interface TimerEntry {\n  /** The state-backend instance that owns this timer. */\n  instanceId: string;"),
+        "local_timer_instance": (root / "src" / "core" / "state" / "local-backend.ts", "onTimerExpired!({ instanceId, member, fireAtMs })"),
+        "gateway_timer_instance": (root / "src" / "gateway" / "server.ts", "let instanceId: string = entry.instanceId"),
+        "l3_policy": (root / "src" / "utils" / "pipeline-factory.ts", "REPOSITORY_MEMORY_DISABLE_AUTO_L3"),
+    }
+    present: dict[str, bool] = {}
+    for name, (path, marker) in checks.items():
+        try:
+            present[name] = marker in path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            present[name] = False
+    if all(present.values()):
+        status = "applied"
+    elif any(present.values()):
+        status = "partial"
+    else:
+        status = "missing"
+    return {"status": status, "checks": present, "patch": str(RUNTIME_PATCH)}
+
+
+def ensure_pipeline_patch(root: Path) -> dict[str, Any]:
+    """Apply the runtime-only MemoryCore patch idempotently and verifiably."""
+    state = _pipeline_patch_state(root)
+    if state["status"] == "applied":
+        return state
+    if state["status"] == "partial":
+        raise RuntimeError("MemoryCore timer-instance patch is partially applied; repair the checkout before starting")
+    if not RUNTIME_PATCH.is_file():
+        raise RuntimeError(f"repository-memory runtime patch is missing: {RUNTIME_PATCH}")
+
+    try:
+        worktree = Path(subprocess.check_output(
+            ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+            text=True,
+            stderr=subprocess.STDOUT,
+        ).strip()).resolve()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise RuntimeError(f"MemoryCore checkout is not a Git worktree; cannot apply runtime patch: {exc}") from exc
+    try:
+        relative_root = root.resolve().relative_to(worktree)
+    except ValueError as exc:
+        raise RuntimeError("MemoryCore checkout is outside its Git worktree") from exc
+
+    command = ["git", "-C", str(worktree), "apply"]
+    if str(relative_root) != ".":
+        command.extend(["--directory", str(relative_root)])
+    command.append(str(RUNTIME_PATCH))
+    check = subprocess.run([*command[:-1], "--check", command[-1]], capture_output=True, text=True, check=False)
+    if check.returncode != 0:
+        detail = (check.stderr or check.stdout).strip()
+        raise RuntimeError(f"cannot apply MemoryCore runtime patch: {detail[:400]}")
+    applied = subprocess.run(command, capture_output=True, text=True, check=False)
+    if applied.returncode != 0:
+        detail = (applied.stderr or applied.stdout).strip()
+        raise RuntimeError(f"MemoryCore runtime patch failed: {detail[:400]}")
+    state = _pipeline_patch_state(root)
+    if state["status"] != "applied":
+        raise RuntimeError("MemoryCore runtime patch command succeeded but verification failed")
+    return state
 
 
 def _openclaw_model_config(model_ref: str, agent_id: str | None = None) -> dict[str, str | None]:
@@ -146,7 +219,7 @@ def _gateway_api_key(cfg: dict[str, Any]) -> str | None:
     return os.environ.get("TDAI_GATEWAY_API_KEY") or os.environ.get("REPOSITORY_MEMORY_GATEWAY_API_KEY")
 
 
-def _runtime_gateway_config(root: Path, state_dir: Path) -> Path:
+def _runtime_gateway_config(root: Path, state_dir: Path, memory: dict[str, Any] | None = None) -> Path:
     """Create a user-owned gateway config with the optional Skill module on.
 
     The optional MemoryCore checkout remains untouched.  The shipped
@@ -164,6 +237,19 @@ def _runtime_gateway_config(root: Path, state_dir: Path) -> Path:
     base = source.read_text(encoding="utf-8")
     if "\nskill:\n" not in base:
         base = base.rstrip() + "\n\n# Generated by repository-memory; do not edit the vendor checkout.\nskill:\n  enabled: true\n  routing:\n    mode: bm25\n  extraction:\n    enabled: true\n    queue:\n      backend: local\n"
+    if isinstance(memory, dict) and memory.get("pipeline_mode") == "fast":
+        # Fast mode is explicitly opt-in for local verification. It changes
+        # only generated user config, never the vendor checkout.
+        overrides = {
+            "triggerEveryN": "1",
+            "everyNConversations": "1",
+            "l1IdleTimeoutSeconds": "1",
+            "l2DelayAfterL1Seconds": "0",
+            "l2MinIntervalSeconds": "0",
+            "l2MaxIntervalSeconds": "30",
+        }
+        for key, value in overrides.items():
+            base = re.sub(rf"^(\s+{re.escape(key)}:\s*).*$", rf"\g<1>{value}", base, flags=re.MULTILINE)
     target.write_text(base, encoding="utf-8")
     os.chmod(target, 0o600)
     return target
@@ -199,6 +285,8 @@ def configure(args: argparse.Namespace) -> dict[str, Any]:
         "agent_id": args.agent_id or memory.get("agent_id") or os.environ.get("OPENCLAW_AGENT_ID") or getpass.getuser(),
         "user_id": args.user_id or memory.get("user_id") or getpass.getuser(),
     })
+    if getattr(args, "pipeline_mode", None):
+        memory["pipeline_mode"] = args.pipeline_mode
     current["memorycore"] = memory
     path = _config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -259,16 +347,23 @@ def _launchctl(*args: str) -> tuple[bool, str]:
 
 
 def install() -> dict[str, Any]:
+    root = Path(str(_memory_config().get("root") or discover_root() or "")).expanduser().resolve()
+    patch = ensure_pipeline_patch(root)
     path = plist_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(_plist(), encoding="utf-8")
     uid = str(os.getuid())
     _launchctl("bootout", f"gui/{uid}/{LABEL}")
+    legacy_stopped: list[str] = []
+    for legacy_label in LEGACY_LABELS:
+        stopped, _ = _launchctl("bootout", f"gui/{uid}/{legacy_label}")
+        if stopped:
+            legacy_stopped.append(legacy_label)
     ok, output = _launchctl("bootstrap", f"gui/{uid}", str(path))
     if not ok:
         raise RuntimeError(f"launchd bootstrap failed: {output[:240]}")
     _launchctl("kickstart", "-k", f"gui/{uid}/{LABEL}")
-    return {"ok": True, "label": LABEL, "plist": str(path), "persistent": True}
+    return {"ok": True, "label": LABEL, "plist": str(path), "persistent": True, "legacy_stopped": legacy_stopped, "runtime_patch": patch}
 
 
 def stop() -> dict[str, Any]:
@@ -289,13 +384,18 @@ def run() -> int:
     if not (root / "src" / "gateway" / "server.ts").is_file():
         print("MemoryCore source is not configured", file=sys.stderr)
         return 2
+    try:
+        ensure_pipeline_patch(root)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     credentials = _credentials(cfg)
     if not credentials.get("base_url") or not credentials.get("api_key"):
         print("MemoryCore LLM gateway credentials are not available; configure Keychain or runtime env", file=sys.stderr)
         return 2
     node = os.environ.get("REPOSITORY_MEMORY_NODE") or shutil.which("node") or "/opt/homebrew/bin/node"
     env = os.environ.copy()
-    runtime_config = _runtime_gateway_config(root, Path(str(cfg.get("state_dir") or Path.home() / ".local" / "share" / "repository-memory" / "memorycore")))
+    runtime_config = _runtime_gateway_config(root, Path(str(cfg.get("state_dir") or Path.home() / ".local" / "share" / "repository-memory" / "memorycore")), cfg)
     env.update({
         "TDAI_GATEWAY_CONFIG": str(runtime_config),
         "TDAI_GATEWAY_HOST": str(cfg.get("host") or "127.0.0.1"),
@@ -305,6 +405,9 @@ def run() -> int:
         "TDAI_LLM_BASE_URL": str(credentials["base_url"]),
         "TDAI_LLM_MODEL": str(credentials["model"]),
         "TDAI_LLM_API_KEY": str(credentials["api_key"]),
+        # L2 may be generated by the native pipeline. L3 acceptance is an
+        # explicit repository-memory promote operation, never an auto-worker.
+        "REPOSITORY_MEMORY_DISABLE_AUTO_L3": "1",
     })
     gateway_api_key = _gateway_api_key(cfg)
     if gateway_api_key:
@@ -330,6 +433,7 @@ def build_parser() -> argparse.ArgumentParser:
     configure_parser.add_argument("--team-id")
     configure_parser.add_argument("--agent-id")
     configure_parser.add_argument("--user-id")
+    configure_parser.add_argument("--pipeline-mode", choices=("native", "fast"))
     sub.add_parser("install")
     sub.add_parser("start")
     sub.add_parser("stop")

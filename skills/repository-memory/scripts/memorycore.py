@@ -10,10 +10,12 @@ MemoryCore instance does not silently become a shared global memory bucket.
 from __future__ import annotations
 
 import getpass
+import hashlib
 import json
 import os
 import re
 import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -110,6 +112,84 @@ def _first_string(*values: Any) -> str | None:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return None
+
+
+def _lifecycle_status(content: str, default: str = "generated") -> str:
+    """Read lifecycle markers from native L2/L3 content.
+
+    MemoryCore's profile APIs return the document body as the stable read-back
+    surface.  Some backends also expose status fields, but the standalone
+    gateway does not consistently do so.  Prefer an explicit accepted marker
+    anywhere in the document, then fall back to the first known marker.
+    """
+
+    matches = re.findall(
+        r"(?im)^\s*(?:memory_status|status|evidence_status)\s*:\s*([a-z_-]+)\s*$",
+        content or "",
+    )
+    normalized = [value.strip().lower() for value in matches]
+    for value in normalized:
+        if value == "accepted":
+            return "accepted"
+    for value in normalized:
+        if value in {"candidate", "pending", "generated", "inferred", "stale"}:
+            return value
+    return default
+
+
+def _with_lifecycle_markers(content: str, *, status: str, layer: str, source_l2: str | None = None) -> str:
+    """Update or prepend explicit lifecycle markers without losing content."""
+
+    value = str(content or "").rstrip()
+    replacements = {
+        "status": status,
+        "evidence_status": status,
+        "layer": layer,
+    }
+    if source_l2:
+        replacements["source_l2"] = source_l2
+    for key, marker in replacements.items():
+        pattern = re.compile(rf"(?im)^(\s*{re.escape(key)}\s*:\s*)[^\n]*$")
+        value, count = pattern.subn(rf"\g<1>{marker}", value, count=1)
+        if count == 0:
+            value = f"{key}: {marker}\n" + value
+    return value + "\n"
+
+
+def _runtime_report() -> dict[str, Any]:
+    """Describe the process/config relationship without exposing credentials."""
+
+    config = _read_json(_config_path())
+    memory = config.get("memorycore") if isinstance(config.get("memorycore"), dict) else {}
+    configured_root = _first_string(memory.get("root"))
+    state_dir = _first_string(memory.get("state_dir"))
+    current_service = str(Path(__file__).with_name("memorycore_service.py").resolve())
+    process_lines: list[str] = []
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        process_lines = [line.strip() for line in result.stdout.splitlines() if "memorycore_service.py run" in line]
+    except (OSError, subprocess.SubprocessError):
+        process_lines = []
+    process_current = any(current_service in line for line in process_lines)
+    return {
+        "config_path": str(_config_path()),
+        "skill_runtime": str(Path(__file__).resolve().parents[1]),
+        "memorycore_root": configured_root,
+        "data_dir": state_dir,
+        "service_label": os.environ.get("REPOSITORY_MEMORY_LAUNCHD_LABEL", "com.repository-memorycore"),
+        "process": {
+            "found": bool(process_lines),
+            "current_runtime": process_current,
+            "count": len(process_lines),
+        },
+        "consistent": bool(configured_root and state_dir and process_current),
+    }
 
 
 @dataclass(frozen=True)
@@ -323,6 +403,7 @@ class MemoryCoreClient:
                 "model": model_name,
                 "base_url": _redacted_endpoint(_first_string(memory_config.get("llm_base_url"))),
             },
+            "runtime": _runtime_report(),
         }
         if not self.config.configured:
             result["layers"] = {
@@ -370,13 +451,34 @@ class MemoryCoreClient:
                             if sampled is not None:
                                 details["record_count_sampled"] = sampled
                             if entries is not None:
-                                accepted = sum(1 for item in entries if isinstance(item, dict) and item.get("accepted") is True)
-                                pending = max(0, len(entries) - accepted)
+                                accepted = 0
+                                pending = 0
+                                generated = 0
+                                for item in entries:
+                                    if not isinstance(item, dict):
+                                        continue
+                                    status = "accepted" if item.get("accepted") is True else "generated"
+                                    path = str(item.get("path") or "")
+                                    if path and not path.endswith("/"):
+                                        try:
+                                            scenario = self._data(self._request("POST", "/v3/scenario/read", self._scoped({"path": path})))
+                                            content = str(scenario.get("content") or "")
+                                            status = _lifecycle_status(content, status)
+                                        except MemoryCoreError:
+                                            status = "unknown"
+                                    if status == "accepted":
+                                        accepted += 1
+                                    elif status in {"candidate", "pending", "generated", "inferred", "stale"}:
+                                        pending += 1
+                                    else:
+                                        generated += 1
                                 details["accepted_count_sampled"] = accepted
                                 details["pending_count_sampled"] = pending
+                                details["generated_count_sampled"] = generated
                                 if count == len(entries):
                                     details["accepted_count"] = accepted
                                     details["pending_count"] = pending
+                                    details["generated_count"] = generated
                             layer_status[layer] = memory_layer_state(
                                 "supported", "ready", population,
                                 self._readback_state(probe_response, shape_known), **details,
@@ -385,9 +487,10 @@ class MemoryCoreClient:
                             content_known = "content" in probe_response
                             content = str(probe_response.get("content") or "").strip() if content_known else ""
                             metadata = probe_response.get("metadata") if isinstance(probe_response.get("metadata"), dict) else {}
-                            accepted = probe_response.get("accepted") is True or metadata.get("status") == "accepted" or metadata.get("accepted") is True
+                            content_status = _lifecycle_status(content, "") if content else ""
+                            accepted = probe_response.get("accepted") is True or metadata.get("status") == "accepted" or metadata.get("accepted") is True or content_status == "accepted"
                             population = "present" if content else "empty" if content_known else "unknown"
-                            details = {"endpoint": endpoint, "accepted": bool(accepted)}
+                            details = {"endpoint": endpoint, "accepted": bool(accepted), "status": content_status or "empty"}
                             if content_known:
                                 details["record_count"] = 1 if content else 0
                             layer_status[layer] = memory_layer_state(
@@ -508,7 +611,7 @@ class MemoryCoreClient:
         }
 
     def write_scenario(self, path: str, content: str, summary: str | None = None) -> dict[str, Any]:
-        """Write an L2 scenario candidate; acceptance is deliberately separate."""
+        """Update an existing native L2 scenario; creation belongs to pipeline."""
 
         return self._data(self._request("POST", "/v3/scenario/write", self._scoped({
             "path": path,
@@ -518,6 +621,53 @@ class MemoryCoreClient:
 
     def read_scenario(self, path: str) -> dict[str, Any]:
         return self._data(self._request("POST", "/v3/scenario/read", self._scoped({"path": path})))
+
+    def list_scenarios(self) -> list[dict[str, Any]]:
+        """List native L2 records, never local pending files."""
+
+        data = self._data(self._request("POST", "/v3/scenario/ls", self._scoped({})))
+        entries = data.get("entries") if isinstance(data.get("entries"), list) else data.get("items")
+        return [item for item in entries if isinstance(item, dict)] if isinstance(entries, list) else []
+
+    def scenario_snapshot(self) -> dict[str, str]:
+        """Return content hashes for native scenarios before a pipeline run."""
+
+        snapshot: dict[str, str] = {}
+        for entry in self.list_scenarios():
+            path = str(entry.get("path") or "")
+            if not path or path.endswith("/"):
+                continue
+            try:
+                content = str(self.read_scenario(path).get("content") or "")
+            except MemoryCoreError:
+                continue
+            snapshot[path] = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        return snapshot
+
+    def wait_for_scenario(self, before: dict[str, str], timeout: float = 8.0, poll: float = 0.5) -> dict[str, Any] | None:
+        """Observe a pipeline-created or pipeline-updated native L2 record."""
+
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            try:
+                entries = self.list_scenarios()
+            except MemoryCoreError:
+                entries = []
+            for entry in entries:
+                path = str(entry.get("path") or "")
+                if not path or path.endswith("/"):
+                    continue
+                try:
+                    record = self.read_scenario(path)
+                except MemoryCoreError:
+                    continue
+                content = str(record.get("content") or "")
+                digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                if before.get(path) != digest and content.strip():
+                    return {"path": path, "record": record, "status": _lifecycle_status(content, "generated")}
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(min(max(0.05, poll), max(0.05, deadline - time.monotonic())))
 
     def delete_scenario(self, path: str) -> dict[str, Any]:
         """Remove an explicitly targeted scenario, primarily for test cleanup."""
@@ -569,9 +719,10 @@ class MemoryCoreClient:
                     if score <= 0:
                         continue
                     metadata = file_data.get("metadata") if isinstance(file_data.get("metadata"), dict) else {}
-                    generated = bool(entry.get("generated") or file_data.get("generated") or metadata.get("generated"))
-                    accepted = bool(entry.get("accepted") is True or file_data.get("accepted") is True or metadata.get("accepted") is True)
-                    evidence_status = "generated" if generated else "primary" if accepted else "pending"
+                    lifecycle = _lifecycle_status(content, "generated")
+                    generated = bool(entry.get("generated") or file_data.get("generated") or metadata.get("generated") or lifecycle == "generated")
+                    accepted = bool(entry.get("accepted") is True or file_data.get("accepted") is True or metadata.get("accepted") is True or lifecycle == "accepted")
+                    evidence_status = "primary" if accepted else lifecycle
                     results.append({
                         "id": f"memorycore:L2:{path}", "kind": "scenario", "title": path,
                         "content": content, "excerpt": content[:800], "path": f"scenario/{path}",
@@ -588,9 +739,10 @@ class MemoryCoreClient:
             score = sum(content.casefold().count(term) for term in terms)
             if content and score > 0:
                 metadata = profile.get("metadata") if isinstance(profile.get("metadata"), dict) else {}
-                generated = bool(profile.get("generated") or metadata.get("generated"))
-                accepted = bool(profile.get("accepted") is True or metadata.get("accepted") is True)
-                evidence_status = "generated" if generated else "primary" if accepted else "pending"
+                lifecycle = _lifecycle_status(content, "pending")
+                generated = bool(profile.get("generated") or metadata.get("generated") or lifecycle == "generated")
+                accepted = bool(profile.get("accepted") is True or metadata.get("accepted") is True or lifecycle == "accepted")
+                evidence_status = "primary" if accepted else lifecycle
                 results.append({
                     "id": "memorycore:L3:profile", "kind": "profile", "title": "profile",
                     "content": content, "excerpt": content[:800], "path": "core/profile",

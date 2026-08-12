@@ -610,7 +610,6 @@ class RepositoryMemoryTest(unittest.TestCase):
             {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {"_meta": modern_meta}},
             {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"_meta": modern_meta, "name": "memory_search", "arguments": {"query": "Atlas evidence"}}},
             {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"_meta": modern_meta, "name": "not-a-memory-tool", "arguments": {"source": "alpha"}}},
-            {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"_meta": modern_meta, "name": "memory_context", "arguments": {"query": "Atlas evidence"}}},
         ]
         process = subprocess.run(command, input="\n".join(json.dumps(item) for item in requests) + "\n", text=True, capture_output=True, check=True)
         responses = [json.loads(line) for line in process.stdout.splitlines() if line.strip()]
@@ -618,16 +617,13 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(responses[0]["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "repository-memory")
         self.assertEqual(responses[0]["result"]["resultType"], "complete")
         self.assertEqual(responses[1]["result"]["resultType"], "complete")
-        self.assertEqual({tool["name"] for tool in responses[1]["result"]["tools"]}, {"memory_doctor", "memory_sync", "memory_search", "memory_get", "memory_init", "memory_ingest", "memory_context", "memory_team_sync", "memory_team_activate", "memory_publish", "memory_feedback", "memory_supersede"})
+        self.assertEqual({tool["name"] for tool in responses[1]["result"]["tools"]}, {"memory_doctor", "memory_sync", "memory_search", "memory_get"})
         payload = responses[2]["result"]["structuredContent"]
         self.assertEqual(responses[2]["result"]["resultType"], "complete")
         self.assertIn("verified", payload)
         self.assertIn("candidates", payload)
         self.assertFalse(payload["abstain"])
         self.assertEqual({item["source"] for item in payload["verified"]}, {"alpha"})
-        context_payload = responses[4]["result"]["structuredContent"]
-        self.assertIn("repository_evidence", context_payload["context"])
-        self.assertEqual(context_payload["semantic_available"], False)
         error_data = responses[3]["error"]["data"]
         self.assertEqual(error_data["adapter"], "repository-memory-runtime")
         self.assertEqual(error_data["source"], "alpha")
@@ -676,7 +672,8 @@ class RepositoryMemoryTest(unittest.TestCase):
             {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {"_meta": meta}},
             {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"_meta": meta, "name": "memory_search", "arguments": {"query": "Atlas evidence"}}},
         ]
-        process = subprocess.run(command, input="\n".join(json.dumps(item) for item in requests) + "\n", text=True, capture_output=True, check=True)
+        environment = {**os.environ, "REPOSITORY_MEMORY_AGENT_ID": "yaole"}
+        process = subprocess.run(command, input="\n".join(json.dumps(item) for item in requests) + "\n", text=True, capture_output=True, check=True, env=environment)
         responses = [json.loads(line) for line in process.stdout.splitlines() if line.strip()]
         self.assertEqual(len(responses), 3)
         self.assertIn("verified", responses[2]["result"]["structuredContent"])
@@ -688,9 +685,11 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertTrue(search_request["query_sha256"])
         self.assertEqual(search_request["protocol_version"], "2026-07-28")
         self.assertTrue(search_request["modern_protocol"])
+        self.assertEqual(search_request["agent"], "yaole")
         self.assertNotIn("Atlas evidence", audit_log.read_text(encoding="utf-8"))
         self.assertEqual(search_response["verified_count"], 1)
         self.assertEqual(search_response["protocol_version"], "2026-07-28")
+        self.assertEqual(search_response["agent"], "yaole")
 
     def test_audit_proxy_labels_legacy_host_after_negotiation(self):
         audit_log = Path(self.temp.name) / "legacy-audit.jsonl"
@@ -798,6 +797,10 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(normalized["memory"], {"layer": "L1", "type": "atomic", "query_source": "memorycore", "strategy": "keyword"})
         self.assertTrue(normalized["citation"]["valid"])
         self.assertEqual(normalized["repository"], "alpha")
+        self.assertEqual(normalized["layer"], "L1")
+        self.assertEqual(normalized["status"], "secondary")
+        self.assertEqual(normalized["readback"]["receipt"], "repository-citation-readback")
+        self.assertEqual(normalized["provenance"]["repository"], "alpha")
 
     def test_explicit_session_ingest_uses_legacy_adapter_and_reports_layers(self):
         legacy = Path(self.temp.name) / "legacy-adapter.py"
@@ -1058,6 +1061,9 @@ class RepositoryMemoryTest(unittest.TestCase):
             adapter.memory_search.assert_not_called()
             memory = core.search(self.alpha, "conversation evidence", local=True, scope="memory")
             self.assertEqual(memory["verified"][0]["memory"]["layer"], "L0")
+            self.assertEqual(memory["verified"][0]["layer"], "L0")
+            self.assertEqual(memory["verified"][0]["status"], "verified")
+            self.assertTrue(memory["verified"][0]["readback"]["verified"])
             adapter.memory_search.assert_called_once()
             combined = core.search(self.alpha, "conversation evidence", local=True, scope="all")
             self.assertIn("repository", combined["groups"])

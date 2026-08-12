@@ -32,14 +32,6 @@ MCP_TOOLS = [
     "memory_sync",
     "memory_search",
     "memory_get",
-    "memory_init",
-    "memory_ingest",
-    "memory_context",
-    "memory_team_sync",
-    "memory_team_activate",
-    "memory_publish",
-    "memory_feedback",
-    "memory_supersede",
 ]
 OPENCLAW_TOOLS = [f"{MCP_NAME}__{name}" for name in MCP_TOOLS]
 
@@ -298,10 +290,13 @@ def _install_openclaw(
     mcp = config.get("mcp") if isinstance(config.get("mcp"), dict) else {}
     servers = mcp.get("servers") if isinstance(mcp.get("servers"), dict) else {}
     command, command_args = _mcp_command(canonical)
+    mcp_env = {"REPOSITORY_MEMORY_AUTODISCOVER": "0"}
+    if len(selected_ids) == 1:
+        mcp_env["REPOSITORY_MEMORY_AGENT_ID"] = next(iter(selected_ids))
     servers[MCP_NAME] = {
         "command": command,
         "args": command_args,
-        "env": {"REPOSITORY_MEMORY_AUTODISCOVER": "0"},
+        "env": mcp_env,
         "toolFilter": {"include": MCP_TOOLS},
     }
     mcp["servers"] = servers

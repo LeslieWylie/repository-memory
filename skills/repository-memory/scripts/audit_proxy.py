@@ -85,6 +85,11 @@ class Audit:
         except OSError:
             pass
         self.proxy_id = uuid.uuid4().hex
+        # OpenClaw starts one configured MCP process per profile in the
+        # supported installation path.  Preserve that profile identity in
+        # metadata-only receipts; when a server is shared by multiple
+        # profiles, leave it unset rather than guessing.
+        self.agent_id = os.environ.get("REPOSITORY_MEMORY_AGENT_ID") or os.environ.get("OPENCLAW_AGENT_ID") or None
         self.pending: dict[str, dict[str, Any]] = {}
         self.request_protocols: dict[str, str | None] = {}
         self.negotiated_protocol: str | None = None
@@ -138,6 +143,7 @@ class Audit:
             "id": request_id,
             "method": request.get("method"),
             "tool": tool,
+            "agent": self.agent_id,
             "scope": arguments.get("scope"),
             "source": arguments.get("source"),
             "protocol_version": protocol_version,
@@ -191,6 +197,7 @@ class Audit:
             "direction": "response",
             "id": request_id,
             "tool": pending.get("tool"),
+            "agent": self.agent_id,
             "protocol_version": protocol_version,
             "modern_protocol": protocol_version == "2026-07-28",
             "error": bool(response.get("error")),

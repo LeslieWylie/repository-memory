@@ -75,6 +75,12 @@ explicit acceptance flag. The runtime then:
 If any step fails, leave the candidate pending and report the failure. Do not
 edit the canonical Git repository from this path.
 
+If a later native pipeline run proposes to rewrite an already accepted L2
+scenario, the runtime preserves the accepted native scenario and stores the new
+turn as a separate pending candidate. An accepted L2 is never silently
+downgraded to pending, and the new proposal still requires explicit review
+before it can affect L2 or L3 state.
+
 ## Host integration checklist
 
 After installing a lifecycle adapter, verify all of these with a synthetic
