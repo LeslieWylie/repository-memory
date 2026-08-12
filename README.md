@@ -199,18 +199,21 @@ or content; unsupported, unreachable, malformed, or unprobed states remain
 `unknown` rather than being inferred from global health.
 
 The repository bundles a clean source snapshot of upstream MemoryCore and
-MemoryKnowledge components under the Skill's `vendor/` directory. The snapshot
-is not a second retrieval backend: the active adapter owns the public JSON
-contract and citations, while the vendor manifest pins the modules used for L0
-capture, L1 extraction, L2 navigation, L3 profile recall, and Wiki/code-graph
-adapter design. Building a standalone TypeScript MemoryCore still requires its
-upstream Node dependencies.
+MemoryKnowledge components under the Skill's `vendor/` directory. The Python
+adapter still owns the public JSON contract and citations, but the installed
+MemoryCore service can run directly from that clean snapshot: it installs the
+runtime dependencies into the user data directory, applies the small
+repository-memory isolation/L3 policy patch there, and never mutates the Git
+vendor snapshot or an unrelated dirty checkout. The manifest pins the modules
+used for L0 capture, L1 extraction, L2 navigation, L3 profile recall, and
+Wiki/code-graph adapter design.
 
 The live MemoryCore endpoint, model, provider, and credentials are discovered
 from user configuration or environment at runtime. Credentials are never
 committed to Git. If the service is unavailable, repository search still works
 and explicit session ingest uses the conservative local fallback with clearly
-reported layer support.
+reported layer support. `doctor --json` reports the actual runtime root and
+process so a vendored service cannot be confused with an external checkout.
 
 ## MCP
 

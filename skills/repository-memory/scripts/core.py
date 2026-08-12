@@ -981,7 +981,12 @@ def capture_turn(root: Path | None, payload: Any, source_id: str | None = None) 
 
 
 def promote_l3(candidate_id: str) -> dict[str, Any]:
-    """Explicitly accept one native L2 scenario and write/read back L3."""
+    """Explicitly accept one native L2 scenario and write/read back L3.
+
+    The operation is intentionally idempotent.  Re-running promotion for an
+    already accepted scenario must not append another copy of the same L2
+    block to the L3 profile.
+    """
 
     if not candidate_id or not candidate_id.startswith("memorycore:L2:"):
         raise RuntimeError("promote-l3 requires a native memorycore:L2 id; local pending candidates are not promotable")
@@ -1009,8 +1014,10 @@ def promote_l3(candidate_id: str) -> dict[str, Any]:
     )
     current = native.read_core()
     previous = str(current.get("content") or "").strip()
-    combined = accepted if not previous else previous + "\n\n" + accepted
-    native.write_core(combined)
+    marker = f"source_l2: {path}"
+    if marker not in previous:
+        combined = accepted if not previous else previous + "\n\n" + accepted
+        native.write_core(combined)
     verified = native.read_core()
     verified_content = str(verified.get("content") or "")
     if _native_lifecycle_status(verified_content) != "accepted" or path not in verified_content:

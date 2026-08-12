@@ -24,10 +24,12 @@ databases, `node_modules`, and credentials were not copied.
 | OpenClaw capture hook | `agent_end` invokes the shared CLI with `capture-turn` |
 | MemoryKnowledge Wiki/code modules | pinned adapter reference; repository-memory keeps citation-first local indexing and does not black-box fuse scores |
 
-The TypeScript snapshot is available for hosts that need to build the native
-service, but the Skill does not import it at runtime. This avoids introducing a
-second Node dependency graph into the Python MCP process and keeps CLI, MCP,
-OpenClaw recall, and citation validation on one code path.
+The TypeScript snapshot is also the default source for the local native service
+after installation. It is kept separate from the Python CLI/MCP process: the
+Python runtime remains the public boundary, while the launchd-managed service
+runs the copied MemoryCore source with user-level dependencies and state. A
+user-configured compatible checkout can still override the bundled source, but
+doctor must report that override explicitly.
 
 ## Runtime checks
 

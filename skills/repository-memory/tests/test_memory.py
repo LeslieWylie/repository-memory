@@ -109,7 +109,7 @@ class RepositoryMemoryTest(unittest.TestCase):
     def test_runtime_version_comes_from_skill_version_file(self):
         self.assertEqual(SERVER_VERSION, VERSION)
         self.assertEqual(VERSION, (SCRIPTS.parent / "VERSION").read_text(encoding="utf-8").strip())
-        self.assertEqual(VERSION, "0.3.0")
+        self.assertEqual(VERSION, "0.3.1")
 
     def test_multisource_search_has_verified_and_candidates(self):
         result = core.search(None, "Atlas evidence", limit=5)
@@ -1325,6 +1325,42 @@ class RepositoryMemoryTest(unittest.TestCase):
         context = core.memory_context(None, "独立 worktree canonical clone")
         self.assertEqual(context["context"]["team_memory"], [])
         self.assertTrue(context["context"]["team_candidates"])
+
+    def test_native_l2_to_l3_promotion_is_idempotent(self):
+        class FakeNative:
+            configured = True
+
+            def __init__(self):
+                self.l2 = "status: generated\nlayer: L2\n\nA durable scenario"
+                self.l3 = "status: accepted\nlayer: L3\n\nExisting profile"
+
+            def get(self, _candidate_id):
+                return {"memory": {"content": self.l2}}
+
+            def write_scenario(self, _path, content, summary=None):
+                self.l2 = content
+                return {"content": content, "summary": summary}
+
+            def read_scenario(self, _path):
+                return {"content": self.l2}
+
+            def read_core(self):
+                return {"content": self.l3}
+
+            def write_core(self, content):
+                self.l3 = content
+                return {"content": content}
+
+        native = FakeNative()
+        with patch("core.native_memory_client", return_value=native):
+            first = core.promote_l3("memorycore:L2:scenario.md")
+            first_length = len(native.l3)
+            second = core.promote_l3("memorycore:L2:scenario.md")
+
+        self.assertTrue(first["verified"])
+        self.assertTrue(second["verified"])
+        self.assertEqual(native.l3.count("source_l2: scenario.md"), 1)
+        self.assertEqual(len(native.l3), first_length)
 
     def test_memory_ingest_does_not_require_repository_source(self):
         client = Mock()

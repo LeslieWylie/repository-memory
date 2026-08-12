@@ -53,6 +53,11 @@ def _candidate_roots() -> list[Path]:
     explicit = os.environ.get("REPOSITORY_MEMORY_MEMORYCORE_ROOT") or config.get("root")
     if explicit:
         candidates.append(Path(str(explicit)).expanduser())
+    # Prefer the clean TencentDB source snapshot shipped with this Skill when
+    # no user root has been selected.  It is installed under the user data
+    # directory and never points the service at the repository worktree.
+    bundled = Path(__file__).resolve().parents[1] / "vendor" / "tencentdb-agent-memory-reference" / "MemoryCore"
+    candidates.append(bundled)
     current = Path.cwd().resolve()
     candidates.extend([current, *current.parents])
     search_paths = os.environ.get("REPOSITORY_MEMORY_MEMORYCORE_SEARCH_PATHS")
@@ -118,7 +123,15 @@ def _pipeline_patch_state(root: Path) -> dict[str, Any]:
 
 
 def ensure_pipeline_patch(root: Path) -> dict[str, Any]:
-    """Apply the runtime-only MemoryCore patch idempotently and verifiably."""
+    """Apply the runtime-only MemoryCore patch idempotently and verifiably.
+
+    A discovered upstream checkout may be a Git worktree, while the bundled
+    TencentDB snapshot is deliberately installed as a plain user-level
+    directory.  Both are supported: Git worktrees use ``git apply`` and
+    immutable vendor snapshots use the standard ``patch`` utility.  The patch
+    is applied only to the user-level runtime copy, never to the canonical
+    repository vendor files or to an unrelated dirty checkout.
+    """
     state = _pipeline_patch_state(root)
     if state["status"] == "applied":
         return state
@@ -133,29 +146,80 @@ def ensure_pipeline_patch(root: Path) -> dict[str, Any]:
             text=True,
             stderr=subprocess.STDOUT,
         ).strip()).resolve()
-    except (OSError, subprocess.CalledProcessError) as exc:
-        raise RuntimeError(f"MemoryCore checkout is not a Git worktree; cannot apply runtime patch: {exc}") from exc
-    try:
-        relative_root = root.resolve().relative_to(worktree)
-    except ValueError as exc:
-        raise RuntimeError("MemoryCore checkout is outside its Git worktree") from exc
+    except (OSError, subprocess.CalledProcessError):
+        patch = shutil.which("patch")
+        if not patch:
+            raise RuntimeError("MemoryCore vendor snapshot is not a Git worktree and patch is unavailable")
+        check = subprocess.run(
+            [patch, "--dry-run", "-p1", "-i", str(RUNTIME_PATCH)],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if check.returncode != 0:
+            detail = (check.stderr or check.stdout).strip()
+            raise RuntimeError(f"cannot apply MemoryCore vendor runtime patch: {detail[:400]}")
+        applied = subprocess.run(
+            [patch, "-p1", "-i", str(RUNTIME_PATCH)],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if applied.returncode != 0:
+            detail = (applied.stderr or applied.stdout).strip()
+            raise RuntimeError(f"MemoryCore vendor runtime patch failed: {detail[:400]}")
+    else:
+        try:
+            relative_root = root.resolve().relative_to(worktree)
+        except ValueError as exc:
+            raise RuntimeError("MemoryCore checkout is outside its Git worktree") from exc
 
-    command = ["git", "-C", str(worktree), "apply"]
-    if str(relative_root) != ".":
-        command.extend(["--directory", str(relative_root)])
-    command.append(str(RUNTIME_PATCH))
-    check = subprocess.run([*command[:-1], "--check", command[-1]], capture_output=True, text=True, check=False)
-    if check.returncode != 0:
-        detail = (check.stderr or check.stdout).strip()
-        raise RuntimeError(f"cannot apply MemoryCore runtime patch: {detail[:400]}")
-    applied = subprocess.run(command, capture_output=True, text=True, check=False)
-    if applied.returncode != 0:
-        detail = (applied.stderr or applied.stdout).strip()
-        raise RuntimeError(f"MemoryCore runtime patch failed: {detail[:400]}")
+        command = ["git", "-C", str(worktree), "apply"]
+        if str(relative_root) != ".":
+            command.extend(["--directory", str(relative_root)])
+        command.append(str(RUNTIME_PATCH))
+        check = subprocess.run([*command[:-1], "--check", command[-1]], capture_output=True, text=True, check=False)
+        if check.returncode != 0:
+            detail = (check.stderr or check.stdout).strip()
+            raise RuntimeError(f"cannot apply MemoryCore runtime patch: {detail[:400]}")
+        applied = subprocess.run(command, capture_output=True, text=True, check=False)
+        if applied.returncode != 0:
+            detail = (applied.stderr or applied.stdout).strip()
+            raise RuntimeError(f"MemoryCore runtime patch failed: {detail[:400]}")
     state = _pipeline_patch_state(root)
     if state["status"] != "applied":
         raise RuntimeError("MemoryCore runtime patch command succeeded but verification failed")
     return state
+
+
+def ensure_runtime_dependencies(root: Path) -> dict[str, Any]:
+    """Ensure a bundled or user-provided TypeScript runtime can start."""
+
+    tsx = root / "node_modules" / ".bin" / "tsx"
+    if tsx.is_file() or (root / "node_modules" / "tsx").is_dir():
+        return {"status": "present", "root": str(root)}
+    npm = shutil.which("npm")
+    if not npm:
+        raise RuntimeError("MemoryCore dependencies are missing and npm is unavailable")
+    try:
+        result = subprocess.run(
+            [npm, "install", "--ignore-scripts", "--no-audit", "--no-fund"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("MemoryCore dependency installation timed out after 180s") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"MemoryCore dependency installation failed: {detail[:400]}")
+    if not tsx.is_file() and not (root / "node_modules" / "tsx").is_dir():
+        raise RuntimeError("MemoryCore dependency installation completed without tsx")
+    return {"status": "installed", "root": str(root)}
 
 
 def _openclaw_model_config(model_ref: str, agent_id: str | None = None) -> dict[str, str | None]:
@@ -220,13 +284,10 @@ def _gateway_api_key(cfg: dict[str, Any]) -> str | None:
 
 
 def _runtime_gateway_config(root: Path, state_dir: Path, memory: dict[str, Any] | None = None) -> Path:
-    """Create a user-owned gateway config with the optional Skill module on.
+    """Create a user-owned gateway config with the Skill module enabled.
 
-    The optional MemoryCore checkout remains untouched.  The shipped
-    standalone YAML intentionally leaves the Skill module commented out, while
-    the local integration needs service-side lifecycle wiring for probes and
-    future direct extraction.  The generated file is derived state under the
-    user data directory and contains no credentials.
+    The source snapshot remains untouched.  The generated file is derived
+    state under the user data directory and contains no credentials.
     """
 
     source = root / "tdai-gateway.standalone.yaml"
@@ -348,6 +409,7 @@ def _launchctl(*args: str) -> tuple[bool, str]:
 
 def install() -> dict[str, Any]:
     root = Path(str(_memory_config().get("root") or discover_root() or "")).expanduser().resolve()
+    dependencies = ensure_runtime_dependencies(root)
     patch = ensure_pipeline_patch(root)
     path = plist_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -363,7 +425,7 @@ def install() -> dict[str, Any]:
     if not ok:
         raise RuntimeError(f"launchd bootstrap failed: {output[:240]}")
     _launchctl("kickstart", "-k", f"gui/{uid}/{LABEL}")
-    return {"ok": True, "label": LABEL, "plist": str(path), "persistent": True, "legacy_stopped": legacy_stopped, "runtime_patch": patch}
+    return {"ok": True, "label": LABEL, "plist": str(path), "persistent": True, "legacy_stopped": legacy_stopped, "runtime_dependencies": dependencies, "runtime_patch": patch}
 
 
 def stop() -> dict[str, Any]:
