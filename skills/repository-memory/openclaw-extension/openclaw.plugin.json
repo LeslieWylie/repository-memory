@@ -2,7 +2,7 @@
   "id": "repository-memory-autocapture",
   "name": "Repository Memory Auto Capture",
   "description": "Audit repository-memory evidence and capture reusable shared team memory without blocking ordinary agent work.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "activation": {
     "onStartup": true
   },
@@ -19,7 +19,10 @@
       "agentIds": { "type": "array", "items": { "type": "string" }, "description": "Only install/capture for these OpenClaw agent ids. The installer requires an explicit selection." },
       "maxMessages": { "type": "integer", "minimum": 4, "maximum": 64, "default": 24 },
       "maxMessageChars": { "type": "integer", "minimum": 1000, "maximum": 50000, "default": 12000 },
-      "timeoutMs": { "type": "integer", "minimum": 1000, "maximum": 60000, "default": 15000 }
+      "timeoutMs": { "type": "integer", "minimum": 1000, "maximum": 60000, "default": 15000 },
+      "recallEnabled": { "type": "boolean", "default": true, "description": "Use the shared runtime for conversation-memory recall in before_prompt_build." },
+      "recallMaxResults": { "type": "integer", "minimum": 1, "maximum": 10, "default": 5 },
+      "recallMaxChars": { "type": "integer", "minimum": 1000, "maximum": 20000, "default": 12000 }
     }
   }
 }

@@ -57,6 +57,12 @@ candidate, but this is an installation capability rather than a promise made
 by the Skill alone. Plain MCP/CLI use remains read-only unless the user
 explicitly requests a write.
 
+When the lifecycle extension is enabled, it may also perform automatic
+conversation-memory recall before the model turn. Treat the injected block as
+labelled L0/L1/L2/L3 context, not as repository evidence; use the normal
+repository MCP path for source-backed project facts. The extension uses the
+same runtime as the CLI and MCP and must not introduce a second ranking path.
+
 ## Operating procedure
 
 1. Run `doctor --json` before the first query or when the environment changes.

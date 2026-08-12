@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import plugin from "../openclaw-extension/index.mjs";
@@ -183,4 +183,21 @@ assert.match(audit, /"citations":1/);
 assert.match(audit, /recovery_allowed/);
 const auditMode = await readFile(join(auditDir, "audit-mode.jsonl"), "utf8");
 assert.match(auditMode, /tool_audited/);
+
+// The TencentDB-compatible lifecycle path must use the shared runtime and
+// inject only answerable memory records, never candidates.
+const recallRuntime = join(auditDir, "fake-repository-memory");
+await writeFile(recallRuntime, "#!/bin/sh\nprintf '%s' '{\"groups\":{\"memory\":{\"verified\":[{\"id\":\"memorycore:L3:profile\",\"status\":\"accepted\"}],\"answerable\":[{\"id\":\"memorycore:L3:profile\",\"memory_layer\":\"L3\",\"status\":\"accepted\",\"content\":\"accepted profile context\",\"citation\":{\"valid\":true}}],\"candidates\":[{\"status\":\"candidate\",\"content\":\"do not inject\"}]}}}'\n", { encoding: "utf8" });
+await chmod(recallRuntime, 0o700);
+const recallHooks = new Map();
+const recallApi = {
+  pluginConfig: { enabled: true, agentIds: ["yaole"], runtime: recallRuntime, auditPath: join(auditDir, "recall.jsonl") },
+  logger: { info() {}, warn() {} },
+  on(name, handler) { recallHooks.set(name, handler); },
+};
+plugin.register(recallApi);
+const recall = await recallHooks.get("before_prompt_build")({ prompt: "记住这个上下文" }, { agentId: "yaole", sessionKey: "recall-1" });
+assert.match(recall.prependContext, /accepted profile context/);
+assert.doesNotMatch(recall.prependContext, /do not inject/);
+
 console.log("openclaw guard ok");

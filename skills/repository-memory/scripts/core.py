@@ -55,6 +55,7 @@ from memorycore import (
 )
 from snapshot import prepare_view
 from team_memory import team_memory_store
+from vendor_components import report as vendor_components_report
 
 from models import SourceSpec, SourceView
 
@@ -1262,6 +1263,7 @@ def doctor(root: Path | None = None, source_id: str | None = None) -> dict[str, 
             "agents": routing.get("agents", {"configured": [], "covered": []}),
             "sources": [],
             "config": config_summary(),
+            "upstream_components": vendor_components_report(),
             "actions": ["init --path <directory>", "source add --path <directory>", "search --scope memory", "ingest-session (explicit write)"] if memory_configured else ["init --path <directory>", "source add --path <directory>", "memorycore configure"],
             "status": "ready" if memory_ready else "not_configured",
             "error": message,
@@ -1337,7 +1339,7 @@ def doctor(root: Path | None = None, source_id: str | None = None) -> dict[str, 
     healthy = all(report.get("healthy", True) for report in reports)
     routing = _openclaw_routing()
     active_values = unique_values(active)
-    return {"schema_version": SCHEMA_VERSION, "ok": healthy, "status": "ready" if healthy else "degraded", "active_adapter": active_values[0] if len(active_values) == 1 else active_values, "capabilities": capabilities, "memory": memory[0] if len(memory) == 1 else memory, "team_memory": team_memory_store().health(), "repository": {"status": "ready" if reports else "not_configured", "source_count": len(reports)}, "knowledge_service": {"configured": False, "required": False, "status": "optional"}, "semantic": semantic[0] if len(semantic) == 1 else ({"available": False, "strategy": "keyword-only"} if native_ready else semantic), "routing": routing, "agents": routing.get("agents", {"configured": [], "covered": []}), "sources": reports, "config": config_summary(), "actions": actions}
+    return {"schema_version": SCHEMA_VERSION, "ok": healthy, "status": "ready" if healthy else "degraded", "active_adapter": active_values[0] if len(active_values) == 1 else active_values, "capabilities": capabilities, "memory": memory[0] if len(memory) == 1 else memory, "team_memory": team_memory_store().health(), "repository": {"status": "ready" if reports else "not_configured", "source_count": len(reports)}, "knowledge_service": {"configured": False, "required": False, "status": "optional"}, "semantic": semantic[0] if len(semantic) == 1 else ({"available": False, "strategy": "keyword-only"} if native_ready else semantic), "routing": routing, "agents": routing.get("agents", {"configured": [], "covered": []}), "sources": reports, "config": config_summary(), "upstream_components": vendor_components_report(), "actions": actions}
 
 
 def feedback(root: Path | None, result_id: str, note: str, rating: str | None = None, feedback_id: str | None = None) -> dict[str, Any]:

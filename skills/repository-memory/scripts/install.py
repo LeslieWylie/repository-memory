@@ -27,6 +27,16 @@ MCP_NAME = "repository-memory"
 OPENCLAW_PLUGIN_ID = "repository-memory-autocapture"
 LEGACY_SKILL_NAMES = {"rlvr-memory"}
 LEGACY_OPENCLAW_PLUGIN_IDS = {"rlvr-memory-autocapture"}
+LEGACY_OPENCLAW_TOOL_NAMES = {
+    "repository-memory__memory_init",
+    "repository-memory__memory_ingest",
+    "repository-memory__memory_context",
+    "repository-memory__memory_team_sync",
+    "repository-memory__memory_team_activate",
+    "repository-memory__memory_publish",
+    "repository-memory__memory_feedback",
+    "repository-memory__memory_supersede",
+}
 MCP_TOOLS = [
     "memory_doctor",
     "memory_sync",
@@ -282,6 +292,11 @@ def _install_openclaw(
             row["skills"] = skills
         tools = row.get("tools") if isinstance(row.get("tools"), dict) else {}
         allowed = tools.get("alsoAllow") if isinstance(tools.get("alsoAllow"), list) else []
+        # Remove stale write/context names from the old contract for the
+        # selected agent. The CLI still owns explicit writes; exposing these
+        # names beside the four read/diagnostic MCP tools makes model routing
+        # ambiguous and was the source of several false receipts.
+        allowed = [name for name in allowed if name not in LEGACY_OPENCLAW_TOOL_NAMES]
         tools["alsoAllow"] = [*allowed, *(name for name in OPENCLAW_TOOLS if name not in allowed)]
         row["tools"] = tools
         installed.append({"agent": agent_id, "skill": str(destination)})
@@ -329,6 +344,9 @@ def _install_openclaw(
             "enforcement": "audit",
             "runtime": str(runtime),
             "agentIds": sorted(selected_ids),
+            "recallEnabled": True,
+            "recallMaxResults": 5,
+            "recallMaxChars": 12000,
         },
         # OpenClaw requires an explicit opt-in before a non-bundled plugin can
         # receive conversation lifecycle events such as agent_end.

@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "upstream_repository": "https://github.com/Tencent/TencentDB-Agent-Memory",
+  "upstream_commit": "fe3230f176f1bf5832fee79d12494bbc2d19a8aa",
+  "import_method": "git archive HEAD",
+  "dirty_worktree_changes_excluded": true,
+  "purpose": "Auditable vendored reference components used by repository-memory adapters",
+  "components": {
+    "memorycore": {
+      "root": "MemoryCore",
+      "modules": [
+        "src/core/conversation",
+        "src/core/record",
+        "src/core/scene",
+        "src/core/persona",
+        "src/core/profile",
+        "src/core/hooks",
+        "src/core/store",
+        "src/core/storage",
+        "src/core/state",
+        "src/core/skill",
+        "src/adapters",
+        "src/config.ts",
+        "src/core/tdai-core.ts",
+        "openclaw-plugin/src/hooks",
+        "openclaw-plugin/src/format.ts",
+        "openclaw-plugin/src/sanitize.ts"
+      ],
+      "role": "L0 capture, L1 extraction, L2 scenario navigation, L3 profile recall, and lifecycle integration"
+    },
+    "memoryknowledge": {
+      "root": "MemoryKnowledge",
+      "modules": [
+        "src/engines/wiki",
+        "src/engines/code",
+        "src/source-fetcher",
+        "src/store",
+        "src/mcp",
+        "src/routes"
+      ],
+      "role": "Git-backed Wiki and code-graph indexing reference; repository-memory keeps its own citation-first adapter"
+    }
+  }
+}

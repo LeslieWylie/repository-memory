@@ -4,7 +4,7 @@ There are two different version numbers in this project:
 
 | Surface | Current value | Meaning |
 | --- | --- | --- |
-| Repository Memory release | `0.2.0` | The Python project, copied Skill runtime, installer, and OpenClaw plugin release. |
+| Repository Memory release | `0.3.0` | The Python project, vendored TencentDB component snapshot, shared runtime, installer, and OpenClaw plugin release. |
 | MCP protocol | `2026-07-28` | The wire-level protocol revision negotiated with a host. |
 
 The release version is stored in

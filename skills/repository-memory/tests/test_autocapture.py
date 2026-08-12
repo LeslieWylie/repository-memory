@@ -53,6 +53,16 @@ class AutoCaptureTest(unittest.TestCase):
         })
         self.assertFalse(should_create_candidate(turn))
 
+    def test_recall_injection_is_not_recaptured_as_memory(self):
+        turn = normalize_turn({
+            "messages": [
+                {"role": "user", "content": "<relevant-memories>old memory</relevant-memories>真实问题"},
+                {"role": "assistant", "content": "结论\n```python\nsecret_internal_code()\n```\n保留这条结论"},
+            ],
+        })
+        self.assertEqual(turn["messages"][0]["content"], "真实问题")
+        self.assertEqual(turn["messages"][1]["content"], "结论\n\n保留这条结论")
+
 
 if __name__ == "__main__":
     unittest.main()

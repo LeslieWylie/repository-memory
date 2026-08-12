@@ -1,8 +1,14 @@
-# OpenClaw automatic capture
+# OpenClaw automatic recall and capture
 
 This extension is an adapter, not a second memory store. It listens to the
-OpenClaw `agent_end` lifecycle event and invokes the installed
-`repository-memory capture-turn` runtime asynchronously.
+OpenClaw `before_prompt_build` and `agent_end` lifecycle events invoke the
+installed shared `repository-memory` runtime. The first hook performs bounded
+`scope=memory` recall; the second invokes `capture-turn` asynchronously.
+
+This follows the useful part of TencentDB's client plugin: L1 search, L2
+scenario navigation, and L3 profile context are recalled before the model turn;
+L0/L1/L2/L3 stay labelled and are never converted into repository citations.
+The Python runtime remains the only ranking and normalization implementation.
 
 When `guardEnabled` is on, the host policy has three intent classes:
 

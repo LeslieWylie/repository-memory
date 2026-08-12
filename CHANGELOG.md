@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.0
+
+- Bundle a clean, pinned TencentDB Agent Memory source snapshot for the native
+  L0-L3 lifecycle and MemoryKnowledge adapter reference.
+- Add shared-runtime OpenClaw `before_prompt_build` memory recall with labelled
+  layer/status context and no candidate injection.
+- Align post-turn capture with upstream sanitization so injected recall and
+  assistant code blocks do not feed back into durable memory.
+- Remove stale legacy memory tool names from the selected OpenClaw agent's
+  active allowlist while keeping the old plugin entries disabled for rollback.
+
 All notable changes to this project are recorded here. The project and its
 bundled runtime currently use the same release version. The MCP protocol
 revision is a separate compatibility identifier; see

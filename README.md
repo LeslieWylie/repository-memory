@@ -9,12 +9,13 @@ The important idea is simple:
 
 > An answer is a fact only when the runtime can show where it came from.
 
-It ships as one generic Skill with a shared Python runtime:
+It ships as one generic Skill with a shared Python runtime and a pinned,
+source-only TencentDB component snapshot:
 
 - a citation-first repository index and CLI;
 - a local stdio MCP server for Claude, Codex, OpenClaw, and other hosts;
-- an optional MemoryCore adapter for L0-L3 conversation memory;
-- an optional OpenClaw lifecycle extension for conservative post-turn capture;
+- a MemoryCore adapter for L0-L3 conversation memory;
+- an OpenClaw lifecycle extension for before-prompt recall and conservative post-turn capture;
 - a metadata-only audit proxy and an advisory guard that validates evidence
   receipts without blocking normal coding, shell, Git, or debugging tools.
 
@@ -197,11 +198,19 @@ is only `present` when the layer's actual query/read response returns records
 or content; unsupported, unreachable, malformed, or unprobed states remain
 `unknown` rather than being inferred from global health.
 
-MemoryCore is optional and is not bundled in this repository. Its endpoint,
-model, provider, and credentials are discovered from user configuration or
-environment at runtime. Credentials are never committed to Git. If it is not
-available, repository search still works and explicit session ingest can use
-the conservative local fallback with clearly reported layer support.
+The repository bundles a clean source snapshot of upstream MemoryCore and
+MemoryKnowledge components under the Skill's `vendor/` directory. The snapshot
+is not a second retrieval backend: the active adapter owns the public JSON
+contract and citations, while the vendor manifest pins the modules used for L0
+capture, L1 extraction, L2 navigation, L3 profile recall, and Wiki/code-graph
+adapter design. Building a standalone TypeScript MemoryCore still requires its
+upstream Node dependencies.
+
+The live MemoryCore endpoint, model, provider, and credentials are discovered
+from user configuration or environment at runtime. Credentials are never
+committed to Git. If the service is unavailable, repository search still works
+and explicit session ingest uses the conservative local fallback with clearly
+reported layer support.
 
 ## MCP
 

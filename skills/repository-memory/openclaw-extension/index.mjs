@@ -311,6 +311,81 @@ function runCapture(cfg, payload) {
   }).catch((error) => ({ ok: false, error: error.message }));
 }
 
+function shouldRecallPrompt(prompt) {
+  const value = String(prompt || "").trim();
+  if (!value || /^\/(?:help|start|reset|new|status)\b/i.test(value)) return false;
+  // Memory recall is for conversational context. Maintenance/code turns keep
+  // their normal tool context and do not receive an implicit memory query.
+  return !isMaintenancePrompt(value);
+}
+
+function formatMemoryContext(value, maxChars) {
+  const result = parseResult(value);
+  const group = result.groups?.memory && typeof result.groups.memory === "object" ? result.groups.memory : result;
+  const items = Array.isArray(group.answerable)
+    ? group.answerable
+    : Array.isArray(group.results)
+      ? group.results
+      : [];
+  const safeItems = items.filter((item) => {
+    const citation = item?.citation && typeof item.citation === "object" ? item.citation : {};
+    const status = String(item?.status || item?.evidence_status || "").toLowerCase();
+    return citation.valid !== false && !["candidate", "pending", "stale", "generated", "inferred"].includes(status);
+  });
+  if (!safeItems.length) return undefined;
+  const lines = [
+    "<repository-memory-context>",
+    "The following is conversation memory, not repository citation. Keep layer and status distinct.",
+    "",
+  ];
+  for (const item of safeItems) {
+    const layer = item?.memory_layer || item?.layer || "memory";
+    const status = item?.status || item?.evidence_status || "verified";
+    const content = text(item?.excerpt || item?.content || item?.memory?.content).trim();
+    if (!content) continue;
+    const id = item?.id || item?.memory_id || item?.citation?.memory_id || "unknown";
+    lines.push(`- [${layer}/${status}] ${content.replace(/\s+/g, " ")} (memory_id=${id})`);
+  }
+  lines.push("", "</repository-memory-context>");
+  return lines.join("\n").slice(0, Math.max(1000, Number(maxChars) || 12000));
+}
+
+function runRecall(cfg, prompt) {
+  const runtime = optional(cfg.runtime) || "repository-memory";
+  const limit = Math.max(1, Math.min(10, Number(cfg.recallMaxResults) || 5));
+  const timeoutMs = Math.max(1000, Math.min(60000, Number(cfg.timeoutMs) || DEFAULT_TIMEOUT_MS));
+  return new Promise((resolve) => {
+    const child = spawn(runtime, ["search", prompt, "--scope", "memory", "--limit", String(limit), "--json"], {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: process.env,
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.on("data", (chunk) => { stdout = (stdout + String(chunk)).slice(-131072); });
+    child.stderr?.on("data", (chunk) => { stderr = (stderr + String(chunk)).slice(-8192); });
+    const timer = setTimeout(() => {
+      child.kill("SIGTERM");
+      resolve({ ok: false, error: "memory recall timeout" });
+    }, timeoutMs);
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      resolve({ ok: false, error: error.message });
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code !== 0) {
+        resolve({ ok: false, error: (stderr || stdout || `runtime exited ${code}`).trim().slice(0, 400) });
+        return;
+      }
+      try {
+        resolve({ ok: true, result: JSON.parse(stdout) });
+      } catch {
+        resolve({ ok: false, error: "memory recall runtime returned invalid JSON" });
+      }
+    });
+  });
+}
+
 export default {
   id: PLUGIN_ID,
   name: "Repository Memory Auto Capture and Guard",
@@ -332,8 +407,47 @@ export default {
       maxMessages: Math.max(4, Math.min(64, Number(raw.maxMessages) || 24)),
       maxMessageChars: Math.max(1000, Math.min(50000, Number(raw.maxMessageChars) || 12000)),
       timeoutMs: Math.max(1000, Math.min(60000, Number(raw.timeoutMs) || DEFAULT_TIMEOUT_MS)),
+      recallEnabled: raw.recallEnabled !== false,
+      recallMaxResults: Math.max(1, Math.min(10, Number(raw.recallMaxResults) || 5)),
+      recallMaxChars: Math.max(1000, Math.min(20000, Number(raw.recallMaxChars) || 12000)),
     };
     if (!cfg.enabled) return;
+
+    // TencentDB's client plugin performs recall in before_prompt_build. Keep
+    // the same lifecycle while delegating to the shared Python runtime, so
+    // MCP, CLI, and automatic recall cannot drift into separate backends.
+    if (cfg.recallEnabled) {
+      api.on("before_prompt_build", async (event, ctx) => {
+        if (!isAllowedAgent(cfg, ctx)) return;
+        const prompt = optional(event?.prompt) || optional(event?.message) || "";
+        if (!shouldRecallPrompt(prompt)) return;
+        const outcome = await runRecall(cfg, prompt);
+        if (!outcome.ok) {
+          await appendAudit(cfg, {
+            agent: optional(ctx?.agentId) || "main",
+            run_id: optional(ctx?.runId) || null,
+            event: "memory_recall",
+            scope: "memory",
+            outcome: "degraded",
+            error: outcome.error,
+          });
+          return;
+        }
+        const context = formatMemoryContext(outcome.result, cfg.recallMaxChars);
+        const group = outcome.result?.groups?.memory;
+        await appendAudit(cfg, {
+          agent: optional(ctx?.agentId) || "main",
+          run_id: optional(ctx?.runId) || null,
+          event: "memory_recall",
+          scope: "memory",
+          outcome: context ? "injected" : "empty",
+          verified: Array.isArray(group?.verified) ? group.verified.length : 0,
+          answerable: Array.isArray(group?.answerable) ? group.answerable.length : 0,
+          retrieval_mode: outcome.result?.retrieval_mode || outcome.result?.diagnostics?.retrieval_mode || "unknown",
+        });
+        return context ? { prependContext: context } : undefined;
+      }, { priority: 80, timeoutMs: Math.min(cfg.timeoutMs, 30000) });
+    }
 
     if (cfg.guardEnabled) {
       api.on("before_agent_run", async (event, ctx) => {

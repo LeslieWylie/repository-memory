@@ -109,7 +109,7 @@ class RepositoryMemoryTest(unittest.TestCase):
     def test_runtime_version_comes_from_skill_version_file(self):
         self.assertEqual(SERVER_VERSION, VERSION)
         self.assertEqual(VERSION, (SCRIPTS.parent / "VERSION").read_text(encoding="utf-8").strip())
-        self.assertEqual(VERSION, "0.2.0")
+        self.assertEqual(VERSION, "0.3.0")
 
     def test_multisource_search_has_verified_and_candidates(self):
         result = core.search(None, "Atlas evidence", limit=5)
@@ -1176,6 +1176,8 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertIn("repository-memory", alpha["skills"])
         self.assertNotIn("rlvr-memory", alpha["skills"])
         self.assertIn("repository-memory__memory_search", alpha["tools"]["alsoAllow"])
+        self.assertNotIn("repository-memory__memory_context", alpha["tools"]["alsoAllow"])
+        self.assertNotIn("repository-memory__memory_publish", alpha["tools"]["alsoAllow"])
         self.assertNotIn("repository-memory", beta.get("skills", []))
         self.assertNotIn("repository-memory__memory_search", beta.get("tools", {}).get("alsoAllow", []))
         wrapper = machine / ".local" / "bin" / ("repository-memory.cmd" if os.name == "nt" else "repository-memory")
