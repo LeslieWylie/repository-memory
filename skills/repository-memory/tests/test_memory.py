@@ -1330,5 +1330,117 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(all_report["rows"][0]["selected_scope"], "repository")
 
 
+class TeamMemoryRetentionTest(unittest.TestCase):
+    """Retention and compaction for memory_revisions."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.db = Path(self.temp.name) / "retention.sqlite3"
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _populate(self, store, count: int = 3):
+        """Publish a memory and create ``count`` revisions by repeated activation/export-import."""
+        pub = store.publish({
+            "type": "decision",
+            "title": "Retention decision",
+            "content": "Should survive compaction.",
+            "status": "candidate",
+            "author_agent": "agent-a",
+        }, default_status="candidate")
+        mid = pub["memory"]["id"]
+        # Activate to bump the revision, then export-import to clone revisions
+        store.activate(mid, reviewer="reviewer-a")
+        for _ in range(count - 2):
+            bundle = store.export_bundle()
+            clone = TeamMemoryStore(Path(self.temp.name) / f"clone-{id(store)}-{_}.sqlite3")
+            clone.import_bundle(bundle)
+            clone.activate(mid, reviewer="reviewer-a")
+            store.import_bundle(clone.export_bundle())
+        return mid
+
+    def test_compact_keep_1_preserves_current_revision(self):
+        store = TeamMemoryStore(self.db)
+        mid = self._populate(store, count=4)
+        before = store.health()["retention"][mid]
+        self.assertGreater(before["total_revisions"], 1)
+        result = store.compact(keep=1)
+        self.assertGreaterEqual(result["purged"], 0)
+        after = store.health()["retention"][mid]
+        self.assertGreaterEqual(after["total_revisions"], 1)
+        # current record is still there
+        self.assertEqual(store.get(mid)["result"]["id"], mid)
+
+    def test_compact_protects_ancestor_chain(self):
+        store = TeamMemoryStore(self.db)
+        mid = self._populate(store, count=5)
+        before_chain = store.health()["retention"][mid]["current_ancestor_chain"]
+        store.compact(keep=100)
+        after = store.health()["retention"][mid]
+        # ancestor chain is never shortened by compaction
+        self.assertGreaterEqual(after["current_ancestor_chain"], 1)
+        self.assertEqual(store.get(mid)["result"]["id"], mid)
+
+    def test_compact_keep_2_preserves_extra_unprotected(self):
+        store = TeamMemoryStore(self.db)
+        mid = self._populate(store, count=4)
+        before = store.health()["retention"][mid]["total_revisions"]
+        store.compact(keep=2)
+        after = store.health()["retention"][mid]["total_revisions"]
+        # keep=2 should preserve at least 2 unprotected + ancestors
+        self.assertGreaterEqual(after, 2)
+        self.assertLessEqual(after, before)
+
+    def test_compact_rejects_keep_0(self):
+        store = TeamMemoryStore(self.db)
+        with self.assertRaises(ValueError):
+            store.compact(keep=0)
+
+    def test_health_reports_retention_diagnostics(self):
+        store = TeamMemoryStore(self.db)
+        mid = self._populate(store, count=3)
+        health = store.health()
+        self.assertIn("retention", health)
+        self.assertIn(mid, health["retention"])
+        entry = health["retention"][mid]
+        self.assertIn("total_revisions", entry)
+        self.assertIn("current_ancestor_chain", entry)
+        self.assertGreaterEqual(entry["total_revisions"], 1)
+        self.assertGreaterEqual(entry["current_ancestor_chain"], 1)
+
+    def test_import_reports_conflict_for_missing_ancestor(self):
+        """Import a record whose parent_revision does not exist locally."""
+        store = TeamMemoryStore(self.db)
+        bundle = {
+            "kind": "repository-memory-team-bundle",
+            "schema_version": 3,
+            "records": [
+                {
+                    "id": "team:decision:orphan",
+                    "memory_type": "decision",
+                    "title": "Orphan memory",
+                    "content": "Parent revision was compacted away on source.",
+                    "summary": "orphan test",
+                    "scope": "{}",
+                    "provenance": "{}",
+                    "confidence": 0.5,
+                    "status": "active",
+                    "created_at": "2026-01-01T00:00:00",
+                    "updated_at": "2026-01-01T00:00:00",
+                    "revision": 5,
+                    "origin_node": "source-node",
+                    "parent_revision": "source-node:4",
+                }
+            ],
+            "revisions": [],
+            "feedback": [],
+        }
+        result = store.import_bundle(bundle)
+        self.assertEqual(result["imported"]["inserted"], 0)
+        self.assertEqual(result["imported"]["conflicts"], 1)
+        self.assertIn("parent_revision not found locally", result["imported"]["conflict_records"][0]["reason"])
+
+
 if __name__ == "__main__":
     unittest.main()

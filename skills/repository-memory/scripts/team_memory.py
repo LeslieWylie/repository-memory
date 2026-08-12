@@ -257,14 +257,7 @@ class SQLiteTeamMemoryBackend:
             revisions = int(connection.execute("SELECT COUNT(*) FROM memory_revisions").fetchone()[0])
             expired = sum(1 for row in connection.execute("SELECT valid_until FROM memories WHERE status = 'active' AND valid_until IS NOT NULL") if self._expired(row[0]))
             fts = self._fts_available(connection)
-        except (IndexError, TypeError):
-            revisions = 0
-            expired = 0
-            fts = False
-
-        # Retention diagnostics
-        retention_details: list[dict[str, Any]] = []
-        try:
+            retention_details: list[dict[str, Any]] = []
             for mem_row in connection.execute("SELECT id, revision, origin_node FROM memories"):
                 mem_id = mem_row["id"]
                 rev_count = int(connection.execute("SELECT COUNT(*) FROM memory_revisions WHERE memory_id = ?", (mem_id,)).fetchone()[0])
@@ -280,8 +273,8 @@ class SQLiteTeamMemoryBackend:
                     ).fetchone()
                     cursor = str(parent[0]) if parent and parent[0] else ""
                 retention_details.append({"id": mem_id, "total_revisions": rev_count, "current_ancestor_chain": current_chain})
-        except Exception:
-            pass
+        finally:
+            connection.close()
         retention = {"total_revisions": revisions, "revision_records": retention_details}
         return {
             "backend": self.backend_name,
@@ -663,10 +656,23 @@ class SQLiteTeamMemoryBackend:
                     else:
                         revisions_skipped += 1
                     continue
+                parent_revision = str(incoming.get("parent_revision") or "").strip() or None
+                if parent_revision and connection.execute(
+                    "SELECT 1 FROM memory_revisions WHERE memory_id = ? AND revision_id = ?",
+                    (incoming["memory_id"], parent_revision),
+                ).fetchone() is None:
+                    conflicts += 1
+                    conflict_records.append({
+                        "id": incoming["memory_id"],
+                        "revision_id": revision_id,
+                        "reason": "incoming revision parent is not retained; causal history is incomplete",
+                        "missing_parent": parent_revision,
+                    })
+                    continue
                 connection.execute(
                     """INSERT INTO memory_revisions (memory_id, revision_id, revision, origin_node, parent_revision, payload, payload_hash, created_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (incoming["memory_id"], revision_id, revision, origin_node, incoming.get("parent_revision"), payload, payload_hash, incoming.get("created_at") or _now()),
+                    (incoming["memory_id"], revision_id, revision, origin_node, parent_revision, payload, payload_hash, incoming.get("created_at") or _now()),
                 )
                 revisions_inserted += 1
             for incoming in records:
@@ -684,6 +690,18 @@ class SQLiteTeamMemoryBackend:
                     raise ValueError(f"Team Memory record has an unsupported type/status: {record.get('id')}")
                 if SECRET_CONTENT.search(f"{record['title']}\n{record['content']}"):
                     raise ValueError(f"Team Memory record contains a secret-like value: {record.get('id')}")
+                record_parent = str(record.get("parent_revision") or "").strip() or None
+                if record_parent and connection.execute(
+                    "SELECT 1 FROM memory_revisions WHERE memory_id = ? AND revision_id = ?",
+                    (record["id"], record_parent),
+                ).fetchone() is None:
+                    conflicts += 1
+                    conflict_records.append({
+                        "id": record["id"],
+                        "reason": "incoming record parent is not retained; causal history is incomplete",
+                        "missing_parent": record_parent,
+                    })
+                    continue
                 existing = connection.execute("SELECT * FROM memories WHERE id = ?", (record["id"],)).fetchone()
                 if existing is None:
                     connection.execute(
@@ -765,34 +783,25 @@ class SQLiteTeamMemoryBackend:
 
 
     def compact(self, keep: int = 1) -> dict[str, Any]:
-        """Remove old revision records beyond ``keep`` per memory.
+        """Explicitly purge unprotected historical revisions per memory.
 
-        Default ``keep=1``: preserve only the most recent revision and the
-        current record's ancestor chain.  Never deletes ancestors needed by
-        the current record.
-
-        After compaction, a future import that arrives with a ``parent_revision``
-        that was deleted is reported as a conflict (the existing ``_is_ancestor``
-        check returns ``False``), not silently accepted.
+        The current record and every revision in its retained ancestor chain
+        are never deleted. Revision-log parent links remain immutable: if a
+        later import needs a purged ancestor, causal validation reports a
+        conflict instead of silently accepting an unverifiable update.
         """
 
         if keep < 1:
             raise ValueError(f"keep must be >= 1, got {keep}")
 
         def operation(connection: sqlite3.Connection) -> dict[str, Any]:
-            affected = 0
-            purged = 0
-            orphaned = 0
-            protected: set[str] = set()
+            protected: set[tuple[str, str]] = set()
             for row in connection.execute("SELECT id, revision, origin_node FROM memories"):
-                memory_id = row["id"]
-                current_id = self._revision_id(row["revision"], row["origin_node"])
-                # Walk the full ancestor chain of the current record --
-                # every node must be kept.
-                cursor = current_id
+                memory_id = str(row["id"])
+                cursor = self._revision_id(row["revision"], row["origin_node"])
                 seen: set[str] = set()
                 while cursor and cursor not in seen:
-                    protected.add(f"{memory_id}::{cursor}")
+                    protected.add((memory_id, cursor))
                     seen.add(cursor)
                     parent = connection.execute(
                         "SELECT parent_revision FROM memory_revisions WHERE memory_id = ? AND revision_id = ?",
@@ -800,46 +809,32 @@ class SQLiteTeamMemoryBackend:
                     ).fetchone()
                     cursor = str(parent[0]) if parent and parent[0] else ""
 
-            for row in connection.execute(
-                "SELECT memory_id, revision_id, revision FROM memory_revisions ORDER BY memory_id, revision DESC"
-            ):
-                key = f"{row['memory_id']}::{row['revision_id']}"
+            rows = connection.execute(
+                "SELECT memory_id, revision_id, revision FROM memory_revisions ORDER BY memory_id, revision DESC, revision_id DESC"
+            ).fetchall()
+            unprotected_seen: dict[str, int] = {}
+            purge: list[tuple[str, str]] = []
+            for row in rows:
+                key = (str(row["memory_id"]), str(row["revision_id"]))
                 if key in protected:
                     continue
-                # Keep the N most recent unprotected revisions.
-                affected += 1
-                if affected <= keep:
+                memory_id = key[0]
+                unprotected_seen[memory_id] = unprotected_seen.get(memory_id, 0) + 1
+                if unprotected_seen[memory_id] <= keep:
                     continue
-                purged += 1
+                purge.append(key)
+            for memory_id, revision_id in purge:
                 connection.execute(
                     "DELETE FROM memory_revisions WHERE memory_id = ? AND revision_id = ?",
-                    (row["memory_id"], row["revision_id"]),
+                    (memory_id, revision_id),
                 )
-
-            # Nullify parent_revision in any descendant whose parent was purged.
-            for memory_id, in connection.execute("SELECT id FROM memories"):
-                for rev_row in connection.execute(
-                    "SELECT revision_id, parent_revision FROM memory_revisions WHERE memory_id = ? AND parent_revision IS NOT NULL",
-                    (memory_id,),
-                ):
-                    parent_key = f"{memory_id}::{rev_row['parent_revision']}"
-                    if parent_key not in protected and not connection.execute(
-                        "SELECT 1 FROM memory_revisions WHERE memory_id = ? AND revision_id = ?",
-                        (memory_id, rev_row["parent_revision"]),
-                    ).fetchone():
-                        connection.execute(
-                            "UPDATE memory_revisions SET parent_revision = NULL WHERE memory_id = ? AND revision_id = ?",
-                            (memory_id, rev_row["revision_id"]),
-                        )
-                        orphaned += 1
 
             remaining = int(
                 connection.execute("SELECT COUNT(*) FROM memory_revisions").fetchone()[0]
             )
             return {
-                "purged": purged,
+                "purged": len(purge),
                 "protected_ancestors": len(protected),
-                "orphaned_descendants": orphaned,
                 "remaining_revisions": remaining,
                 "keep": keep,
             }

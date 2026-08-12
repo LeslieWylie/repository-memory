@@ -45,6 +45,7 @@ repository-memory team-activate --id <team-memory-id> [--reviewer <agent>] --jso
 repository-memory memorycore promote-l3 --candidate <autocapture:L2:id> --accept --json
 repository-memory evaluate --queries <queries.jsonl> --qrels <qrels.jsonl> [--revision <commit>] [--scope repository|memory|all] --json
 repository-memory team-evaluate --records <records.jsonl> --queries <queries.jsonl> --qrels <qrels.jsonl> [--gate] --json
+repository-memory team-compact [--keep N] --json
 repository-memory memorycore configure|start|stop|status
 repository-memory mcp
 ```
