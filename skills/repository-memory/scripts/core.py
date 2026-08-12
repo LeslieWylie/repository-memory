@@ -16,6 +16,7 @@ import os
 import re
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -49,10 +50,11 @@ from local_index import status as local_index_status
 from mcp_server import serve
 from memorycore import native_memory_client
 from snapshot import prepare_view
+from team_memory import team_memory_store
 
 from models import SourceSpec, SourceView
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 REPOSITORY_BACKEND = "repository-local-structured"
 # Keep fabricated-marker detection conservative: the ``ZZZ...`` form is used
 # by synthetic negative probes and should never fall through to generic
@@ -134,7 +136,8 @@ def _openclaw_routing() -> dict[str, Any]:
     state_dir = os.environ.get("OPENCLAW_STATE_DIR")
     if state_dir:
         candidates.append(Path(state_dir).expanduser() / "openclaw.json")
-    candidates.append(Path.home() / ".openclaw" / "openclaw.json")
+    home = Path(os.environ.get("HOME") or os.environ.get("USERPROFILE") or Path.home()).expanduser()
+    candidates.append(home / ".openclaw" / "openclaw.json")
     config_path = next((path for path in candidates if path.is_file()), None)
     if config_path is None:
         return {
@@ -177,28 +180,34 @@ def _openclaw_routing() -> dict[str, Any]:
     autocapture = entries.get("repository-memory-autocapture") if isinstance(entries.get("repository-memory-autocapture"), dict) else {}
     autocapture_config = autocapture.get("config") if isinstance(autocapture.get("config"), dict) else {}
     guard_enabled = autocapture.get("enabled") is not False and autocapture_config.get("enabled") is not False and autocapture_config.get("guardEnabled") is True
+    enforcement = autocapture_config.get("enforcement") if autocapture_config.get("enforcement") in {"audit", "enforce"} else "audit"
     allowed_agents = autocapture_config.get("agentIds")
     if not isinstance(allowed_agents, list) or not all(isinstance(item, str) for item in allowed_agents):
         allowed_agents = []
     covered_agents = configured_agents if not allowed_agents else [agent_id for agent_id in configured_agents if agent_id in allowed_agents]
+    excluded_agents = [] if not allowed_agents else [agent_id for agent_id in configured_agents if agent_id not in allowed_agents]
     mcp_servers = config.get("mcp", {}).get("servers", {}) if isinstance(config.get("mcp"), dict) else {}
     repository_mcp = "ready" if isinstance(mcp_servers, dict) and isinstance(mcp_servers.get("repository-memory"), dict) else "missing"
     builtin_status = "disabled" if not enabled_agent_memory else "enabled"
     active_status = "disabled" if active_memory.get("enabled") is False else "enabled"
     legacy_status = "disabled" if memmy.get("enabled") is False and plugins.get("slots", {}).get("memory") != "memmy-memory" else "legacy-active"
-    coverage_ok = bool(configured_agents) and set(covered_agents) == set(configured_agents)
-    guard_status = "ready" if guard_enabled and coverage_ok else "partial" if guard_enabled else "disabled"
-    managed_ready = repository_mcp == "ready" and builtin_status == "disabled" and active_status == "disabled" and guard_status == "ready"
+    allowlist_ok = bool(configured_agents) and bool(allowed_agents) and set(allowed_agents).issubset(set(configured_agents))
+    coverage_ok = bool(configured_agents) and (not allowed_agents or set(covered_agents) == set(configured_agents))
+    guard_ready = allowlist_ok if allowed_agents else coverage_ok
+    guard_status = "advisory" if guard_enabled and guard_ready else "partial" if guard_enabled else "disabled"
+    managed_ready = repository_mcp == "ready" and builtin_status == "disabled" and active_status == "disabled" and guard_status == "advisory"
     return {
         "status": "ready" if managed_ready else "degraded",
         "managed": True,
         "repository_mcp": repository_mcp,
         "builtin_memory_search": builtin_status,
-        "direct_file_fallback": "blocked" if guard_status == "ready" else "host-dependent",
+        "direct_file_fallback": "audited" if guard_status == "advisory" else "host-dependent",
+        "guard_mode": "advisory" if guard_status == "advisory" else "unavailable",
         "guard": guard_status,
+        "guard_enforcement": enforcement if guard_enabled else "disabled",
         "legacy_memory": legacy_status,
         "active_memory": active_status,
-        "agents": {"configured": configured_agents, "covered": covered_agents},
+        "agents": {"configured": configured_agents, "covered": covered_agents, "excluded": excluded_agents, "scope": "allowlist" if allowed_agents else "all"},
     }
 
 
@@ -424,9 +433,11 @@ def _fallback_is_stale(view: SourceView, local: bool) -> bool:
     falls back to a dirty local worktree must not be promoted to ``verified``.
     """
 
-    if local:
-        return False
-    return view.freshness.get("state") not in {"fresh"}
+    # A clean local HEAD is still a concrete, line-addressable Git revision.
+    # It is not remotely fresh, but it is not stale merely because no remote
+    # exists.  Only an uncommitted local worktree is unsafe to verify when the
+    # caller did not explicitly request --local.
+    return bool(not local and view.dirty and view.commit_type == "local_worktree")
 
 
 def _sync_if_needed(adapter: Adapter, view: SourceView, deep: bool = False) -> tuple[dict[str, Any] | None, str | None]:
@@ -657,10 +668,17 @@ def ingest_session(root: Path | None, input_path: str, source_id: str | None = N
     }
 
 
-def init_source(path: str, source_id: str | None = None, repository: str | None = None, profile: str | None = None, sync: bool = True) -> dict[str, Any]:
+def init_source(
+    path: str,
+    source_id: str | None = None,
+    repository: str | None = None,
+    profile: str | None = None,
+    sync: bool = True,
+    local_only: bool = False,
+) -> dict[str, Any]:
     """Register a user-owned source and optionally build its derived index."""
 
-    registration = add_source(path, source_id, repository, profile)
+    registration = add_source(path, source_id, repository, profile, local_only)
     root = Path(registration["root"])
     source = registration["id"]
     synced = sync_index(root, source_id=source, local=True) if sync else None
@@ -799,6 +817,38 @@ def capture_turn(root: Path | None, payload: Any, source_id: str | None = None) 
     elif not l0["l0_verified"]:
         candidate["reason"] = "L0 was not verified"
 
+    # Shared Team Memory is intentionally narrower than raw conversation
+    # capture.  A durable answer becomes a reviewable candidate only when it
+    # contains a reusable decision, failure, discovery, solution, or handoff.
+    team_candidate: dict[str, Any] = {"created": False, "status": "skipped", "reason": "not durable"}
+    if should_create_candidate(turn):
+        answer = next((item["content"] for item in reversed(turn["messages"]) if item["role"] == "assistant"), "")
+        if re.search(r"决定|选择|采用|策略|decision|policy|选择", answer, re.IGNORECASE):
+            memory_type = "decision"
+        elif re.search(r"失败|报错|异常|阻塞|原因|failure|error|blocked|root cause", answer, re.IGNORECASE):
+            memory_type = "failure"
+        elif re.search(r"修复|解决|方案|workaround|fix|solution|resolved", answer, re.IGNORECASE):
+            memory_type = "solution"
+        elif re.search(r"交接|下一步|待办|handoff|next step|follow[- ]?up", answer, re.IGNORECASE):
+            memory_type = "handoff"
+        else:
+            memory_type = "discovery"
+        try:
+            team_result = team_memory_store().publish({
+                "type": memory_type,
+                "title": answer[:140].splitlines()[0] if answer else memory_type,
+                "content": answer,
+                "scope": {"workspace": Path(turn.get("workspace") or "").name if turn.get("workspace") else None},
+                "provenance": {"agent": turn.get("agent_id"), "session": turn.get("session_id"), "run_id": turn.get("run_id")},
+                "confidence": 0.4,
+                "status": "candidate",
+                "idempotency_key": f"capture:{key}",
+            })
+            team_memory = team_result.get("memory") if isinstance(team_result.get("memory"), dict) else {}
+            team_candidate = {"created": True, "status": "candidate", "id": team_memory.get("id"), "memory_type": memory_type, "duplicate": team_result.get("duplicate", False), "evidence_status": "candidate"}
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            team_candidate = {"created": False, "status": "error", "reason": str(exc)[:240]}
+
     result = {
         "schema_version": SCHEMA_VERSION,
         "ok": bool(l0_result.get("ok")) and l0["l0_verified"],
@@ -809,6 +859,7 @@ def capture_turn(root: Path | None, payload: Any, source_id: str | None = None) 
         "l0": l0,
         "l1": l1,
         "l2": candidate,
+        "team_memory": team_candidate,
         "l3": {"written": False, "status": "explicit_promotion_only"},
         "memory": native.health(refresh=True, probe_layers=True) if native.configured else l0_result.get("memory"),
         "canonical_repo_changed": False,
@@ -895,6 +946,11 @@ def _memory_get_result(result_id: str, explain: bool = False) -> dict[str, Any]:
 
 
 def get_result(root: Path | None, result_id: str, explain: bool = False, expected_commit: str | None = None) -> dict[str, Any]:
+    if result_id.startswith("team:"):
+        value = team_memory_store().get(result_id)
+        if explain:
+            value["doctor"] = doctor(root)
+        return value
     errors = []
     if result_id.startswith(("memorycore:", "local:", "autocapture:")):
         return _memory_get_result(result_id, explain)
@@ -989,6 +1045,7 @@ def doctor(root: Path | None = None, source_id: str | None = None) -> dict[str, 
             memory_report = memory_adapter.native_memory.health(refresh=True, probe_layers=True)
         memory_configured = bool(memory_report.get("configured"))
         memory_ready = memory_report.get("status") == "ready"
+        team_report = team_memory_store().health()
         routing = _openclaw_routing()
         capabilities = ["init", "source-add", "memory-init"]
         if memory_configured and memory_ready:
@@ -999,6 +1056,7 @@ def doctor(root: Path | None = None, source_id: str | None = None) -> dict[str, 
             "active_adapter": "native-memorycore" if memory_report.get("backend") != "local-memory" and memory_configured else "local-memory" if memory_configured else None,
             "capabilities": sorted(set(capabilities)),
             "memory": memory_report,
+            "team_memory": team_report,
             "repository": {"status": "not_configured", "source_count": 0},
             "knowledge_service": {"configured": False, "required": False, "status": "optional"},
             "semantic": memory_report.get("embedding", {"available": False, "strategy": "keyword-only"}),
@@ -1013,6 +1071,11 @@ def doctor(root: Path | None = None, source_id: str | None = None) -> dict[str, 
     reports = []
     for spec in specs:
         state = repository_state(spec.root)
+        # The checkout directory may be a content-addressed or user-managed
+        # snapshot whose basename is not the configured repository identity.
+        # Keep doctor/source metadata aligned with the stable source contract.
+        state["repository"] = spec.repository
+        state["local_only"] = spec.local_only
         # Doctor must describe the same effective read view used by ordinary
         # search: a fresh remote snapshot when one is available.  Keep the
         # canonical worktree state separately in ``state`` so a dirty local
@@ -1030,7 +1093,7 @@ def doctor(root: Path | None = None, source_id: str | None = None) -> dict[str, 
             pass
         snapshot_path = cache_root() / "snapshots" / fingerprint(spec)
         snapshot = {"path": str(snapshot_path), "exists": (snapshot_path / ".git").exists(), "commit": git(snapshot_path, "rev-parse", "HEAD") if (snapshot_path / ".git").exists() else None}
-        report.update({"source": spec.id, "repository": spec.repository, "state": state, "index": local_index_status(view), "snapshot_cache": {**snapshot, **view.metadata}, "freshness": view.freshness})
+        report.update({"source": spec.id, "repository": spec.repository, "local_only": spec.local_only, "state": state, "index": local_index_status(view), "snapshot_cache": {**snapshot, **view.metadata}, "freshness": view.freshness})
         reports.append(report)
     active = [report.get("name") for report in reports if report.get("available")]
     capabilities = sorted({capability for report in reports for capability in report.get("capabilities", [])})
@@ -1076,10 +1139,12 @@ def doctor(root: Path | None = None, source_id: str | None = None) -> dict[str, 
     healthy = all(report.get("healthy", True) for report in reports)
     routing = _openclaw_routing()
     active_values = unique_values(active)
-    return {"schema_version": SCHEMA_VERSION, "ok": healthy, "status": "ready" if healthy else "degraded", "active_adapter": active_values[0] if len(active_values) == 1 else active_values, "capabilities": capabilities, "memory": memory[0] if len(memory) == 1 else memory, "repository": {"status": "ready" if reports else "not_configured", "source_count": len(reports)}, "knowledge_service": {"configured": False, "required": False, "status": "optional"}, "semantic": semantic[0] if len(semantic) == 1 else ({"available": False, "strategy": "keyword-only"} if native_ready else semantic), "routing": routing, "agents": routing.get("agents", {"configured": [], "covered": []}), "sources": reports, "config": config_summary(), "actions": actions}
+    return {"schema_version": SCHEMA_VERSION, "ok": healthy, "status": "ready" if healthy else "degraded", "active_adapter": active_values[0] if len(active_values) == 1 else active_values, "capabilities": capabilities, "memory": memory[0] if len(memory) == 1 else memory, "team_memory": team_memory_store().health(), "repository": {"status": "ready" if reports else "not_configured", "source_count": len(reports)}, "knowledge_service": {"configured": False, "required": False, "status": "optional"}, "semantic": semantic[0] if len(semantic) == 1 else ({"available": False, "strategy": "keyword-only"} if native_ready else semantic), "routing": routing, "agents": routing.get("agents", {"configured": [], "covered": []}), "sources": reports, "config": config_summary(), "actions": actions}
 
 
-def feedback(root: Path | None, result_id: str, note: str, rating: str | None = None) -> dict[str, Any]:
+def feedback(root: Path | None, result_id: str, note: str, rating: str | None = None, feedback_id: str | None = None) -> dict[str, Any]:
+    if result_id.startswith("team:"):
+        return team_memory_store().feedback(result_id, rating or "helpful", note, feedback_id=feedback_id)
     destination = data_root() / "feedback.jsonl"
     destination.parent.mkdir(parents=True, exist_ok=True)
     item = {"timestamp": dt.datetime.now(dt.timezone.utc).isoformat(), "repository": str(root) if root else None, "result_id": result_id, "note": note, "rating": rating}
@@ -1110,6 +1175,152 @@ def promote(root: Path, input_path: str) -> dict[str, Any]:
     return {"schema_version": SCHEMA_VERSION, "status": "candidate", "written": written, "canonical_repo_changed": False}
 
 
+def _read_json_or_jsonl(input_path: str) -> Any:
+    source = Path(input_path).expanduser()
+    text = source.read_text(encoding="utf-8")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        rows = [json.loads(line) for line in text.splitlines() if line.strip()]
+        return rows
+
+
+def publish_memory(input_path: str, *, status: str | None = None) -> dict[str, Any]:
+    """Explicitly publish one or more cross-agent memories."""
+
+    payload = _read_json_or_jsonl(input_path)
+    items = payload if isinstance(payload, list) else [payload]
+    written = []
+    store = team_memory_store()
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError("memory_publish input must contain JSON objects")
+        written.append(store.publish({**item, **({"status": status} if status else {})}))
+    return {"schema_version": SCHEMA_VERSION, "ok": True, "published": written, "count": len(written), "canonical_repo_changed": False}
+
+
+def activate_memory(memory_id: str, reviewer: str | None = None) -> dict[str, Any]:
+    """Explicitly move one Team Memory candidate into the active plane."""
+
+    result = team_memory_store().activate(memory_id, reviewer=reviewer)
+    result["schema_version"] = SCHEMA_VERSION
+    result["write_operation"] = "explicit-review"
+    return result
+
+
+def export_team_memory(output_path: str) -> dict[str, Any]:
+    """Export the user-level Team Memory plane as an explicit sync bundle."""
+
+    destination = Path(output_path).expanduser().resolve()
+    bundle = team_memory_store().export_bundle()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(bundle, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, destination)
+    try:
+        destination.chmod(0o600)
+    except OSError:
+        pass
+    return {"schema_version": SCHEMA_VERSION, "ok": True, "operation": "team-memory-export", "path": str(destination), "records": len(bundle.get("records", [])), "feedback": len(bundle.get("feedback", [])), "canonical_repo_changed": False}
+
+
+def import_team_memory(input_path: str) -> dict[str, Any]:
+    """Merge an explicit Team Memory bundle into the configured backend."""
+
+    source = Path(input_path).expanduser().resolve()
+    try:
+        bundle = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid Team Memory bundle: {source}") from exc
+    result = team_memory_store().import_bundle(bundle)
+    result.update({"operation": "team-memory-import", "path": str(source)})
+    return result
+
+
+def supersede_memory(memory_id: str, input_path: str) -> dict[str, Any]:
+    store = team_memory_store()
+    store.get(memory_id)
+    payload = _read_json_or_jsonl(input_path)
+    if isinstance(payload, list):
+        if len(payload) != 1:
+            raise ValueError("memory_supersede input must contain exactly one object")
+        payload = payload[0]
+    if not isinstance(payload, dict):
+        raise ValueError("memory_supersede input must contain one JSON object")
+    payload = {**payload, "status": "active", "supersedes": memory_id}
+    result = store.publish(payload, default_status="active")
+    return {"schema_version": SCHEMA_VERSION, "ok": True, "superseded": memory_id, "replacement": result, "canonical_repo_changed": False}
+
+
+def memory_context(
+    root: Path | None,
+    query: str,
+    *,
+    limit: int = 5,
+    source_id: str | None = None,
+    repo: str | None = None,
+    issue: str | None = None,
+    branch: str | None = None,
+    agent: str | None = None,
+    local: bool = False,
+) -> dict[str, Any]:
+    """Build one context package without erasing provenance boundaries.
+
+    Repository retrieval and Team Memory retrieval are ranked in their own
+    planes.  The package is the fusion seam: it gives the agent the sections it
+    needs while keeping Git citations distinct from experience/decision
+    provenance.  No cross-backend score is invented.
+    """
+
+    # Query normalization is shared, but the two retrieval lanes run in
+    # parallel.  They remain separate after recall: scores and provenance are
+    # never mixed into an opaque cross-backend ranking.
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="memory-context") as pool:
+        repository_future = pool.submit(search, root, query, limit, False, source_id, local, "repository")
+        team_future = pool.submit(team_memory_store().search, query, limit=limit, repo=repo, issue=issue, branch=branch, agent=agent)
+        repository = repository_future.result()
+        team = team_future.result()
+    active = team.get("active", []) if isinstance(team, dict) else []
+    candidates = team.get("candidates", []) if isinstance(team, dict) else []
+    grouped: dict[str, list[dict[str, Any]]] = {memory_type: [] for memory_type in ("evidence", "decision", "discovery", "failure", "solution", "handoff")}
+    for item in active:
+        grouped.setdefault(str(item.get("memory_type") or "discovery"), []).append(item)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "query": query,
+        "mode": classify(query),
+        "retrieval_mode": "multi-source-lexical",
+        "retrieval_strategy": "sectioned-lexical",
+        "semantic_available": False,
+        "abstain": not repository.get("verified") and not active,
+        "context": {
+            "repository_evidence": repository.get("verified", []),
+            "repository_candidates": repository.get("candidates", []),
+            "team_memory": active,
+            "decisions": grouped.get("decision", []),
+            "failures": grouped.get("failure", []),
+            "solutions": grouped.get("solution", []),
+            "discoveries": grouped.get("discovery", []),
+            "handoffs": grouped.get("handoff", []),
+            "evidence_memory": grouped.get("evidence", []),
+            "team_candidates": candidates,
+        },
+        "freshness": repository.get("freshness", {}),
+        "diagnostics": {
+            "fusion": "sectioned-provenance; repository and team scores are not mixed",
+            "parallel_recall": True,
+            "repository_verified": len(repository.get("verified", [])),
+            "repository_candidates": len(repository.get("candidates", [])),
+            "team_active": len(active),
+            "team_candidates": len(candidates),
+            "team_memory": team.get("diagnostics", {}),
+            "repository": repository.get("diagnostics", {}),
+            "semantic_available": False,
+        },
+        "sources": {"repository": repository, "team_memory": {**team_memory_store().health(), "retrieval_mode": "lexical"}},
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="repository-memory")
     parser.add_argument("--root")
@@ -1126,13 +1337,20 @@ def build_parser() -> argparse.ArgumentParser:
     search_parser = common("search"); search_parser.add_argument("query"); search_parser.add_argument("--limit", type=int, default=5); search_parser.add_argument("--deep", action="store_true"); search_parser.add_argument("--local", action="store_true"); search_parser.add_argument("--scope", choices=("repository", "memory", "all"), default="repository"); search_parser.add_argument("--json", action="store_true")
     get_parser = common("get"); get_parser.add_argument("result_id"); get_parser.add_argument("--commit"); get_parser.add_argument("--json", action="store_true")
     explain_parser = common("explain"); explain_parser.add_argument("result_id"); explain_parser.add_argument("--commit"); explain_parser.add_argument("--json", action="store_true")
-    feedback_parser = common("feedback"); feedback_parser.add_argument("result_id"); feedback_parser.add_argument("--note", required=True); feedback_parser.add_argument("--rating"); feedback_parser.add_argument("--json", action="store_true")
+    feedback_parser = common("feedback"); feedback_parser.add_argument("result_id"); feedback_parser.add_argument("--note", required=True); feedback_parser.add_argument("--rating"); feedback_parser.add_argument("--feedback-id"); feedback_parser.add_argument("--json", action="store_true")
     promote_parser = common("promote"); promote_parser.add_argument("--input", required=True); promote_parser.add_argument("--json", action="store_true")
+    publish_parser = common("publish"); publish_parser.add_argument("--input", required=True); publish_parser.add_argument("--status", choices=("candidate", "active"), default="candidate"); publish_parser.add_argument("--json", action="store_true")
+    activate_parser = common("team-activate"); activate_parser.add_argument("--id", required=True); activate_parser.add_argument("--reviewer"); activate_parser.add_argument("--json", action="store_true")
+    export_parser = common("team-export"); export_parser.add_argument("--output", required=True); export_parser.add_argument("--json", action="store_true")
+    import_parser = common("team-import"); import_parser.add_argument("--input", required=True); import_parser.add_argument("--json", action="store_true")
+    context_parser = common("context"); context_parser.add_argument("query"); context_parser.add_argument("--limit", type=int, default=5); context_parser.add_argument("--repo"); context_parser.add_argument("--issue"); context_parser.add_argument("--branch"); context_parser.add_argument("--agent"); context_parser.add_argument("--local", action="store_true"); context_parser.add_argument("--json", action="store_true")
+    supersede_parser = common("supersede"); supersede_parser.add_argument("--id", required=True); supersede_parser.add_argument("--input", required=True); supersede_parser.add_argument("--json", action="store_true")
     ingest_parser = common("ingest-session"); ingest_parser.add_argument("--input", required=True); ingest_parser.add_argument("--json", action="store_true")
     capture_parser = common("capture-turn"); capture_parser.add_argument("--input", required=True); capture_parser.add_argument("--json", action="store_true")
-    init_parser = sub.add_parser("init"); init_parser.add_argument("--path", required=True); init_parser.add_argument("--id", dest="source_id"); init_parser.add_argument("--repository"); init_parser.add_argument("--profile"); init_parser.add_argument("--no-sync", action="store_true"); init_parser.add_argument("--json", action="store_true")
-    source_parser = sub.add_parser("source"); source_parser.add_argument("action", choices=("add", "list", "remove")); source_parser.add_argument("--path"); source_parser.add_argument("--id", dest="source_id"); source_parser.add_argument("--repository"); source_parser.add_argument("--profile"); source_parser.add_argument("--no-sync", action="store_true"); source_parser.add_argument("--json", action="store_true")
+    init_parser = sub.add_parser("init"); init_parser.add_argument("--path", required=True); init_parser.add_argument("--id", dest="source_id"); init_parser.add_argument("--repository"); init_parser.add_argument("--profile"); init_parser.add_argument("--local-only", action="store_true"); init_parser.add_argument("--no-sync", action="store_true"); init_parser.add_argument("--json", action="store_true")
+    source_parser = sub.add_parser("source"); source_parser.add_argument("action", choices=("add", "list", "remove")); source_parser.add_argument("--path"); source_parser.add_argument("--id", dest="source_id"); source_parser.add_argument("--repository"); source_parser.add_argument("--profile"); source_parser.add_argument("--local-only", action="store_true"); source_parser.add_argument("--no-sync", action="store_true"); source_parser.add_argument("--json", action="store_true")
     evaluate_parser = common("evaluate"); evaluate_parser.add_argument("--queries", required=True); evaluate_parser.add_argument("--qrels", required=True); evaluate_parser.add_argument("--limit", type=int, default=5); evaluate_parser.add_argument("--deep", action="store_true"); evaluate_parser.add_argument("--local", action="store_true"); evaluate_parser.add_argument("--scope", choices=("repository", "memory", "all"), default="repository"); evaluate_parser.add_argument("--revision"); evaluate_parser.add_argument("--fallback-only", action="store_true"); evaluate_parser.add_argument("--json", action="store_true")
+    team_evaluate_parser = common("team-evaluate"); team_evaluate_parser.add_argument("--records", required=True); team_evaluate_parser.add_argument("--queries", required=True); team_evaluate_parser.add_argument("--qrels", required=True); team_evaluate_parser.add_argument("--limit", type=int, default=5); team_evaluate_parser.add_argument("--gate", action="store_true"); team_evaluate_parser.add_argument("--min-p1", type=float, default=1.0); team_evaluate_parser.add_argument("--min-recall", type=float, default=1.0); team_evaluate_parser.add_argument("--min-negative", type=float, default=1.0); team_evaluate_parser.add_argument("--max-candidate-contamination", type=float, default=0.0); team_evaluate_parser.add_argument("--json", action="store_true")
     memorycore = sub.add_parser("memorycore")
     memorycore.add_argument("action", choices=["configure", "install", "start", "stop", "status", "promote-l3"])
     memorycore.add_argument("--memorycore-root")
@@ -1161,11 +1379,55 @@ def _mcp_dispatch(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         return search(root, str(arguments.get("query") or ""), int(arguments.get("limit") or 5), bool(arguments.get("deep")), source, bool(arguments.get("local")), str(arguments.get("scope") or "repository"))
     if name == "memory_get":
         return get_result(root, str(arguments.get("id") or ""), expected_commit=str(arguments.get("commit") or "") or None)
+    if name == "memory_context":
+        return memory_context(root, str(arguments.get("query") or ""), limit=int(arguments.get("limit") or 5), source_id=source, repo=str(arguments.get("repo") or "") or None, issue=str(arguments.get("issue") or "") or None, branch=str(arguments.get("branch") or "") or None, agent=str(arguments.get("agent") or "") or None, local=bool(arguments.get("local")))
+    if name == "memory_team_sync":
+        mode = str(arguments.get("mode") or "status").lower()
+        if mode == "export":
+            output = str(arguments.get("output") or "").strip()
+            if not output:
+                raise ValueError("memory_team_sync export requires output")
+            return export_team_memory(output)
+        if mode == "import":
+            source_path = str(arguments.get("input") or "").strip()
+            if not source_path:
+                raise ValueError("memory_team_sync import requires input")
+            return import_team_memory(source_path)
+        return {"schema_version": SCHEMA_VERSION, "ok": True, "operation": "team-memory-status", "backend": team_memory_store().health(), "canonical_repo_changed": False}
+    if name == "memory_team_activate":
+        return activate_memory(str(arguments.get("id") or ""), str(arguments.get("reviewer") or "") or None)
+    if name == "memory_publish":
+        if "memory" not in arguments:
+            raise ValueError("memory_publish requires memory")
+        payload = arguments.get("memory")
+        data_dir = data_root() / "incoming"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", prefix="team-memory-", dir=data_dir, delete=False) as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+            path = Path(handle.name)
+        try:
+            return publish_memory(str(path), status=str(arguments.get("status") or "candidate"))
+        finally:
+            path.unlink(missing_ok=True)
+    if name == "memory_feedback":
+        return feedback(root, str(arguments.get("id") or ""), str(arguments.get("note") or ""), str(arguments.get("rating") or "helpful"), str(arguments.get("feedback_id") or "") or None)
+    if name == "memory_supersede":
+        if "memory" not in arguments:
+            raise ValueError("memory_supersede requires memory")
+        data_dir = data_root() / "incoming"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", prefix="team-memory-replacement-", dir=data_dir, delete=False) as handle:
+            json.dump(arguments.get("memory"), handle, ensure_ascii=False)
+            path = Path(handle.name)
+        try:
+            return supersede_memory(str(arguments.get("id") or ""), str(path))
+        finally:
+            path.unlink(missing_ok=True)
     if name == "memory_init":
         path = str(arguments.get("path") or "").strip()
         if not path:
             raise ValueError("memory_init requires path")
-        return init_source(path, str(arguments.get("source_id") or "") or None, str(arguments.get("repository") or "") or None, str(arguments.get("profile") or "") or None, bool(arguments.get("sync", True)))
+        return init_source(path, str(arguments.get("source_id") or "") or None, str(arguments.get("repository") or "") or None, str(arguments.get("profile") or "") or None, bool(arguments.get("sync", True)), bool(arguments.get("local_only")))
     if name == "memory_ingest":
         if "session" not in arguments:
             raise ValueError("memory_ingest requires session")
@@ -1186,7 +1448,8 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
                     arguments = {**arguments, "root": configured_root}
                 return _mcp_dispatch(name, arguments)
             return serve(dispatch)
-        root = None if args.command in {"init", "source", "doctor", "sync", "search", "get", "explain", "feedback", "promote", "ingest-session", "capture-turn"} else resolve_root(root_arg)
+        gate_failed = False
+        root = None if args.command in {"init", "source", "doctor", "sync", "search", "get", "explain", "feedback", "promote", "publish", "team-activate", "team-export", "team-import", "team-evaluate", "context", "supersede", "ingest-session", "capture-turn"} else resolve_root(root_arg)
         if args.command in {"init", "source"} and root_arg:
             root = resolve_root(root_arg)
         if args.command == "doctor":
@@ -1200,9 +1463,39 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
         elif args.command == "explain":
             value = get_result(root if root_arg else None, args.result_id, explain=True, expected_commit=args.commit)
         elif args.command == "feedback":
-            value = feedback(root, args.result_id, args.note, args.rating)
+            value = feedback(root, args.result_id, args.note, args.rating, args.feedback_id)
         elif args.command == "promote":
             value = promote(root, args.input)
+        elif args.command == "publish":
+            value = publish_memory(args.input, status=args.status)
+        elif args.command == "team-activate":
+            value = activate_memory(args.id, args.reviewer)
+        elif args.command == "team-export":
+            value = export_team_memory(args.output)
+        elif args.command == "team-import":
+            value = import_team_memory(args.input)
+        elif args.command == "team-evaluate":
+            from team_memory_eval import evaluate_team_memory
+
+            value = evaluate_team_memory(Path(args.records).expanduser(), Path(args.queries).expanduser(), Path(args.qrels).expanduser(), limit=args.limit)
+            if args.gate:
+                metrics = value["metrics"]
+                failures = []
+                if metrics["precision_at_1"] < args.min_p1:
+                    failures.append(f"precision_at_1 {metrics['precision_at_1']:.4f} < {args.min_p1:.4f}")
+                if metrics["recall_at_5"] < args.min_recall:
+                    failures.append(f"recall_at_5 {metrics['recall_at_5']:.4f} < {args.min_recall:.4f}")
+                if metrics["negative_abstain_accuracy"] < args.min_negative:
+                    failures.append(f"negative_abstain_accuracy {metrics['negative_abstain_accuracy']:.4f} < {args.min_negative:.4f}")
+                if metrics["candidate_contamination"] > args.max_candidate_contamination:
+                    failures.append(f"candidate_contamination {metrics['candidate_contamination']:.4f} > {args.max_candidate_contamination:.4f}")
+                gate_failed = bool(failures)
+                value["ok"] = not gate_failed
+                value["gate"] = {"passed": not gate_failed, "failures": failures, "thresholds": {"min_p1": args.min_p1, "min_recall": args.min_recall, "min_negative": args.min_negative, "max_candidate_contamination": args.max_candidate_contamination}}
+        elif args.command == "context":
+            value = memory_context(root if root_arg else None, args.query, limit=args.limit, source_id=getattr(args, "source", None), repo=args.repo, issue=args.issue, branch=args.branch, agent=args.agent, local=args.local)
+        elif args.command == "supersede":
+            value = supersede_memory(args.id, args.input)
         elif args.command == "ingest-session":
             value = ingest_session(root if root_arg else None, args.input, getattr(args, "source", None))
         elif args.command == "capture-turn":
@@ -1214,14 +1507,14 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
                 payload = [json.loads(line) for line in raw.splitlines() if line.strip()]
             value = capture_turn(root if root_arg else None, payload, getattr(args, "source", None))
         elif args.command == "init":
-            value = init_source(args.path, args.source_id, args.repository, args.profile, not args.no_sync)
+            value = init_source(args.path, args.source_id, args.repository, args.profile, not args.no_sync, args.local_only)
         elif args.command == "source":
             if args.action == "list":
                 value = source_list()
             elif args.action == "add":
                 if not args.path:
                     raise RuntimeError("source add requires --path")
-                value = init_source(args.path, args.source_id, args.repository, args.profile, not args.no_sync)
+                value = init_source(args.path, args.source_id, args.repository, args.profile, not args.no_sync, args.local_only)
             elif args.action == "remove":
                 if not args.source_id:
                     raise RuntimeError("source remove requires --id")
@@ -1255,7 +1548,7 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
         else:
             raise RuntimeError(f"unknown command: {args.command}")
         print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
-        return 0
+        return 1 if gate_failed else 0
     except (OSError, RuntimeError, TypeError, AdapterError) as exc:
         print(json.dumps({"schema_version": SCHEMA_VERSION, "ok": False, "error": str(exc)}, ensure_ascii=False, indent=2))
         return 2

@@ -82,12 +82,13 @@ function isExplicitDirectOperation(prompt) {
 function isMaintenancePrompt(prompt) {
   if (!prompt) return false;
   if (isExplicitDirectOperation(prompt)) return true;
-  return /修复|实现|重构|审计|审核|评审|检查代码|改代码|开发|调试|(?:测试)(?:代码|用例|失败|一下|这个)|(?:验证)(?:修复|结果是否|一下|这个)|生成|写入|写日报|更新日报|(?:更新)(?:代码|分支|上去|一下|这个)|创建|修改|删除|安装|升级|(?:提交)(?:代码|变更|这个分支|到|上去|PR)|推送|合并|rebase|重启|启动|停止|排查|诊断|运行|执行|同步|拉取|交付|交了|整理|发布|部署|fix|implement|refactor|audit|review|(?:test)\s+(?:code|suite|failure)|verify\s+(?:the\s+)?(?:fix|result)|generate|write|update\s+(?:code|branch|report)|create|modify|delete|install|upgrade|commit\s+(?:changes|this|the\s+branch)|push|merge|restart|start|stop|diagnose|run|sync|deploy/i.test(prompt);
+  return /修复|实现|重构|审计|审核|评审|检查代码|改代码|开发|调试|(?:测试)(?:代码|用例|失败|一下|这个)|(?:验证)(?:修复|结果是否|一下|这个)|生成|写入|写日报|更新日报|(?:更新)(?:代码|分支|上去|一下|这个|报告)|创建|修改|删除|安装|升级|(?:提交)(?:代码|变更|这个分支|到|上去|PR)|推送|合并|rebase|重启|启动|停止|排查|诊断|交付|交了|整理|发布|部署|fix|implement|refactor|audit|review|(?:test)\s+(?:code|suite|failure)|verify\s+(?:the\s+)?(?:fix|result)|generate|write|update\s+(?:code|branch|report)|create|modify|delete|install|upgrade|commit\s+(?:changes|this|the\s+branch)|push|merge|restart|start|stop|diagnose|deploy/i.test(prompt)
+    || /(?:运行|执行)\s*(?:命令|测试|脚本|任务|用例|pytest|npm|一下)|(?:同步|拉取)\s*(?:仓库|分支|源|代码|文件|一下)|\b(?:run|sync)\s+(?:tests?|commands?|scripts?|repo(?:sitory)?|branch)/i.test(prompt);
 }
 
 function isRepositoryFactPrompt(prompt) {
   if (!prompt || isMaintenancePrompt(prompt)) return false;
-  return /记忆|知识库|仓库|代码库|实验结果|评测结果|日报|周报|历史报告|研究结论|最近在做|最近做了什么|上次|之前|进展|状态|根据记录|来源|证据|citation|repository|repo\b|experiment|evaluation|benchmark|latest|recent|history|report|according to/i.test(prompt);
+  return /记忆|知识库|仓库|代码库|实验结果|评测结果|日报|周报|历史报告|研究结论|最近|最新|运行结果|最近在做|最近做了什么|上次|之前|进展|状态|根据记录|来源|证据|citation|repository|repo\b|experiment|evaluation|benchmark|latest|recent|history|report|according to/i.test(prompt);
 }
 
 function promptPolicy(prompt) {
@@ -105,16 +106,47 @@ function bareHostMemoryTool(toolName) {
   return toolName === "memory_search" || toolName === "memory_get";
 }
 
-function directTool(toolName) {
-  const name = String(toolName || "").toLowerCase();
-  if (["read", "exec", "code_mode_exec", "write", "edit", "apply_patch", "file_read", "file_write", "file_edit", "delete", "shell", "terminal", "git"].includes(name)) return true;
-  if (/(?:^|[._-])(?:fs|filesystem|file)(?:$|[._-])/.test(name)) return true;
-  return /(?:^|[._-])(exec|shell|terminal|bash|zsh|python|read|write|edit|patch|file|git)(?:$|[._-])/.test(name);
+function directToolKind(toolName) {
+  const name = String(toolName || "").toLowerCase().trim();
+  const fileReadNames = new Set([
+    "read",
+    "file_read",
+    "read_file",
+    "filesystem.readfile",
+    "filesystem.read_file",
+    "fs.readfile",
+    "fs.read_file",
+  ]);
+  if (fileReadNames.has(name)) return "file-read";
+  if (/(?:^|[._:-])(?:filesystem|fs|file)(?:[._:-])(?:read|readfile|read_file)$/.test(name)) return "file-read";
+
+  // Only recognize an actual shell/code execution surface.  Do not classify
+  // arbitrary tools such as ``file_search`` or ``gitlab_search`` as direct
+  // access merely because their names contain a matching substring.
+  if (["exec", "shell", "terminal", "bash", "zsh", "python", "python3", "code_mode_exec", "code.exec", "git"].includes(name)) return "shell";
+  if (/(?:^|[._:-])(?:exec|shell|terminal|bash|zsh)$/.test(name)) return "shell";
+  return null;
 }
 
 function directToolInput(event) {
   const params = event?.params && typeof event.params === "object" ? event.params : {};
-  return text(params.command || params.cmd || params.script || params.code || params.input || "").trim();
+  const toolName = String(event?.toolName || "").toLowerCase();
+  const value = params.command || params.cmd || params.script || params.code || params.input || params.path || params.file || params.args || "";
+  return `${toolName === "git" && params.args ? "git " : ""}${text(value)}`.trim();
+}
+
+function isEvidenceReadCommand(command) {
+  if (!command) return false;
+  // These are high-confidence source-reading commands.  Generic exec such as
+  // pytest, npm, make, git status, or a build command remains available even
+  // during a repository-fact turn.
+  if (/(?:^|[;&|]\s*)(?:cat|sed|grep|rg|awk|head|tail|less|more|bat)\b/i.test(command)) return true;
+  if (/(?:^|[;&|]\s*)git\s+(?:show|log|grep)\b/i.test(command)) return true;
+  return /\b(?:open|read_text|read_bytes|readFile|readFileSync)\s*\(/i.test(command);
+}
+
+function isDestructiveCommand(command) {
+  return /\b(?:rm|rmdir|mkfs|shutdown|reboot|kill\s+-9|git\s+(?:reset|clean|checkout\s+--|rebase|push))\b/i.test(command);
 }
 
 function isSafeRecoveryCommand(command) {
@@ -175,9 +207,10 @@ function isResultPayload(value) {
 function resultCounts(value) {
   const result = parseResult(value);
   const verified = Array.isArray(result.verified) ? result.verified : Array.isArray(result.results) ? result.results : [];
+  const contextEvidence = Array.isArray(result.context?.repository_evidence) ? result.context.repository_evidence : [];
   const groups = result.groups && typeof result.groups === "object" ? Object.values(result.groups) : [];
   const groupedVerified = groups.flatMap((group) => Array.isArray(group?.verified) ? group.verified : []);
-  const items = groupedVerified.length ? groupedVerified : verified;
+  const items = groupedVerified.length ? groupedVerified : contextEvidence.length ? contextEvidence : verified;
   const citations = items.filter((item) => item?.citation?.valid === true || item?.citation_valid === true).length;
   const freshnessValue = result.freshness;
   const freshness = freshnessValue && typeof freshnessValue === "object"
@@ -262,7 +295,7 @@ function runCapture(cfg, payload) {
 export default {
   id: PLUGIN_ID,
   name: "Repository Memory Auto Capture and Guard",
-  description: "Enforce repository-memory evidence routing and capture completed turns into the shared L0-L2 pipeline.",
+  description: "Audit repository-memory evidence and capture reusable shared team memory without blocking normal agent work.",
   register(api) {
     const raw = api.pluginConfig && typeof api.pluginConfig === "object" ? api.pluginConfig : {};
     const cfg = {
@@ -271,6 +304,11 @@ export default {
       runtime: raw.runtime,
       auditPath: raw.auditPath,
       repoToolPrefix: typeof raw.repoToolPrefix === "string" ? raw.repoToolPrefix : "repository-memory__",
+      // Audit is the usable default: preserve routing receipts without
+      // deadlocking diagnostics or ordinary work when a backend is slow.
+      // ``enforcement`` is retained for config compatibility, but the guard
+      // itself is advisory: it must not become a capability sandbox.
+      enforcement: raw.enforcement === "enforce" ? "enforce" : "audit",
       agentIds: Array.isArray(raw.agentIds) ? raw.agentIds.filter((item) => typeof item === "string") : [],
       maxMessages: Math.max(4, Math.min(64, Number(raw.maxMessages) || 24)),
       maxMessageChars: Math.max(1000, Math.min(50000, Number(raw.maxMessageChars) || 12000)),
@@ -292,6 +330,7 @@ export default {
           doctorCompleted: false,
           doctorFailed: false,
           search: false,
+          context: false,
           searchCompleted: false,
           searchFailed: false,
           get: false,
@@ -312,15 +351,20 @@ export default {
       api.on("before_tool_call", async (event, ctx) => {
         if (!isAllowedAgent(cfg, ctx)) return;
         const toolName = optional(event?.toolName) || "unknown";
-        const key = stateKey(ctx, event);
         const state = agentState(cfg, ctx, event);
         if (bareHostMemoryTool(toolName) && state?.strict) {
-          await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "tool_blocked", tool: toolName, reason: "bare host memory backend is not repository-memory" });
-          return { block: true, blockReason: "Use the namespaced repository-memory MCP tools. A bare host memory_search is not a repository citation source." };
+          await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "tool_audited", tool: toolName, reason: "bare host memory backend is outside the repository-memory evidence plane" });
         }
         if (!state?.strict) return;
         if (repoTool(cfg, toolName, "memory_search")) {
-          if (!state.doctorCompleted) return { block: true, blockReason: "Call repository-memory__memory_doctor and wait for a successful result before repository search." };
+          if (!state.doctorCompleted) {
+            await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "policy_warning", tool: toolName, reason: "repository search started before a successful doctor" });
+          }
+          state.search = true;
+          return;
+        }
+        if (repoTool(cfg, toolName, "memory_context")) {
+          state.context = true;
           state.search = true;
           return;
         }
@@ -333,32 +377,43 @@ export default {
           return;
         }
         if (repoTool(cfg, toolName, "memory_get")) {
-          if (!state.searchCompleted) return { block: true, blockReason: "Call repository-memory__memory_search before memory_get." };
+          if (!state.searchCompleted) {
+            await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "policy_warning", tool: toolName, reason: "memory_get started before repository search" });
+          }
           state.get = true;
           return;
         }
-        if (directTool(toolName)) {
-          const command = directToolInput(event);
-          if (state.searchFailed && isSafeRecoveryCommand(command)) {
-            state.recovery = true;
-            await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "recovery_allowed", tool: toolName, reason: "repository-memory search failed; safe diagnostic/recovery command allowed" });
-            return;
-          }
-          await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "tool_blocked", tool: toolName, reason: "repository-fact request must not bypass MCP" });
-          return { block: true, blockReason: "Repository-fact turns must use repository-memory MCP. Direct file/shell fallback is blocked; after an MCP failure only a safe repository-memory diagnostic/recovery command is allowed." };
+        const directKind = directToolKind(toolName);
+        const command = directToolInput(event);
+        if (directKind === "shell" && state.searchFailed && isSafeRecoveryCommand(command)) {
+          state.recovery = true;
+          await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "recovery_allowed", tool: toolName, reason: "repository-memory search failed; safe diagnostic/recovery command allowed" });
+          return;
+        }
+        const evidenceBypass = directKind === "file-read" || (directKind === "shell" && (isEvidenceReadCommand(command) || isDestructiveCommand(command)));
+        if (evidenceBypass) {
+          await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "tool_audited", tool: toolName, reason: "repository-fact turn used direct file/shell access; final evidence remains the agent's responsibility" });
         }
       }, { priority: 100, timeoutMs: 5000 });
 
       api.on("after_tool_call", async (event, ctx) => {
         if (!isAllowedAgent(cfg, ctx)) return;
         const toolName = optional(event?.toolName) || "unknown";
-        const key = stateKey(ctx, event);
         const state = agentState(cfg, ctx, event);
         const repoSearch = repoTool(cfg, toolName, "memory_search");
+        const contextTool = repoTool(cfg, toolName, "memory_context");
         const result = event?.result ?? event?.output ?? event?.resultText;
-        const counts = repoSearch ? resultCounts(result) : { verified: 0, citations: 0, abstain: false, freshness: null, failed: false };
-        if (repoSearch && event?.error) counts.failed = true;
-        if (repoSearch && state) {
+        const counts = repoSearch || contextTool ? resultCounts(result) : { verified: 0, citations: 0, abstain: false, freshness: null, failed: false };
+        if ((repoSearch || contextTool) && event?.error) counts.failed = true;
+        if ((repoSearch || contextTool) && state) {
+          state.searchCompleted = true;
+          state.searchFailed = counts.failed;
+          state.verified = counts.verified;
+          state.citations = counts.citations;
+          state.abstain = counts.abstain;
+        }
+        if (state && repoTool(cfg, toolName, "memory_context")) {
+          state.context = true;
           state.searchCompleted = true;
           state.searchFailed = counts.failed;
           state.verified = counts.verified;
@@ -391,24 +446,20 @@ export default {
 
       api.on("before_agent_finalize", async (_event, ctx) => {
         if (!isAllowedAgent(cfg, ctx)) return;
-        const key = stateKey(ctx, _event);
         const state = agentState(cfg, ctx, _event);
         if (!state?.strict || state.revisionRequested) return;
         const answer = finalAnswerText(_event);
         const missingReceipt = Boolean(answer) && state.verified > 0 && !hasEvidenceReceipt(answer);
-        const missingAbstain = Boolean(answer) && state.verified === 0 && !state.abstain && !hasExplicitAbstention(answer);
-        if (!state.searchCompleted || (state.verified > 0 && !state.get) || missingReceipt || missingAbstain) {
-          state.revisionRequested = true;
-          await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "finalize_revision", reason: missingReceipt || missingAbstain ? "repository-memory answer receipt incomplete" : "repository-memory sequence incomplete", search_failed: state.searchFailed === true });
-          return {
-            action: "revise",
-            reason: missingReceipt || missingAbstain ? "Repository-memory answer must include an evidence receipt or explicit abstention." : "Repository-memory evidence sequence was not observed.",
-            retry: {
-              instruction: "Use the namespaced repository-memory doctor/search/get tools. If search fails, you may run only a safe repository-memory diagnostic/recovery command; never read files or use an unrelated shell fallback. If no verified citation remains, answer with an explicit abstention.",
-              idempotencyKey: `${key}:repository-memory-guard`,
-              maxAttempts: 1,
-            },
-          };
+        const missingRetrieval = Boolean(answer) && !state.searchCompleted && !hasExplicitAbstention(answer);
+        const emptyRetrieval = Boolean(answer) && state.searchCompleted && state.verified === 0 && !state.abstain && !hasExplicitAbstention(answer);
+        if (missingReceipt || missingRetrieval || emptyRetrieval) {
+          await appendAudit(cfg, {
+            agent: optional(ctx?.agentId) || "main",
+            run_id: optional(ctx?.runId) || null,
+            event: "finalize_warning",
+            reason: missingReceipt ? "repository-memory answer receipt incomplete" : missingRetrieval ? "repository-fact answer had no observed shared-memory retrieval" : "repository-memory answer had no verified result or explicit abstention",
+            search_failed: state.searchFailed === true,
+          });
         }
       }, { priority: 100, timeoutMs: 5000 });
     }
@@ -429,6 +480,7 @@ export default {
         intent: state?.mode || "ordinary",
         doctor: state?.doctor === true,
         search: state?.searchCompleted === true,
+        context: state?.context === true,
         get: state?.get === true,
         recovery: state?.recovery === true,
         verified: Number(state?.verified || 0),

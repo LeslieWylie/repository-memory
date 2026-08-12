@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/LeslieWylie/repository-memory/schema/doctor-v4.json",
+  "title": "Repository Memory doctor result",
+  "type": "object",
+  "required": ["schema_version", "status", "repository", "routing"],
+  "properties": {
+    "schema_version": { "const": 4 },
+    "status": { "type": "string", "enum": ["ready", "degraded"] },
+    "repository": { "type": "object" },
+    "memory": { "type": ["object", "array"] },
+    "team_memory": { "type": "object" },
+    "routing": { "type": "object" },
+    "agents": { "type": "object" },
+    "sources": { "type": "array" },
+    "actions": { "type": "array" }
+  }
+}

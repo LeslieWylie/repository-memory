@@ -5,6 +5,7 @@ import json
 import os
 import stat
 import subprocess
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -20,7 +21,10 @@ from citation import locate, validate
 from evaluate import evaluate_queries
 from fallback import paths, query_terms
 from memorycore import MemoryCoreClient, MemoryCoreConfig
-from snapshot import _snapshot_lock, fcntl, prepare_view
+from mcp_server import SERVER_VERSION
+from snapshot import _snapshot_lock, prepare_view, snapshot_lock_backend
+from team_memory import TeamMemoryStore
+from version import VERSION
 
 from models import SourceSpec
 
@@ -102,6 +106,11 @@ class RepositoryMemoryTest(unittest.TestCase):
     def write_config(self, value: dict):
         self.config.write_text(json.dumps(value), encoding="utf-8")
 
+    def test_runtime_version_comes_from_skill_version_file(self):
+        self.assertEqual(SERVER_VERSION, VERSION)
+        self.assertEqual(VERSION, (SCRIPTS.parent / "VERSION").read_text(encoding="utf-8").strip())
+        self.assertEqual(VERSION, "0.2.0")
+
     def test_multisource_search_has_verified_and_candidates(self):
         result = core.search(None, "Atlas evidence", limit=5)
         self.assertFalse(result["abstain"])
@@ -134,6 +143,19 @@ class RepositoryMemoryTest(unittest.TestCase):
         dirty_result = core.search(None, "Atlas evidence", local=True)
         self.assertTrue(dirty_result["abstain"])
         self.assertTrue(all(".env" not in item["path"] for item in dirty_result["candidates"]))
+
+    def test_local_only_source_is_fresh_without_remote_fetch(self):
+        self.write_config({
+            "sources": [{"id": "alpha", "root": str(self.alpha), "local_only": True}],
+        })
+
+        result = core.search(None, "Atlas evidence")
+
+        self.assertFalse(result["abstain"])
+        self.assertEqual(result["verified"][0]["citation"]["valid"], True)
+        self.assertEqual(result["freshness"]["alpha"]["state"], "fresh")
+        self.assertEqual(result["freshness"]["alpha"]["commit_type"], "local_worktree")
+        self.assertIsNone(result["freshness"]["alpha"]["fetch_error"])
 
     def test_default_index_filters_operational_templates_but_deep_can_include_them(self):
         (self.alpha / "templates").mkdir()
@@ -222,8 +244,8 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertTrue(source["state"]["dirty"])
 
     def test_shared_snapshot_lock_serializes_concurrent_clients(self):
-        if fcntl is None:
-            self.skipTest("snapshot locking requires fcntl")
+        if snapshot_lock_backend() == "unavailable":
+            self.skipTest("snapshot locking backend unavailable")
         target = Path(self.temp.name) / "shared-snapshot"
         holder_entered = threading.Event()
         release_holder = threading.Event()
@@ -272,6 +294,218 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertFalse(promoted["canonical_repo_changed"])
         self.assertEqual(before_status, after_status)
 
+    def test_shared_team_memory_context_lifecycle_and_feedback(self):
+        record_input = Path(self.temp.name) / "team-memory.json"
+        record_input.write_text(json.dumps({
+            "type": "decision",
+            "title": "Use isolated worktrees",
+            "content": "Each issue uses an isolated persistent worktree; do not work from the canonical clone.",
+            "scope": {"repo": "alpha", "issue": "A-42"},
+            "provenance": {"agent": "planner", "commits": ["abc1234"]},
+            "confidence": 0.9,
+            "status": "active",
+        }), encoding="utf-8")
+        published = core.publish_memory(str(record_input), status="active")
+        memory = published["published"][0]["memory"]
+        self.assertTrue(memory["id"].startswith("team:decision:"))
+        context = core.memory_context(None, "isolated worktree Atlas evidence", repo="alpha")
+        self.assertTrue(context["context"]["repository_evidence"])
+        self.assertEqual(context["context"]["decisions"][0]["id"], memory["id"])
+        self.assertEqual(context["retrieval_mode"], "multi-source-lexical")
+        self.assertTrue(context["diagnostics"]["parallel_recall"])
+        self.assertFalse(context["semantic_available"])
+
+        feedback = core.feedback(None, memory["id"], "reused successfully", "helpful")
+        self.assertTrue(feedback["ok"])
+        replacement_input = Path(self.temp.name) / "replacement.json"
+        replacement_input.write_text(json.dumps({
+            "type": "decision",
+            "title": "Use isolated worktrees, updated",
+            "content": "Keep one isolated worktree per issue and record the branch in the handoff.",
+            "scope": {"repo": "alpha", "issue": "A-42"},
+            "provenance": {"agent": "reviewer", "commits": ["def5678"]},
+            "confidence": 0.95,
+        }), encoding="utf-8")
+        superseded = core.supersede_memory(memory["id"], str(replacement_input))
+        replacement_id = superseded["replacement"]["memory"]["id"]
+        self.assertEqual(core.get_result(None, memory["id"])["result"]["status"], "superseded")
+        self.assertEqual(core.get_result(None, replacement_id)["result"]["status"], "active")
+
+    def test_team_memory_expiry_and_feedback_update_lifecycle(self):
+        store = TeamMemoryStore(Path(self.temp.name) / "expiry.sqlite3")
+        expired = store.publish({
+            "type": "decision",
+            "title": "Temporary decision",
+            "content": "Use the temporary runner until the migration finishes.",
+            "status": "active",
+            "valid_until": "2000-01-01T00:00:00+00:00",
+        }, default_status="active")
+        memory_id = expired["memory"]["id"]
+        search = store.search("temporary runner")
+        self.assertEqual(search["active"], [])
+        self.assertEqual(search["diagnostics"]["expired_count"], 1)
+        self.assertTrue(store.get(memory_id)["result"]["expired"])
+        self.assertEqual(store.feedback(memory_id, "wrong", "review rejected", agent="reviewer")["status"], "stale")
+
+        fresh = store.publish({
+            "type": "handoff",
+            "title": "Fresh handoff",
+            "content": "The isolated worktree is ready for the next agent.",
+            "status": "active",
+        }, default_status="active")
+        fresh_id = fresh["memory"]["id"]
+        self.assertEqual(store.feedback(fresh_id, "stale", "old from my lane", agent="agent-a")["status"], "active")
+        self.assertEqual(store.feedback(fresh_id, "stale", "confirmed old", agent="agent-b")["status"], "stale")
+
+    def test_team_memory_concurrent_writers_and_bundle_round_trip(self):
+        path = Path(self.temp.name) / "shared.sqlite3"
+
+        def publish(index: int):
+            return TeamMemoryStore(path).publish({
+                "type": "discovery",
+                "title": f"Concurrent discovery {index}",
+                "content": f"Agent {index} found the shared writer path.",
+                "status": "active",
+                "idempotency_key": f"concurrent-{index}",
+                "author_agent": f"agent-{index}",
+            }, default_status="active")
+
+        errors = []
+        results = []
+
+        def worker(index: int):
+            try:
+                results.append(publish(index))
+            except Exception as exc:  # pragma: no cover - failure is asserted below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(index,)) for index in range(20)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5)
+        self.assertFalse(errors, errors)
+        self.assertEqual(len(results), 20)
+        self.assertEqual(TeamMemoryStore(path).health()["record_count"], 20)
+
+        os.environ["REPOSITORY_MEMORY_TEAM_DB"] = str(path)
+        bundle_path = Path(self.temp.name) / "team-bundle.json"
+        exported = core.export_team_memory(str(bundle_path))
+        self.assertEqual(exported["records"], 20)
+        imported_db = Path(self.temp.name) / "imported.sqlite3"
+        os.environ["REPOSITORY_MEMORY_TEAM_DB"] = str(imported_db)
+        imported = core.import_team_memory(str(bundle_path))
+        self.assertEqual(imported["imported"]["inserted"], 20)
+        self.assertEqual(TeamMemoryStore(imported_db).health()["record_count"], 20)
+
+    def test_team_memory_activation_and_causal_merge_conflict(self):
+        base_path = Path(self.temp.name) / "base.sqlite3"
+        node_a = TeamMemoryStore(base_path, node_id="node-a")
+        candidate = node_a.publish({
+            "id": "team:decision:causal",
+            "type": "decision",
+            "title": "Causal decision",
+            "content": "Use one isolated worktree per issue.",
+            "status": "candidate",
+            "author_agent": "agent-a",
+        })
+        memory_id = candidate["memory"]["id"]
+        candidate_bundle = node_a.export_bundle()
+        activated = node_a.activate(memory_id, reviewer="reviewer-a")
+        self.assertEqual(activated["status"], "active")
+        self.assertEqual(activated["memory"]["revision"], 2)
+        self.assertEqual(activated["memory"]["parent_revision"], "node-a:1")
+        self.assertEqual(activated["memory"]["author_agent"], "agent-a")
+        self.assertEqual(activated["memory"]["reviewed_by"], "reviewer-a")
+        self.assertEqual(activated["memory"]["activated_at"], activated["memory"]["updated_at"])
+
+        node_b = TeamMemoryStore(Path(self.temp.name) / "node-b.sqlite3", node_id="node-b")
+        base_bundle = node_a.export_bundle()
+        self.assertEqual(base_bundle["schema_version"], 3)
+        self.assertEqual(node_b.import_bundle(base_bundle)["imported"]["inserted"], 1)
+        lagging = TeamMemoryStore(Path(self.temp.name) / "lagging.sqlite3", node_id="node-lagging")
+        lagging.import_bundle(candidate_bundle)
+        node_a.feedback(memory_id, "wrong", "A rejected it", agent="reviewer-a")
+        fast_forward = lagging.import_bundle(node_a.export_bundle())
+        self.assertEqual(fast_forward["imported"]["updated"], 1)
+        self.assertEqual(lagging.get(memory_id)["result"]["revision"], 3)
+        self.assertEqual(lagging.get(memory_id)["result"]["status"], "stale")
+        node_b.feedback(memory_id, "stale", "B has not confirmed expiry", agent="reviewer-b")
+        conflict = node_a.import_bundle(node_b.export_bundle())
+        self.assertEqual(conflict["imported"]["conflicts"], 1)
+        self.assertEqual(node_a.get(memory_id)["result"]["status"], "stale")
+        feedback = node_a.feedback(memory_id, "helpful", "stable feedback", agent="reviewer-a", feedback_id="feedback-1")
+        duplicate_feedback = node_a.feedback(memory_id, "helpful", "stable feedback", agent="reviewer-a", feedback_id="feedback-1")
+        self.assertFalse(feedback["duplicate"])
+        self.assertTrue(duplicate_feedback["duplicate"])
+
+        receiver = TeamMemoryStore(Path(self.temp.name) / "receiver.sqlite3", node_id="node-r")
+        receiver.import_bundle(base_bundle)
+        child = TeamMemoryStore(Path(self.temp.name) / "child.sqlite3", node_id="node-c")
+        child.import_bundle(base_bundle)
+        child.feedback(memory_id, "wrong", "causal child", agent="reviewer-c")
+        applied = receiver.import_bundle(child.export_bundle())
+        self.assertEqual(applied["imported"]["updated"], 1)
+        self.assertEqual(receiver.get(memory_id)["result"]["status"], "stale")
+
+    def test_team_memory_public_benchmark_is_isolated_and_measures_top1(self):
+        from team_memory_eval import evaluate_team_memory
+
+        root = Path(__file__).resolve().parents[3]
+        report = evaluate_team_memory(
+            root / "eval/public/team_memory/records.jsonl",
+            root / "eval/public/team_memory/queries.jsonl",
+            root / "eval/public/team_memory/qrels.jsonl",
+        )
+        self.assertEqual(report["metrics"]["precision_at_1"], 1.0)
+        self.assertEqual(report["metrics"]["recall_at_5"], 1.0)
+        self.assertEqual(report["metrics"]["negative_abstain_accuracy"], 1.0)
+        self.assertFalse(report["canonical_repo_changed"])
+        command = [
+            sys.executable,
+            str(SCRIPTS / "repository-memory.py"),
+            "team-evaluate",
+            "--records", str(root / "eval/public/team_memory/records.jsonl"),
+            "--queries", str(root / "eval/public/team_memory/queries.jsonl"),
+            "--qrels", str(root / "eval/public/team_memory/qrels.jsonl"),
+            "--gate", "--json",
+        ]
+        gated = subprocess.run(command, text=True, capture_output=True, check=False)
+        self.assertEqual(gated.returncode, 0, gated.stderr)
+        self.assertTrue(json.loads(gated.stdout)["gate"]["passed"])
+
+    def test_team_memory_migrates_legacy_database_and_backfills_revision_log(self):
+        path = Path(self.temp.name) / "legacy.sqlite3"
+        connection = sqlite3.connect(path)
+        connection.executescript("""
+            CREATE TABLE memories (
+                id TEXT PRIMARY KEY, memory_type TEXT NOT NULL, title TEXT NOT NULL,
+                content TEXT NOT NULL, summary TEXT NOT NULL, scope TEXT NOT NULL,
+                provenance TEXT NOT NULL, confidence REAL NOT NULL, status TEXT NOT NULL,
+                supersedes TEXT, superseded_by TEXT, valid_from TEXT, valid_until TEXT,
+                author_agent TEXT, idempotency_key TEXT UNIQUE, created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE memory_feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, memory_id TEXT NOT NULL,
+                rating TEXT NOT NULL, note TEXT NOT NULL, agent TEXT, created_at TEXT NOT NULL
+            );
+        """)
+        connection.execute("INSERT INTO memories VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (
+            "team:legacy:1", "decision", "Legacy", "Legacy content", "Legacy content", "{}", "{}", 0.5, "active", None, None, None, None, "agent-a", None, "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00",
+        ))
+        connection.commit()
+        connection.close()
+        store = TeamMemoryStore(path, node_id="node-migrated")
+        value = store.get("team:legacy:1")["result"]
+        bundle = store.export_bundle()
+        self.assertEqual(value["revision"], 1)
+        self.assertEqual(value["origin_node"], "legacy")
+        self.assertIsNone(value["reviewed_by"])
+        self.assertEqual(bundle["schema_version"], 3)
+        self.assertEqual(len(bundle["revisions"]), 1)
+
+
     def test_mcp_stdio_matches_cli_contract(self):
         command = [sys.executable, str(SCRIPTS / "repository-memory.py"), "mcp", "--root", str(self.alpha)]
         modern_meta = {
@@ -284,6 +518,7 @@ class RepositoryMemoryTest(unittest.TestCase):
             {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {"_meta": modern_meta}},
             {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"_meta": modern_meta, "name": "memory_search", "arguments": {"query": "Atlas evidence"}}},
             {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"_meta": modern_meta, "name": "not-a-memory-tool", "arguments": {"source": "alpha"}}},
+            {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"_meta": modern_meta, "name": "memory_context", "arguments": {"query": "Atlas evidence"}}},
         ]
         process = subprocess.run(command, input="\n".join(json.dumps(item) for item in requests) + "\n", text=True, capture_output=True, check=True)
         responses = [json.loads(line) for line in process.stdout.splitlines() if line.strip()]
@@ -291,13 +526,16 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(responses[0]["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "repository-memory")
         self.assertEqual(responses[0]["result"]["resultType"], "complete")
         self.assertEqual(responses[1]["result"]["resultType"], "complete")
-        self.assertEqual({tool["name"] for tool in responses[1]["result"]["tools"]}, {"memory_doctor", "memory_sync", "memory_search", "memory_get", "memory_init", "memory_ingest"})
+        self.assertEqual({tool["name"] for tool in responses[1]["result"]["tools"]}, {"memory_doctor", "memory_sync", "memory_search", "memory_get", "memory_init", "memory_ingest", "memory_context", "memory_team_sync", "memory_team_activate", "memory_publish", "memory_feedback", "memory_supersede"})
         payload = responses[2]["result"]["structuredContent"]
         self.assertEqual(responses[2]["result"]["resultType"], "complete")
         self.assertIn("verified", payload)
         self.assertIn("candidates", payload)
         self.assertFalse(payload["abstain"])
         self.assertEqual({item["source"] for item in payload["verified"]}, {"alpha"})
+        context_payload = responses[4]["result"]["structuredContent"]
+        self.assertIn("repository_evidence", context_payload["context"])
+        self.assertEqual(context_payload["semantic_available"], False)
         error_data = responses[3]["error"]["data"]
         self.assertEqual(error_data["adapter"], "repository-memory-runtime")
         self.assertEqual(error_data["source"], "alpha")
@@ -415,6 +653,33 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(report["strict_precision_at_1"], 1.0)
         self.assertEqual(report["negative_abstain_accuracy"], 1.0)
         self.assertEqual(report["query_quality"]["quality_counts"]["focused"], 2)
+
+    def test_evaluator_recall_counts_multiple_gold_documents_and_pins_citation_commit(self):
+        queries = Path(self.temp.name) / "multi-gold-queries.jsonl"
+        qrels = Path(self.temp.name) / "multi-gold-qrels.jsonl"
+        queries.write_text(json.dumps({"id": "q1", "query": "Atlas evidence", "intent": "exact", "quality": "focused"}) + "\n", encoding="utf-8")
+        qrels.write_text(
+            "\n".join([
+                json.dumps({"query_id": "q1", "document_id": "alpha:docs/atlas.md", "source": "alpha", "path": "docs/atlas.md", "relevance": 2}),
+                json.dumps({"query_id": "q1", "document_id": "alpha:README.md", "source": "alpha", "path": "README.md", "relevance": 1}),
+            ]) + "\n",
+            encoding="utf-8",
+        )
+        commit = subprocess.check_output(["git", "-C", str(self.alpha), "rev-parse", "HEAD"], text=True).strip()
+        verified = {
+            "id": "alpha:docs/atlas.md",
+            "citation": {"valid": True, "source": "repository", "path": "docs/atlas.md", "line_start": 1, "line_end": 2, "commit": commit},
+        }
+        with patch("evaluate.search", return_value={"verified": [verified], "candidates": [], "abstain": False, "mode": "exact"}):
+            report = evaluate_queries(self.alpha, queries, qrels, local=True)
+        self.assertEqual(report["precision_at_1"], 1.0)
+        self.assertEqual(report["recall_at_5"], 0.5)
+        self.assertEqual(report["recall_at_5_micro"], 0.5)
+        self.assertEqual(report["citation_parseability"], 1.0)
+        mismatched = {**verified, "citation": {**verified["citation"], "commit": "wrong"}}
+        with patch("evaluate.search", return_value={"verified": [mismatched], "candidates": [], "abstain": False, "mode": "exact"}):
+            mismatched_report = evaluate_queries(self.alpha, queries, qrels, local=True)
+        self.assertEqual(mismatched_report["citation_parseability"], 0.0)
 
     def test_memory_layer_metadata_is_preserved_but_citation_still_controls_verification(self):
         view = prepare_view(SourceSpec("alpha", self.alpha, "alpha"), local=True)
@@ -646,10 +911,11 @@ class RepositoryMemoryTest(unittest.TestCase):
         openclaw_config.write_text(json.dumps({
             "agents": {
                 "list": [
-                    {"id": "alpha", "workspace": str(workspaces[0]), "skills": [], "tools": {"alsoAllow": []}},
+                    {"id": "alpha", "workspace": str(workspaces[0]), "skills": ["rlvr-memory"], "tools": {"alsoAllow": []}},
                     {"id": "beta", "workspace": str(workspaces[1])},
                 ]
-            }
+            },
+            "plugins": {"entries": {"rlvr-memory-autocapture": {"enabled": True, "config": {"guardEnabled": True}}}},
         }), encoding="utf-8")
         environment = os.environ.copy()
         environment.update({
@@ -661,6 +927,19 @@ class RepositoryMemoryTest(unittest.TestCase):
             "CLAUDE_CONFIG_DIR": str(machine / ".claude"),
         })
         environment.pop("REPOSITORY_MEMORY_CONFIG", None)
+        missing_selection = subprocess.run([
+            sys.executable,
+            str(SCRIPTS / "install.py"),
+            "--target",
+            "openclaw",
+            "--no-mcp",
+            "--no-verify",
+            "--openclaw-config",
+            str(openclaw_config),
+            "--json",
+        ], text=True, capture_output=True, env=environment)
+        self.assertNotEqual(missing_selection.returncode, 0)
+        self.assertIn("requires --openclaw-agent", missing_selection.stdout)
         installed = subprocess.run([
             sys.executable,
             str(SCRIPTS / "install.py"),
@@ -670,6 +949,9 @@ class RepositoryMemoryTest(unittest.TestCase):
             str(openclaw_config),
             "--source-root",
             str(self.alpha),
+            "--source-local-only",
+            "--openclaw-agent",
+            "alpha",
             "--json",
         ], text=True, capture_output=True, check=True, env=environment)
         report = json.loads(installed.stdout)
@@ -677,8 +959,11 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(report["targets"], ["claude", "codex", "openclaw"])
         self.assertTrue((machine / ".codex" / "skills" / "repository-memory" / "SKILL.md").is_file())
         self.assertTrue((machine / ".claude" / "skills" / "repository-memory" / "SKILL.md").is_file())
-        self.assertTrue(all((workspace / "skills" / "repository-memory" / "SKILL.md").is_file() for workspace in workspaces))
+        self.assertTrue((workspaces[0] / "skills" / "repository-memory" / "SKILL.md").is_file())
+        self.assertFalse((workspaces[1] / "skills" / "repository-memory").exists())
         configured = json.loads(openclaw_config.read_text(encoding="utf-8"))
+        user_config = json.loads((machine / "config" / "repository-memory" / "config.json").read_text(encoding="utf-8"))
+        self.assertTrue(user_config["sources"][0]["local_only"])
         self.assertIn("repository-memory", configured["mcp"]["servers"])
         self.assertEqual(
             Path(configured["plugins"]["load"]["paths"][0]),
@@ -686,11 +971,18 @@ class RepositoryMemoryTest(unittest.TestCase):
         )
         plugin = configured["plugins"]["entries"]["repository-memory-autocapture"]
         self.assertTrue(plugin["config"]["guardEnabled"])
+        self.assertEqual(plugin["config"]["enforcement"], "audit")
+        self.assertEqual(plugin["config"]["agentIds"], ["alpha"])
         self.assertTrue(plugin["hooks"]["allowConversationAccess"])
-        for agent in configured["agents"]["list"]:
-            self.assertIn("repository-memory", agent["skills"])
-            self.assertIn("repository-memory__memory_search", agent["tools"]["alsoAllow"])
-        wrapper = machine / ".local" / "bin" / "repository-memory"
+        self.assertFalse(configured["plugins"]["entries"]["rlvr-memory-autocapture"]["enabled"])
+        alpha = next(agent for agent in configured["agents"]["list"] if agent["id"] == "alpha")
+        beta = next(agent for agent in configured["agents"]["list"] if agent["id"] == "beta")
+        self.assertIn("repository-memory", alpha["skills"])
+        self.assertNotIn("rlvr-memory", alpha["skills"])
+        self.assertIn("repository-memory__memory_search", alpha["tools"]["alsoAllow"])
+        self.assertNotIn("repository-memory", beta.get("skills", []))
+        self.assertNotIn("repository-memory__memory_search", beta.get("tools", {}).get("alsoAllow", []))
+        wrapper = machine / ".local" / "bin" / ("repository-memory.cmd" if os.name == "nt" else "repository-memory")
         self.assertTrue(wrapper.is_file())
         searched = subprocess.run([
             str(wrapper),
@@ -705,6 +997,32 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertFalse(payload["abstain"])
         self.assertEqual(payload["verified"][0]["path"], "docs/atlas.md")
 
+    def test_openclaw_allowlist_is_ready_without_covering_unselected_agents(self):
+        home = Path(self.temp.name) / "openclaw-home"
+        config_path = home / ".openclaw" / "openclaw.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(json.dumps({
+            "agents": {"list": [{"id": "yaole"}, {"id": "other"}]},
+            "mcp": {"servers": {"repository-memory": {}}},
+            "plugins": {"entries": {
+                "repository-memory-autocapture": {"enabled": True, "config": {
+                    "enabled": True,
+                    "guardEnabled": True,
+                    "enforcement": "audit",
+                    "agentIds": ["yaole"],
+                }},
+                "active-memory": {"enabled": False},
+                "memmy-memory": {"enabled": False},
+            }},
+        }), encoding="utf-8")
+        with patch.dict(os.environ, {"HOME": str(home)}):
+            routing = core._openclaw_routing()
+        self.assertEqual(routing["status"], "ready")
+        self.assertEqual(routing["guard"], "advisory")
+        self.assertEqual(routing["agents"]["scope"], "allowlist")
+        self.assertEqual(routing["agents"]["covered"], ["yaole"])
+        self.assertEqual(routing["agents"]["excluded"], ["other"])
+
     def test_mcp_init_is_explicit_and_ingest_accepts_session_payload(self):
         knowledge = Path(self.temp.name) / "mcp-knowledge"
         knowledge.mkdir()
@@ -715,6 +1033,20 @@ class RepositoryMemoryTest(unittest.TestCase):
             result = core._mcp_dispatch("memory_ingest", {"session": {"messages": [{"role": "user", "content": "remember this"}]}, "source": "mcp"})
             self.assertTrue(result["ok"])
             ingest.assert_called_once()
+
+    def test_mcp_shared_team_memory_tools_use_same_runtime(self):
+        published = core._mcp_dispatch("memory_publish", {"memory": {
+            "type": "handoff",
+            "title": "Review handoff",
+            "content": "Review the isolated worktree decision before changing the runner.",
+            "scope": {"repo": "alpha", "issue": "A-7"},
+            "provenance": {"agent": "coder"},
+        }, "status": "active"})
+        memory_id = published["published"][0]["memory"]["id"]
+        context = core._mcp_dispatch("memory_context", {"query": "isolated worktree runner", "repo": "alpha"})
+        self.assertEqual(context["context"]["handoffs"][0]["id"], memory_id)
+        feedback = core._mcp_dispatch("memory_feedback", {"id": memory_id, "rating": "helpful", "note": "used"})
+        self.assertTrue(feedback["ok"])
 
     def test_memory_scope_works_without_repository_source(self):
         client = Mock()
@@ -766,6 +1098,28 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertTrue(fetched["found"])
         self.assertEqual(fetched["source"], "local-memory")
         self.assertFalse(subprocess.check_output(["git", "-C", str(self.alpha), "status", "--porcelain"], text=True))
+
+    def test_capture_turn_creates_one_team_candidate_without_accepting_it(self):
+        self.write_config({})
+        os.environ["REPOSITORY_MEMORY_AUTODISCOVER"] = "0"
+        payload = {
+            "session_id": "capture-session",
+            "run_id": "capture-run",
+            "agent_id": "coder",
+            "messages": [
+                {"role": "user", "content": "记录这次决定"},
+                {"role": "assistant", "content": "决定：每个 issue 使用独立 worktree，避免共享 canonical clone。"},
+            ],
+        }
+        first = core.capture_turn(None, payload)
+        second = core.capture_turn(None, payload)
+        self.assertTrue(first["ok"])
+        self.assertEqual(first["team_memory"]["status"], "candidate")
+        self.assertTrue(first["team_memory"]["created"])
+        self.assertTrue(second["duplicate"])
+        context = core.memory_context(None, "独立 worktree canonical clone")
+        self.assertEqual(context["context"]["team_memory"], [])
+        self.assertTrue(context["context"]["team_candidates"])
 
     def test_memory_ingest_does_not_require_repository_source(self):
         client = Mock()

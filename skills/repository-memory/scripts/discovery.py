@@ -206,6 +206,7 @@ def _source_from_item(item: dict[str, Any], fallback_root: Path) -> SourceSpec:
         remote=str(item.get("remote") or "") or None,
         branch=str(item.get("branch") or "") or None,
         profile=str(item.get("profile") or "") or None,
+        local_only=bool(item.get("local_only", item.get("localOnly", False))),
     )
 
 
@@ -252,7 +253,13 @@ def _write_config(config: dict[str, Any]) -> Path:
     return path
 
 
-def add_source(path: str, source_id: str | None = None, repository: str | None = None, profile: str | None = None) -> dict[str, Any]:
+def add_source(
+    path: str,
+    source_id: str | None = None,
+    repository: str | None = None,
+    profile: str | None = None,
+    local_only: bool = False,
+) -> dict[str, Any]:
     root = Path(path).expanduser().resolve()
     if not is_configured_source(root):
         raise RuntimeError(f"source is not a readable knowledge directory: {root}")
@@ -262,6 +269,8 @@ def add_source(path: str, source_id: str | None = None, repository: str | None =
     item = {"id": identifier, "root": str(root), "repository": str(repository or identifier)}
     if profile:
         item["profile"] = profile
+    if local_only:
+        item["local_only"] = True
     replaced = False
     updated = []
     for existing in configured:
@@ -276,7 +285,15 @@ def add_source(path: str, source_id: str | None = None, repository: str | None =
         updated.append(item)
     config["sources"] = updated
     config_path_value = _write_config(config)
-    return {"id": identifier, "root": str(root), "repository": item["repository"], "profile": profile, "config": str(config_path_value), "canonical_repo_changed": False}
+    return {
+        "id": identifier,
+        "root": str(root),
+        "repository": item["repository"],
+        "profile": profile,
+        "local_only": bool(item.get("local_only", False)),
+        "config": str(config_path_value),
+        "canonical_repo_changed": False,
+    }
 
 
 def remove_source(source_id: str) -> dict[str, Any]:
@@ -313,18 +330,25 @@ def adapter_config(spec: SourceSpec) -> dict[str, Any]:
 
 
 def configured_adapter(spec: SourceSpec) -> Path | None:
-    if os.environ.get("REPOSITORY_MEMORY_DISABLE_ADAPTER", "").lower() in {"1", "true", "yes"}:
-        return None
     values = adapter_config(spec)
-    candidates: list[Path] = []
+    explicitly_configured: list[Path] = []
     if spec.adapter:
-        candidates.append(Path(spec.adapter).expanduser())
+        explicitly_configured.append(Path(spec.adapter).expanduser())
+    for key in ADAPTER_CONFIG_KEYS:
+        if values.get(key):
+            explicitly_configured.append(Path(str(values[key])).expanduser())
+
+    # CI and shared hosts use this switch to prevent accidental discovery of
+    # a developer's private adapter.  An adapter explicitly attached to the
+    # selected source remains valid: tests and users that deliberately opt in
+    # must not be silently converted to the local fallback.
+    disabled = os.environ.get("REPOSITORY_MEMORY_DISABLE_ADAPTER", "").lower() in {"1", "true", "yes"}
+    candidates: list[Path] = list(explicitly_configured)
+    if disabled:
+        return _first_executable(candidates)
     for env_name in ADAPTER_ENVS:
         if os.environ.get(env_name):
             candidates.append(Path(os.environ[env_name]).expanduser())
-    for key in ADAPTER_CONFIG_KEYS:
-        if values.get(key):
-            candidates.append(Path(str(values[key])).expanduser())
 
     # Do not let an unrelated checkout next to the current directory become a
     # backend for an arbitrary document root.  Explicit config/env adapters
@@ -344,6 +368,10 @@ def configured_adapter(spec: SourceSpec) -> Path | None:
         if found:
             candidates.append(Path(found))
 
+    return _first_executable(candidates)
+
+
+def _first_executable(candidates: list[Path]) -> Path | None:
     seen: set[str] = set()
     for candidate in candidates:
         try:
@@ -353,7 +381,11 @@ def configured_adapter(spec: SourceSpec) -> Path | None:
         if str(resolved) in seen:
             continue
         seen.add(str(resolved))
-        if resolved.is_file() and (resolved.suffix == ".mjs" or os.access(resolved, os.X_OK)):
+        # Windows does not expose Unix execute bits for a configured Python
+        # adapter.  A deliberate .py adapter is still runnable through the
+        # current interpreter; .mjs remains runnable through Node.
+        runnable_script = resolved.suffix.lower() in {".mjs", ".py"}
+        if resolved.is_file() and (runnable_script or os.access(resolved, os.X_OK)):
             return resolved
     return None
 

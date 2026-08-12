@@ -20,9 +20,13 @@ import time
 from pathlib import Path
 from typing import Any
 
+from version import VERSION
+
 SKILL_NAME = "repository-memory"
 MCP_NAME = "repository-memory"
 OPENCLAW_PLUGIN_ID = "repository-memory-autocapture"
+LEGACY_SKILL_NAMES = {"rlvr-memory"}
+LEGACY_OPENCLAW_PLUGIN_IDS = {"rlvr-memory-autocapture"}
 MCP_TOOLS = [
     "memory_doctor",
     "memory_sync",
@@ -30,12 +34,20 @@ MCP_TOOLS = [
     "memory_get",
     "memory_init",
     "memory_ingest",
+    "memory_context",
+    "memory_team_sync",
+    "memory_team_activate",
+    "memory_publish",
+    "memory_feedback",
+    "memory_supersede",
 ]
 OPENCLAW_TOOLS = [f"{MCP_NAME}__{name}" for name in MCP_TOOLS]
 
 
 def _home() -> Path:
-    return Path.home().resolve()
+    # HOME is also used by isolated host tests and by portable agent profiles;
+    # USERPROFILE is the native Windows equivalent when HOME is absent.
+    return Path(os.environ.get("HOME") or os.environ.get("USERPROFILE") or Path.home()).expanduser().resolve()
 
 
 def _data_home() -> Path:
@@ -228,7 +240,13 @@ def _install_claude(canonical: Path, register_mcp: bool) -> dict[str, Any]:
     return {"skill": str(destination), "mcp_registered": registered, "mcp_detail": detail}
 
 
-def _install_openclaw(canonical: Path, runtime: Path, config_path: Path | None = None, agent_ids: list[str] | None = None) -> dict[str, Any]:
+def _install_openclaw(
+    canonical: Path,
+    runtime: Path,
+    config_path: Path | None = None,
+    agent_ids: list[str] | None = None,
+    all_agents: bool = False,
+) -> dict[str, Any]:
     path = config_path or (_home() / ".openclaw" / "openclaw.json")
     if not path.is_file():
         return {"config": str(path), "agents": [], "mcp_registered": False, "detail": "OpenClaw is not configured"}
@@ -241,21 +259,40 @@ def _install_openclaw(canonical: Path, runtime: Path, config_path: Path | None =
     _copy_openclaw_extension(extension_source, extension_destination)
     agents = config.get("agents") if isinstance(config.get("agents"), dict) else {}
     rows = agents.get("list") if isinstance(agents.get("list"), list) else []
+    configured_ids = {
+        str(row.get("id") or Path(str(row.get("workspace") or "")).name)
+        for row in rows
+        if isinstance(row, dict) and row.get("workspace")
+    }
+    selected_ids = configured_ids if all_agents else set(agent_ids or [])
+    if not selected_ids:
+        raise RuntimeError("OpenClaw installation requires --openclaw-agent <id>; use --openclaw-all-agents only when intentional")
+    unknown_ids = selected_ids - configured_ids
+    if unknown_ids:
+        raise RuntimeError(f"OpenClaw agent id(s) not found: {', '.join(sorted(unknown_ids))}")
     installed: list[dict[str, str]] = []
     for row in rows:
         if not isinstance(row, dict) or not row.get("workspace"):
+            continue
+        agent_id = str(row.get("id") or Path(str(row["workspace"])).name)
+        if agent_id not in selected_ids:
             continue
         workspace = Path(str(row["workspace"])).expanduser().resolve()
         destination = workspace / "skills" / SKILL_NAME
         _copy_skill(canonical, destination)
         skills = row.get("skills") if isinstance(row.get("skills"), list) else []
+        # Keep old Skill files available for rollback, but remove their active
+        # registration so the model cannot choose between two memory contracts.
+        skills = [name for name in skills if name not in LEGACY_SKILL_NAMES]
         if SKILL_NAME not in skills:
             row["skills"] = [*skills, SKILL_NAME]
+        else:
+            row["skills"] = skills
         tools = row.get("tools") if isinstance(row.get("tools"), dict) else {}
         allowed = tools.get("alsoAllow") if isinstance(tools.get("alsoAllow"), list) else []
         tools["alsoAllow"] = [*allowed, *(name for name in OPENCLAW_TOOLS if name not in allowed)]
         row["tools"] = tools
-        installed.append({"agent": str(row.get("id") or workspace.name), "skill": str(destination)})
+        installed.append({"agent": agent_id, "skill": str(destination)})
 
     config.setdefault("agents", {})["list"] = rows
     mcp = config.get("mcp") if isinstance(config.get("mcp"), dict) else {}
@@ -281,13 +318,22 @@ def _install_openclaw(canonical: Path, runtime: Path, config_path: Path | None =
         allow.append(OPENCLAW_PLUGIN_ID)
     plugins["allow"] = allow
     entries = plugins.get("entries") if isinstance(plugins.get("entries"), dict) else {}
+    disabled_legacy_plugins: list[str] = []
+    for legacy_id in LEGACY_OPENCLAW_PLUGIN_IDS:
+        if legacy_id == OPENCLAW_PLUGIN_ID:
+            continue
+        legacy = entries.get(legacy_id)
+        if isinstance(legacy, dict) and legacy.get("enabled") is not False:
+            legacy["enabled"] = False
+            disabled_legacy_plugins.append(legacy_id)
     entries[OPENCLAW_PLUGIN_ID] = {
         "enabled": True,
         "config": {
             "enabled": True,
             "guardEnabled": True,
+            "enforcement": "audit",
             "runtime": str(runtime),
-            "agentIds": sorted(set(agent_ids or [])),
+            "agentIds": sorted(selected_ids),
         },
         # OpenClaw requires an explicit opt-in before a non-bundled plugin can
         # receive conversation lifecycle events such as agent_end.
@@ -298,14 +344,17 @@ def _install_openclaw(canonical: Path, runtime: Path, config_path: Path | None =
     backup = path.with_name(f"{path.name}.bak.repository-memory-{int(time.time())}")
     shutil.copy2(path, backup)
     _atomic_json(path, config)
-    return {"config": str(path), "backup": str(backup), "agents": installed, "mcp_registered": True, "autocapture": {"plugin": OPENCLAW_PLUGIN_ID, "extension": str(extension_destination), "agent_ids": sorted(set(agent_ids or []))}}
+    return {"config": str(path), "backup": str(backup), "agents": installed, "mcp_registered": True, "autocapture": {"plugin": OPENCLAW_PLUGIN_ID, "extension": str(extension_destination), "agent_ids": sorted(set(agent_ids or [])), "disabled_legacy_plugins": disabled_legacy_plugins}}
 
 
 def _install_cli(canonical: Path) -> Path:
-    destination = _home() / ".local" / "bin" / "repository-memory"
+    destination = _home() / ".local" / "bin" / ("repository-memory.cmd" if os.name == "nt" else "repository-memory")
     destination.parent.mkdir(parents=True, exist_ok=True)
     script = canonical / "scripts" / "repository-memory.py"
-    wrapper = f"#!/bin/sh\nexec {json.dumps(sys.executable)} {json.dumps(str(script))} \"$@\"\n"
+    if os.name == "nt":
+        wrapper = f'@echo off\n"{sys.executable}" "{script}" %*\n'
+    else:
+        wrapper = f"#!/bin/sh\nexec {json.dumps(sys.executable)} {json.dumps(str(script))} \"$@\"\n"
     temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
     temporary.write_text(wrapper, encoding="utf-8")
     os.chmod(temporary, 0o755)
@@ -313,7 +362,7 @@ def _install_cli(canonical: Path) -> Path:
     return destination
 
 
-def _configure_source(canonical: Path, source_root: Path) -> dict[str, Any]:
+def _configure_source(canonical: Path, source_root: Path, local_only: bool = False) -> dict[str, Any]:
     command = [
         sys.executable,
         str(canonical / "scripts" / "repository-memory.py"),
@@ -324,6 +373,8 @@ def _configure_source(canonical: Path, source_root: Path) -> dict[str, Any]:
         source_root.name,
         "--json",
     ]
+    if local_only:
+        command.insert(-1, "--local-only")
     ok, output = _run(command)
     if not ok:
         raise RuntimeError(f"source initialization failed: {output[:500]}")
@@ -346,7 +397,7 @@ def _verify(canonical: Path, require_repository: bool) -> dict[str, Any]:
 
     modern_meta = {
         "io.modelcontextprotocol/protocolVersion": "2026-07-28",
-        "io.modelcontextprotocol/clientInfo": {"name": "repository-memory-installer", "version": "2.0.0"},
+        "io.modelcontextprotocol/clientInfo": {"name": "repository-memory-installer", "version": VERSION},
         "io.modelcontextprotocol/clientCapabilities": {},
     }
     modern_requests = [
@@ -439,11 +490,12 @@ def install(args: argparse.Namespace) -> dict[str, Any]:
             # point at a different-looking profile than the one supplied.
             Path(args.openclaw_config).expanduser() if args.openclaw_config else None,
             args.openclaw_agent,
+            args.openclaw_all_agents,
         )
 
     source_status = None
     if args.source_root:
-        source_status = _configure_source(canonical, Path(args.source_root).expanduser().resolve())
+        source_status = _configure_source(canonical, Path(args.source_root).expanduser().resolve(), args.source_local_only)
     verification = None if args.no_verify else _verify(canonical, require_repository=bool(args.source_root))
     return {
         "schema_version": 1,
@@ -463,8 +515,10 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--target", action="append", choices=["auto", "all", "codex", "claude", "openclaw"])
     value.add_argument("--all", action="store_true", help="install for Codex, Claude Code, and every configured OpenClaw agent")
     value.add_argument("--source-root", help="register and index a repository or document directory")
+    value.add_argument("--source-local-only", action="store_true", help="declare --source-root as an intentional offline/local snapshot")
     value.add_argument("--openclaw-config", help="override the OpenClaw config path")
-    value.add_argument("--openclaw-agent", action="append", help="agent id allowed to auto-capture; omit to allow all configured agents")
+    value.add_argument("--openclaw-agent", action="append", help="install and enable repository-memory only for this OpenClaw agent; repeat for multiple agents")
+    value.add_argument("--openclaw-all-agents", action="store_true", help="explicitly install and enable repository-memory for every configured OpenClaw agent")
     value.add_argument("--no-mcp", action="store_true", help="install Skills without registering Codex/Claude MCP")
     value.add_argument("--no-verify", action="store_true", help="skip installed doctor and MCP smoke checks")
     value.add_argument("--json", action="store_true")

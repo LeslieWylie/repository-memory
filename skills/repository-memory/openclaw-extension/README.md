@@ -4,16 +4,19 @@ This extension is an adapter, not a second memory store. It listens to the
 OpenClaw `agent_end` lifecycle event and invokes the installed
 `repository-memory capture-turn` runtime asynchronously.
 
-When `guardEnabled` is on, the host policy has three modes:
+When `guardEnabled` is on, the host policy has three intent classes:
 
-- `repository-fact`: doctor → search → get, verified citation or abstention;
+- `repository-fact`: prefer doctor → context/search → get, verified citation or
+  an explicit uncertainty statement;
 - `maintenance`: Git inspection, tests, report generation, and explicit writes
   remain available;
 - `ordinary`: no repository-memory routing requirement.
 
-If a repository search fails, only a narrow, non-destructive runtime diagnostic
-or recovery command is allowed. This prevents an MCP outage from deadlocking
-the repair path without reopening arbitrary file or shell fallback.
+The installer sets `enforcement=audit` by default. The extension records wrong
+routes, missing doctor/search/get steps, direct fallback, and incomplete
+receipts, but does not block the host's tools in either mode. The old
+`enforcement=enforce` value is retained for configuration compatibility; it is
+not a shell sandbox and cannot deadlock repair work.
 
 The write contract is deliberately conservative:
 

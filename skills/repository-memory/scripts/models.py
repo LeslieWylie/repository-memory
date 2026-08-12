@@ -17,6 +17,9 @@ class SourceSpec:
     remote: str | None = None
     branch: str | None = None
     profile: str | None = None
+    # A local-only source is an explicit, user-managed snapshot.  It must not
+    # be treated as a failed remote fetch merely because it has no origin.
+    local_only: bool = False
 
 
 @dataclass

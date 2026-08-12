@@ -1,12 +1,54 @@
+[build-system]
+requires = ["setuptools>=69,<81"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "repository-memory"
-version = "0.1.0"
+version = "0.2.0"
 description = "Citation-first repository memory Skill, CLI, MCP server, and optional MemoryCore adapter"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Repository Memory contributors" }]
 dependencies = []
 
+[project.scripts]
+repository-memory = "repository_memory:cli"
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8,<9",
+  "pytest-cov>=6,<8",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["skills/repository-memory/tests"]
+
+[tool.setuptools]
+package-dir = {"" = "skills/repository-memory/scripts"}
+py-modules = [
+  "adapters",
+  "audit_proxy",
+  "autocapture",
+  "citation",
+  "core",
+  "discovery",
+  "doctor",
+  "eval_gate",
+  "evaluate",
+  "fallback",
+  "index",
+  "install",
+  "local_index",
+  "local_memory",
+  "mcp_server",
+  "memorycore",
+  "memorycore_service",
+  "models",
+  "repository_memory",
+  "snapshot",
+  "team_memory",
+  "team_memory_eval",
+  "version",
+]

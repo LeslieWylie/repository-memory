@@ -16,12 +16,14 @@ import sys
 from collections.abc import Callable, Iterator
 from typing import Any
 
+from version import VERSION
+
 
 MODERN_PROTOCOL = "2026-07-28"
 LEGACY_PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 SUPPORTED_PROTOCOLS = (MODERN_PROTOCOL, *LEGACY_PROTOCOLS)
 SERVER_NAME = "repository-memory"
-SERVER_VERSION = "2.0.0"
+SERVER_VERSION = VERSION
 
 
 def _tool_schema() -> list[dict[str, Any]]:
@@ -30,8 +32,14 @@ def _tool_schema() -> list[dict[str, Any]]:
         {"name": "memory_sync", "description": "Fetch remote snapshots and update derived indexes without changing the worktree. Uses the server-configured root by default.", "inputSchema": {"type": "object", "properties": {"root": {"type": "string", "description": "Optional verified Git repository root; omit to use server discovery."}, "source": {"type": "string"}, "local": {"type": "boolean"}}, "additionalProperties": False}},
         {"name": "memory_search", "description": "Search repository evidence, native conversation memory, or both. Repository is the default; all keeps source groups separate.", "inputSchema": {"type": "object", "required": ["query"], "properties": {"root": {"type": "string", "description": "Optional verified Git repository root; omit to use server discovery."}, "source": {"type": "string"}, "query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 50}, "deep": {"type": "boolean"}, "local": {"type": "boolean"}, "scope": {"type": "string", "enum": ["repository", "memory", "all"], "default": "repository"}}, "additionalProperties": False}},
         {"name": "memory_get", "description": "Resolve a memory result and its source evidence. Pass the result citation commit when pinning the evidence window matters.", "inputSchema": {"type": "object", "required": ["id"], "properties": {"root": {"type": "string", "description": "Optional verified Git repository root; omit to use server discovery."}, "id": {"type": "string"}, "commit": {"type": "string", "description": "Optional commit from the search citation; mismatch returns stale instead of silently reading a newer source."}}, "additionalProperties": False}},
-        {"name": "memory_init", "description": "Explicitly register a user-provided knowledge directory and build its disposable local index. This changes user config/cache only, never canonical files.", "inputSchema": {"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}, "source_id": {"type": "string"}, "repository": {"type": "string"}, "profile": {"type": "string"}, "sync": {"type": "boolean", "default": True}}, "additionalProperties": False}},
+        {"name": "memory_init", "description": "Explicitly register a user-provided knowledge directory and build its disposable local index. This changes user config/cache only, never canonical files.", "inputSchema": {"type": "object", "required": ["path"], "properties": {"path": {"type": "string"}, "source_id": {"type": "string"}, "repository": {"type": "string"}, "profile": {"type": "string"}, "local_only": {"type": "boolean", "description": "Declare an intentional offline/local snapshot; it is fresh relative to its clean commit, not necessarily the latest remote revision."}, "sync": {"type": "boolean", "default": True}}, "additionalProperties": False}},
         {"name": "memory_ingest", "description": "Explicitly ingest a supplied session JSON/JSONL value into the configured memory backend. Never call this during ordinary search.", "inputSchema": {"type": "object", "required": ["session"], "properties": {"root": {"type": "string"}, "source": {"type": "string"}, "session": {}, "source_id": {"type": "string"}}, "additionalProperties": False}},
+        {"name": "memory_context", "description": "Build a task context package from repository evidence and shared Team Memory. Provenance remains separated; no cross-backend score fusion is used.", "inputSchema": {"type": "object", "required": ["query"], "properties": {"root": {"type": "string"}, "source": {"type": "string"}, "query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 50}, "repo": {"type": "string"}, "issue": {"type": "string"}, "branch": {"type": "string"}, "agent": {"type": "string"}, "local": {"type": "boolean"}}, "additionalProperties": False}},
+        {"name": "memory_team_sync", "description": "Explicitly export or import the shared Team Memory bundle. This syncs the Team Memory plane, not repository snapshots; it never edits a canonical repository.", "inputSchema": {"type": "object", "required": ["mode"], "properties": {"mode": {"type": "string", "enum": ["status", "export", "import"]}, "output": {"type": "string"}, "input": {"type": "string"}}, "additionalProperties": False}},
+        {"name": "memory_team_activate", "description": "Explicitly review and activate one Team Memory candidate. Activation is a write and creates a new causal revision.", "inputSchema": {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}, "reviewer": {"type": "string"}}, "additionalProperties": False}},
+        {"name": "memory_publish", "description": "Explicitly publish a compact shared Team Memory record. Default status is candidate; this is a write operation and never edits a canonical repository.", "inputSchema": {"type": "object", "required": ["memory"], "properties": {"memory": {"type": "object"}, "status": {"type": "string", "enum": ["candidate", "active"]}}, "additionalProperties": False}},
+        {"name": "memory_feedback", "description": "Record whether a shared Team Memory result was helpful, stale, wrong, or not helpful. Pass feedback_id for stable cross-machine deduplication.", "inputSchema": {"type": "object", "required": ["id", "rating"], "properties": {"id": {"type": "string"}, "rating": {"type": "string", "enum": ["helpful", "not_helpful", "stale", "wrong"]}, "note": {"type": "string"}, "feedback_id": {"type": "string"}}, "additionalProperties": False}},
+        {"name": "memory_supersede", "description": "Explicitly publish a replacement Team Memory record and mark the old record superseded.", "inputSchema": {"type": "object", "required": ["id", "memory"], "properties": {"id": {"type": "string"}, "memory": {"type": "object"}}, "additionalProperties": False}},
     ]
 
 
@@ -45,7 +53,7 @@ def _discover_result() -> dict[str, Any]:
         "supportedVersions": list(SUPPORTED_PROTOCOLS),
         "capabilities": {"tools": {}},
         "_meta": {"io.modelcontextprotocol/serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION}},
-        "instructions": "Use repository-memory tools for source-backed project evidence. Keep repository and conversation-memory scopes separate.",
+        "instructions": "Use memory_context at task start when shared team knowledge may matter. Keep repository citations distinct from experience, decision, failure, solution, and handoff provenance. Publish only explicit, compact knowledge.",
         "ttlMs": 3600000,
         "cacheScope": "private",
     }

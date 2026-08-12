@@ -4,7 +4,7 @@ Search responses use this shape:
 
 ```json
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "query": "...",
   "mode": "exact|semantic|temporal|cross-source|deep",
   "scope": "repository|memory|all",

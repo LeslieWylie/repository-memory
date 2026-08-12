@@ -47,8 +47,12 @@ def _qrels(qrels: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
     for item in qrels:
         query_id = str(item.get("query_id") or "")
         document_id = str(item.get("document_id") or "")
+        try:
+            relevance = int(item.get("relevance", 0))
+        except (TypeError, ValueError):
+            continue
         if query_id and document_id:
-            grouped[query_id][document_id] = int(item.get("relevance", 0))
+            grouped[query_id][document_id] = relevance
     return dict(grouped)
 
 
@@ -56,15 +60,26 @@ def audit_qrels(root: Path, queries: list[dict[str, Any]], qrels: list[dict[str,
     query_ids = [str(item.get("id") or "") for item in queries]
     known = set(query_ids)
     duplicate_queries = sorted({item for item in query_ids if item and query_ids.count(item) > 1})
+    invalid_query_ids = sorted({item for item in query_ids if not item})
     duplicate_qrels: list[dict[str, str]] = []
     unknown: list[str] = []
     invalid: list[dict[str, str]] = []
+    invalid_relevance: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     for item in qrels:
         query_id = str(item.get("query_id") or "")
         document_id = str(item.get("document_id") or "")
+        if not query_id or not document_id:
+            invalid.append({"query_id": query_id, "document_id": document_id, "reason": "query_id and document_id are required"})
         if query_id not in known:
             unknown.append(query_id)
+        try:
+            relevance = int(item.get("relevance", 0))
+        except (TypeError, ValueError):
+            invalid_relevance.append({"query_id": query_id, "document_id": document_id, "relevance": item.get("relevance")})
+            relevance = 0
+        if relevance < 0:
+            invalid_relevance.append({"query_id": query_id, "document_id": document_id, "relevance": relevance})
         key = (query_id, document_id)
         if key in seen:
             duplicate_qrels.append({"query_id": query_id, "document_id": document_id})
@@ -72,30 +87,42 @@ def audit_qrels(root: Path, queries: list[dict[str, Any]], qrels: list[dict[str,
         source = str(item.get("source") or "")
         path = str(item.get("path") or "")
         expected = f"{source}:{path}" if source and path else ""
-        if scope == "repository" and expected and document_id != expected:
+        if scope == "repository" and not expected:
+            invalid.append({"query_id": query_id, "document_id": document_id, "reason": "repository qrels require source and path"})
+        elif scope == "repository" and document_id != expected:
             invalid.append({"query_id": query_id, "document_id": document_id, "expected": expected})
-        if scope != "memory" and path and not (root / path).is_file():
-            invalid.append({"query_id": query_id, "document_id": document_id, "reason": f"path does not exist: {path}"})
+        if scope != "memory":
+            if not path:
+                invalid.append({"query_id": query_id, "document_id": document_id, "reason": "repository qrels require path"})
+            else:
+                candidate = (root / path).resolve()
+                root_resolved = root.resolve()
+                if root_resolved not in candidate.parents and candidate != root_resolved:
+                    invalid.append({"query_id": query_id, "document_id": document_id, "reason": f"path escapes root: {path}"})
+                elif not candidate.is_file():
+                    invalid.append({"query_id": query_id, "document_id": document_id, "reason": f"path does not exist: {path}"})
     grouped = _qrels(qrels)
     missing = sorted(
         str(item.get("id") or "")
         for item in queries
-        if not item.get("expected_abstain") and not grouped.get(str(item.get("id") or ""))
+        if not item.get("expected_abstain") and not any(value > 0 for value in grouped.get(str(item.get("id") or ""), {}).values())
     )
     negatives_with_gold = sorted(
         str(item.get("id") or "")
         for item in queries
-        if item.get("expected_abstain") and grouped.get(str(item.get("id") or ""))
+        if item.get("expected_abstain") and any(value > 0 for value in grouped.get(str(item.get("id") or ""), {}).values())
     )
-    counts = [len(grouped.get(query_id, {})) for item in queries if not item.get("expected_abstain") for query_id in [str(item.get("id") or "")]]
+    counts = [sum(value > 0 for value in grouped.get(query_id, {}).values()) for item in queries if not item.get("expected_abstain") for query_id in [str(item.get("id") or "")]]
     return {
-        "ok": not (duplicate_queries or duplicate_qrels or unknown or invalid or missing or negatives_with_gold),
+        "ok": not (duplicate_queries or invalid_query_ids or duplicate_qrels or unknown or invalid or invalid_relevance or missing or negatives_with_gold),
         "query_count": len(queries),
         "qrel_count": len(qrels),
         "duplicate_query_ids": duplicate_queries,
+        "invalid_query_ids": invalid_query_ids,
         "duplicate_qrels": duplicate_qrels,
         "unknown_query_ids": sorted(set(unknown)),
         "invalid_document_ids_or_paths": invalid,
+        "invalid_relevance": invalid_relevance,
         "missing_positive_gold": missing,
         "negative_queries_with_gold": negatives_with_gold,
         "positive_gold_count_min": min(counts) if counts else 0,
@@ -117,22 +144,27 @@ def _percentile(values: list[float], fraction: float) -> float:
     return ordered[min(len(ordered) - 1, max(0, int((len(ordered) - 1) * fraction)))]
 
 
-def _citation_valid(root: Path, item: dict[str, Any]) -> bool:
+def _citation_valid(root: Path, item: dict[str, Any], expected_commit: str | None = None) -> bool:
     citation = item.get("citation") if isinstance(item.get("citation"), dict) else {}
     if citation.get("valid") is not True:
         return False
     if citation.get("source") == "memorycore":
         return bool(citation.get("memory_id") and citation.get("layer") in {"L0", "L1", "L2", "L3"})
+    if expected_commit and citation.get("commit") != expected_commit:
+        return False
     path = str(citation.get("path") or "")
     start = citation.get("line_start")
     end = citation.get("line_end")
     if not path or not isinstance(start, int) or not isinstance(end, int) or start < 1 or end < start:
         return False
+    candidate = (root / path).resolve()
+    root_resolved = root.resolve()
+    if root_resolved not in candidate.parents and candidate != root_resolved:
+        return False
     try:
-        return end <= len((root / path).read_text(encoding="utf-8").splitlines())
+        return candidate.is_file() and end <= len(candidate.read_text(encoding="utf-8").splitlines())
     except (OSError, UnicodeDecodeError):
-        # A remote snapshot has already been validated by the runtime.
-        return True
+        return False
 
 
 def _revision_snapshot(root: Path, revision: str) -> tuple[Path, str]:
@@ -214,7 +246,7 @@ def evaluate_queries(root: Path, queries_path: Path, qrels_path: Path, *, limit:
                 "abstain_correct": bool(abstain and not hits) if expected_abstain else None,
                 "verified_count": len(hits),
                 "candidate_count": len(candidates),
-                "citation_valid_count": sum(_citation_valid(evaluated_root, item) for item in hits),
+                "citation_valid_count": sum(_citation_valid(evaluated_root, item, evaluated_commit) for item in hits),
                 "citation_total": len(hits),
                 "latency_ms": round(latency, 3),
                 "mode": result.get("mode"),
@@ -238,6 +270,9 @@ def evaluate_queries(root: Path, queries_path: Path, qrels_path: Path, *, limit:
     verified = sum(row["verified_count"] for row in rows)
     candidates = sum(row["candidate_count"] for row in rows)
     citations = sum(row["citation_valid_count"] for row in rows)
+    p1_hits = sum(int(row["precision_at_1"] or 0) for row in positive)
+    relevant_retrieved_at_5 = sum(len(set(row["top5_ids"]) & set(row["gold_ids"])) for row in positive)
+    relevant_total = sum(len(row["gold_ids"]) for row in positive)
 
     def bucket(rows_for_intent: list[dict[str, Any]]) -> dict[str, Any]:
         positives = [row for row in rows_for_intent if not row["expected_abstain"]]
@@ -267,10 +302,15 @@ def evaluate_queries(root: Path, queries_path: Path, qrels_path: Path, *, limit:
         "qrels_audit": audit,
         "query_quality": {"positive_queries": len(positive), "negative_queries": len(negatives), "quality_counts": {quality: sum(str(item.get("quality") or "focused") == quality for item in queries) for quality in sorted({str(item.get("quality") or "focused") for item in queries})}},
         "precision_at_1": sum(row["precision_at_1"] or 0 for row in positive) / len(positive) if positive else 0.0,
+        "precision_at_1_hits": p1_hits,
+        "precision_at_1_total": len(positive),
         "strict_precision_at_1": sum(row["precision_at_1"] or 0 for row in strict) / len(strict) if strict else 0.0,
         "focused_precision_at_1": sum(row["precision_at_1"] or 0 for row in focused) / len(focused) if focused else 0.0,
         "mrr_at_5": sum(row["mrr_at_5"] or 0 for row in positive) / len(positive) if positive else 0.0,
         "recall_at_5": sum(row["recall_at_5"] or 0 for row in positive) / len(positive) if positive else 0.0,
+        "recall_at_5_relevant_retrieved": relevant_retrieved_at_5,
+        "recall_at_5_relevant_total": relevant_total,
+        "recall_at_5_micro": relevant_retrieved_at_5 / relevant_total if relevant_total else 0.0,
         "negative_abstain_accuracy": sum(bool(row["abstain_correct"]) for row in negatives) / len(negatives) if negatives else None,
         "citation_parseability": citations / verified if verified else 0.0,
         "candidate_contamination": candidates / (verified + candidates) if verified + candidates else 0.0,

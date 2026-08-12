@@ -14,6 +14,11 @@ try:
 except ImportError:  # pragma: no cover - Windows has no fcntl
     fcntl = None
 
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - Unix has no msvcrt
+    msvcrt = None
+
 from discovery import (
     cache_root,
     content_revision,
@@ -52,26 +57,54 @@ def _snapshot_lock(target: Path, timeout: float = 300.0):
     retained so a waiter never races a lock-file unlink/recreate cycle.
     """
 
-    if fcntl is None:
+    if fcntl is None and msvcrt is None:
         yield
         return
     lock_path = target.with_name(f"{target.name}.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    handle = lock_path.open("a+", encoding="utf-8")
+    handle = lock_path.open("a+b")
     deadline = time.monotonic() + timeout
     try:
+        if msvcrt is not None and fcntl is None:
+            # msvcrt.locking locks a byte range from the current file offset.
+            # Keep one byte in the derived lock file so every waiter uses the
+            # same range on Windows.
+            handle.seek(0)
+            handle.write(b"\0")
+            handle.flush()
         while True:
             try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                handle.seek(0)
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                else:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
                 break
-            except BlockingIOError:
+            except (BlockingIOError, OSError):
                 if time.monotonic() >= deadline:
                     raise TimeoutError(f"timed out waiting for snapshot lock: {lock_path}")
                 time.sleep(0.1)
         yield
     finally:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.seek(0)
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        elif msvcrt is not None:
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
         handle.close()
+
+
+def snapshot_lock_backend() -> str:
+    """Return the platform lock implementation used for shared snapshots."""
+
+    if fcntl is not None:
+        return "fcntl"
+    if msvcrt is not None:
+        return "msvcrt"
+    return "unavailable"
 
 
 def local_view(spec: SourceSpec, reason: str | None = None) -> SourceView:
@@ -93,7 +126,7 @@ def local_view(spec: SourceSpec, reason: str | None = None) -> SourceView:
 
 
 def prepare_view(spec: SourceSpec, local: bool = False) -> SourceView:
-    if local:
+    if local or spec.local_only:
         return local_view(spec)
     remote_url = spec.remote or git(spec.root, "remote", "get-url", "origin")
     branch = spec.branch or remote_branch(spec.root)

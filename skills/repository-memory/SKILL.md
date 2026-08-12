@@ -5,8 +5,8 @@ description: Search durable project and research memory across discovered knowle
 
 # Repository Memory
 
-Use this Skill for durable repository knowledge and explicitly imported long-term
-memory, not transient conversation context. The bundled runtime discovers
+Use this Skill for durable repository knowledge, shared team experience, and
+explicitly imported long-term memory, not transient conversation context. The bundled runtime discovers
 sources and adapters at execution time; do not invent paths, providers, models,
 indexes, or deployment details.
 
@@ -17,11 +17,11 @@ working directory.
 
 On hosts that namespace MCP tools, the repository-memory tools are exposed with
 the host's repository namespace (for example, `repository-memory__memory_search`).
-The bare host tool `memory_search` is a different backend and is not a valid
-repository-memory substitute. Do not call it for repository facts, even if it
-returns a result or reports an embedding/index error. Follow the routing state
-reported by `doctor`; if the host guard says direct file fallback is blocked,
-an unavailable search ends in `abstain`, not in a `read`/`exec` workaround.
+The bare host tool `memory_search` is a different backend. Prefer the
+namespaced tools for shared evidence, but the host guard is advisory and must
+not block ordinary `read`, `grep`, `git`, `exec`, tests, or debugging. If a
+memory backend is unavailable, report that fact and distinguish any direct
+workspace inspection from retrieved memory evidence.
 
 ## First-use setup handshake
 
@@ -62,25 +62,26 @@ explicitly requests a write.
 1. Run `doctor --json` before the first query or when the environment changes.
 2. If no source is configured, ask for or discover the user's intended knowledge directory, then run `init --path <directory> --json`. Repeat `source add --path <directory> --id <stable-id>` for additional repositories or document roots. This writes only user config and derived cache.
 3. Run `sync --json` when the doctor reports a missing/stale index or the source is not fresh.
-4. Run `search "<question>" --scope repository --json` by default. Use `--scope memory` for conversation memory or `--scope all` when both source groups are needed.
+4. For a task that may benefit from prior agent work, call `memory_context(query)` first. It returns repository evidence plus shared decisions, failures, solutions, discoveries, and handoffs with separate provenance. Its current mode is `multi-source-lexical`: the lanes run in parallel but are not score-fused. Use `search "<question>" --scope repository --json` for a repository-only lookup, or `--scope memory` when the native conversation layers are explicitly needed.
 5. Inspect `verified`, `candidates`, `support`, `freshness`, and `diagnostics`; use `get` or `explain` for the complete evidence window and pass the result's citation `commit` when available.
 6. Cite only `verified` results with a valid citation. A verified document proves that the document citation is real; `support.claim_support=partial|unknown` means the answer must abstain from the unsupported part of a composite claim.
 
 For a project-fact turn, the auditable call sequence is:
 
 ```text
-repository-memory doctor → repository-memory search → repository-memory get
+repository-memory doctor → repository-memory context/search → repository-memory get
 ```
 
-The host may enforce this sequence with a lifecycle guard. A model-written
-receipt is not evidence that the sequence happened; use the host audit record
-when it is available.
+The host extension records this sequence when it can observe it, but does not
+block coding or debugging tools. A model-written receipt is not evidence that
+the sequence happened; use the host audit record when it is available.
 
 Do not manually rewrite a natural-language query into a filename or path. The
 runtime performs conservative CJK token expansion, entity-in-filename matching,
 and temporal routing to report/standup layers. If it still returns no verified
-evidence, abstain; never use `read`, `exec`, or direct filesystem access to
-silently replace the retrieval result.
+evidence, mark the retrieved claim unknown. Direct workspace inspection may be
+used when it is part of the coding task, but it must not be mislabeled as a
+citation returned by this Skill.
 
 The repository runtime's current “entity extraction” is structural lexical
 routing, not named-entity recognition and not a persistent relation graph. It
@@ -92,9 +93,17 @@ When using MCP, do not invent or pass a `root` path. Use the server's configured
 repository discovery unless the user explicitly supplies a Git repository root;
 pass only the query and, when needed, a known source id.
 
-`candidates` are leads, not facts. Generated, inferred, pending, stale, dirty, or citation-incomplete results require source verification. If no defensible verified evidence exists, abstain and say what is missing. With `scope=all`, keep repository evidence and memory results in their returned groups; never merge their scores or let raw conversation memory masquerade as a repository citation.
+`candidates` are leads, not facts. Generated, inferred, pending, stale, dirty, or citation-incomplete repository results require source verification. Team Memory uses its own lifecycle: `active` records are experience/decision context with provenance, while `candidate`, `stale`, and `superseded` records are not facts. `memory_context` keeps the sections separate and never makes a team recollection look like a Git citation.
 
-Normal use is read-only. Only run `feedback` or `promote` when the user explicitly asks to record feedback or create a candidate. Use the local stdio MCP entrypoint when the host exposes it; CLI and MCP return the same contract.
+Normal use is read-only. Only run `memory_publish`, `memory_feedback`,
+`memory_supersede`, `feedback`, `promote`, or `memory_ingest` when the user or
+an explicit task-end workflow asks for a write. New Team Memory defaults to
+`candidate`; promotion/replacement is explicit. Use the local stdio MCP
+entrypoint when the host exposes it; CLI and MCP return the same contract.
+When agents run on different hosts, use the explicit `team-export` and
+`team-import` bundle commands (or `memory_team_sync`) to transfer Team Memory;
+review candidates explicitly with `team-activate`/`memory_team_activate`, and
+do not claim that a local SQLite file is automatically cross-machine shared.
 
 When the host exposes the audited MCP registration, tool calls are recorded as
 metadata-only request/response events. Treat `audit_verified` evidence from the
@@ -126,3 +135,5 @@ Read the relevant reference only when needed:
   current entity-routing and L0-L3 semantics.
 - [automatic capture](references/automatic-capture.md) for host lifecycle
   capture, redaction, candidate review, and explicit L3 promotion.
+- [team memory](references/team-memory.md) for shared memory types, lifecycle,
+  context hydration, feedback, and conflict resolution.

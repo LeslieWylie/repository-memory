@@ -28,19 +28,23 @@ and `fallback` remain explicit statuses.
 
 ```text
 repository-memory doctor --json
-repository-memory init --path <knowledge-directory> [--id <stable-id>] --json
-repository-memory source add --path <knowledge-directory> [--id <stable-id>] --json
+repository-memory init --path <knowledge-directory> [--id <stable-id>] [--local-only] --json
+repository-memory source add --path <knowledge-directory> [--id <stable-id>] [--local-only] --json
 repository-memory source list --json
 repository-memory sync [--source <id>|--all] [--local] --json
 repository-memory search "<query>" [--source <id>] [--scope repository|memory|all] [--deep] [--local] --json
 repository-memory get "<result-id>" [--commit <citation-commit>] --json
 repository-memory explain "<result-id>" [--commit <citation-commit>] --json
-repository-memory feedback "<result-id>" --note "..." --json
+repository-memory feedback "<result-id>" --note "..." [--feedback-id <stable-id>] --json
 repository-memory promote --input <file> --json
 repository-memory ingest-session --input <json-or-jsonl> --json
 repository-memory capture-turn --input <bounded-turn.json> --json  # lifecycle adapter only
+repository-memory team-export --output <bundle.json> --json
+repository-memory team-import --input <bundle.json> --json
+repository-memory team-activate --id <team-memory-id> [--reviewer <agent>] --json
 repository-memory memorycore promote-l3 --candidate <autocapture:L2:id> --accept --json
 repository-memory evaluate --queries <queries.jsonl> --qrels <qrels.jsonl> [--revision <commit>] [--scope repository|memory|all] --json
+repository-memory team-evaluate --records <records.jsonl> --queries <queries.jsonl> --qrels <qrels.jsonl> [--gate] --json
 repository-memory memorycore configure|start|stop|status
 repository-memory mcp
 ```
@@ -62,6 +66,12 @@ memory_search
 memory_get
 memory_init
 memory_ingest
+memory_context
+memory_team_sync
+memory_team_activate
+memory_publish
+memory_feedback
+memory_supersede
 ```
 
 `memory_init` registers a user-provided knowledge directory and builds a
@@ -71,6 +81,11 @@ repository. It never edits canonical documents. `memory_ingest` is an explicit
 write and accepts a session object or JSONL value; it is not part of ordinary
 retrieval.
 
+`team-export`/`team-import` and `memory_team_sync` move the user-level Team
+Memory plane as an explicit JSON bundle. They are idempotent merge operations,
+not repository snapshot sync and not a claim that a hosted cross-machine
+service exists.
+
 The native ingest response is intentionally conservative: it can verify the
 durable L0 conversation write while reporting L1 extraction as `pending` or
 `unknown`. L2/L3 are not promised by the write response; report them only after
@@ -78,7 +93,7 @@ the corresponding read/search API returns a record and status. A native
 backend's `supported_layers`/`reachable` fields describe capability and
 readiness, not the amount or quality of stored memory.
 
-`sync` updates only remote snapshots and derived indexes. It does not pull, commit, push, or overwrite the working tree. Use `--local` only when local checkout state is intentionally desired.
+`sync` updates only remote snapshots and derived indexes. It does not pull, commit, push, or overwrite the working tree. Use `--local` only when local checkout state is intentionally desired. For an intentionally detached or offline snapshot, register the source with `--local-only`; this makes the configured local commit the declared source of truth and reports `commit_type=local_worktree` with `freshness.state=fresh` when the checkout is clean. It does not claim that the snapshot is the latest remote revision. Dirty local-only sources remain `dirty` and are not verified.
 
 `evaluate --revision` evaluates an immutable detached snapshot in the user
 cache and records the evaluated commit, branch, qrels revision, scope, and
