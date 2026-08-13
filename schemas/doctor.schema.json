@@ -4,11 +4,52 @@
   "title": "Repository Memory doctor result",
   "type": "object",
   "required": ["schema_version", "status", "repository", "routing"],
+  "$defs": {
+    "memoryLayer": {
+      "type": "object",
+      "required": ["capability", "api_status", "population", "readback"],
+      "properties": {
+        "capability": { "type": "string", "enum": ["supported", "unsupported", "unknown"] },
+        "api_status": { "type": "string", "enum": ["ready", "unreachable", "not_configured", "unsupported", "unknown"] },
+        "population": { "type": "string", "enum": ["empty", "present", "unknown"] },
+        "readback": { "type": "string", "enum": ["verified", "pending", "unknown"] },
+        "record_count": { "type": "integer", "minimum": 0 },
+        "record_count_sampled": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": true
+    },
+    "memoryStatus": {
+      "type": "object",
+      "properties": {
+        "supported_layers": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["L0", "L1", "L2", "L3"] },
+          "uniqueItems": true
+        },
+        "layers": {
+          "type": "object",
+          "properties": {
+            "L0": { "$ref": "#/$defs/memoryLayer" },
+            "L1": { "$ref": "#/$defs/memoryLayer" },
+            "L2": { "$ref": "#/$defs/memoryLayer" },
+            "L3": { "$ref": "#/$defs/memoryLayer" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": true
+    }
+  },
   "properties": {
     "schema_version": { "const": 4 },
-    "status": { "type": "string", "enum": ["ready", "degraded"] },
+    "status": { "type": "string", "enum": ["ready", "degraded", "not_configured"] },
     "repository": { "type": "object" },
-    "memory": { "type": ["object", "array"] },
+    "memory": {
+      "oneOf": [
+        { "$ref": "#/$defs/memoryStatus" },
+        { "type": "array", "items": { "$ref": "#/$defs/memoryStatus" } }
+      ]
+    },
     "team_memory": { "type": "object" },
     "routing": { "type": "object" },
     "agents": { "type": "object" },

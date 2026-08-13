@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -47,10 +48,17 @@ from fallback import SECRET_CONTENT, SECRET_NAME, _claim_support, query_terms
 from fallback import search as fallback_search
 from local_index import ensure as ensure_local_index
 from local_index import status as local_index_status
+from memmy import MemmyError, configure_memmy, memmy_memory_client
 from mcp_server import serve
-from memorycore import native_memory_client
+from memorycore import (
+    _lifecycle_status as _native_lifecycle_status,
+    _with_lifecycle_markers as _with_native_lifecycle,
+    native_memory_client,
+)
+from knowledge import KnowledgeClient
 from snapshot import prepare_view
 from team_memory import team_memory_store
+from vendor_components import report as vendor_components_report
 
 from models import SourceSpec, SourceView
 
@@ -101,7 +109,16 @@ def _safe_document(root: Path, relative: str) -> tuple[Path, list[str]] | None:
 
 def _source_payload(view: SourceView) -> dict[str, Any]:
     memory_only = view.commit_type == "memorycore"
-    return {"id": view.spec.id, "repository": None if memory_only else view.spec.repository, "root": None if memory_only else str(view.spec.root), "path": None if memory_only else str(view.path), "branch": view.branch, "remote": view.remote_url, "commit": view.commit, "commit_type": view.commit_type, "freshness": view.freshness}
+    return {"id": view.spec.id, "repository": None if memory_only else view.spec.repository, "root": None if memory_only else str(view.spec.root), "path": None if memory_only else str(view.path), "branch": view.branch, "remote": view.remote_url, "commit": view.commit, "commit_type": view.commit_type, "freshness": _freshness(view)}
+
+
+def _freshness(view: SourceView) -> dict[str, Any]:
+    """Return source freshness without treating a live memory store as stale."""
+
+    value = view.freshness
+    if view.commit_type == "memorycore":
+        return {**value, "state": "memorycore"}
+    return value
 
 
 def _memory_view() -> SourceView:
@@ -253,7 +270,7 @@ def _discover_views(root: Path | None, source_id: str | None, scope: str, local:
 
 
 def _empty(query: str, mode: str, source_views: list[SourceView], reason: str, *, scope: str = "repository", backend: str | None = None) -> dict[str, Any]:
-    groups = {name: {"verified": [], "candidates": [], "results": [], "abstain": True} for name in ("repository", "memory")}
+    groups = {name: {"verified": [], "answerable": [], "candidates": [], "results": [], "abstain": True} for name in ("repository", "memory")}
     return {
         "schema_version": SCHEMA_VERSION,
         "query": query,
@@ -261,11 +278,12 @@ def _empty(query: str, mode: str, source_views: list[SourceView], reason: str, *
         "scope": scope,
         "sources": [_source_payload(view) for view in source_views],
         "verified": [] if scope == "all" else groups[scope]["verified"],
+        "answerable": [] if scope == "all" else groups[scope]["answerable"],
         "candidates": [] if scope == "all" else groups[scope]["candidates"],
         "results": [] if scope == "all" else groups[scope]["results"],
         "groups": groups if scope == "all" else None,
         "abstain": True,
-        "freshness": {view.spec.id: view.freshness for view in source_views},
+        "freshness": {view.spec.id: _freshness(view) for view in source_views},
         "diagnostics": {"scope": scope, "adapter": backend, "result_count": 0, "reason": reason},
     }
 
@@ -314,7 +332,7 @@ def normalize_item(item: dict[str, Any], view: SourceView, source_type: str, que
         start, end = locate(view.path, path, excerpt)
     commit = citation.get("commit") or item.get("commit") or item.get("_commit") or metadata.get("commit") or metadata.get("revision") or view.commit
     status = evidence_status(item, citation)
-    memory_backend = citation.get("source") if citation.get("source") in {"memorycore", "local-memory"} else None
+    memory_backend = citation.get("source") if citation.get("source") in {"memorycore", "local-memory", "memmy"} else None
     native = bool(item.get("_native_memory") or memory_backend)
     memory_backend = memory_backend or (item.get("_memory_backend") if native else None) or ("memorycore" if native else None)
     checked = validate_memory(citation, excerpt) if native else validate(view.path, path, start, end, excerpt, commit, view.commit)
@@ -330,6 +348,31 @@ def normalize_item(item: dict[str, Any], view: SourceView, source_type: str, que
     citation_repository = citation.get("repository") or item.get("repository") or item.get("_repository") or metadata.get("repository") or (None if native else view.spec.repository)
     memory_layer = item.get("memory_layer") or item.get("layer") or item.get("level") or metadata.get("memory_layer") or metadata.get("layer") or metadata.get("level") or citation.get("layer")
     memory_type = item.get("memory_type") or item.get("type") or metadata.get("memory_type") or metadata.get("type") or citation.get("memory_type")
+    accepted = citation.get("accepted", item.get("accepted"))
+    generated = bool(citation.get("generated", item.get("generated", False)))
+    if native:
+        # Native records have a backend read-back state in addition to the
+        # evidence status used by the result splitter.  Keep both explicit so
+        # an accepted L2/L3 record cannot be confused with a merely readable
+        # generated record.
+        if accepted is True:
+            lifecycle_status = "accepted"
+        elif status in {"candidate", "pending", "inferred", "generated", "stale"}:
+            lifecycle_status = status
+        elif generated:
+            lifecycle_status = "generated"
+        else:
+            lifecycle_status = "verified"
+    else:
+        lifecycle_status = status
+    linked_evidence = item.get("linked_evidence") or citation.get("linked_evidence") or []
+    provenance = item.get("provenance") or citation.get("provenance") or linked_evidence or {
+        "source": memory_backend if native else view.spec.id,
+        "repository": citation_repository,
+        "commit": commit,
+        "path": path,
+        "locator": citation.get("locator") or ({"start_line": start, "end_line": end} if start else None),
+    }
     support = item.get("support") if isinstance(item.get("support"), dict) else None
     if support is None and query is not None:
         support = _claim_support(query_terms(query), str(excerpt or ""), start or 1, end or start or 1)
@@ -349,10 +392,21 @@ def normalize_item(item: dict[str, Any], view: SourceView, source_type: str, que
         "excerpt": excerpt,
         "support": support,
         "evidence_status": status,
-        "generated": bool(citation.get("generated", item.get("generated", False))),
-        "accepted": citation.get("accepted", item.get("accepted")),
+        "generated": generated,
+        "accepted": accepted,
+        "layer": memory_layer,
+        "status": lifecycle_status,
+        "provenance": provenance,
+        "readback": {
+            "verified": bool(checked.get("valid")) and not bool(checked.get("stale")),
+            "status": "verified" if checked.get("valid") and not checked.get("stale") else ("stale" if checked.get("stale") else "invalid"),
+            "source": memory_backend if native else view.spec.id,
+            "memory_id": memory_id,
+            "layer": memory_layer,
+            "receipt": "native-memorycore-readback" if native else "repository-citation-readback",
+        },
         "related": item.get("related") or item.get("links") or [],
-        "linked_evidence": item.get("linked_evidence") or citation.get("linked_evidence") or [],
+        "linked_evidence": linked_evidence,
         "memory": {
             "layer": memory_layer,
             "type": memory_type,
@@ -374,8 +428,9 @@ def normalize_item(item: dict[str, Any], view: SourceView, source_type: str, que
             "line_end": end,
             "evidence": citation.get("evidence") or excerpt,
             "locator": citation.get("locator") or ({"start_line": start, "end_line": end} if start else None),
-            "generated": bool(citation.get("generated", item.get("generated", False))),
-            "accepted": citation.get("accepted", item.get("accepted")),
+            "generated": generated,
+            "accepted": accepted,
+            "provenance": provenance,
             "layer": memory_layer,
             "memory_type": memory_type,
             "linked_evidence": item.get("linked_evidence") or citation.get("linked_evidence") or [],
@@ -403,6 +458,23 @@ def _split_results(items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], l
         seen.add(identifier)
         (verified if item.get("citation", {}).get("valid") and item.get("evidence_status") not in {"stale", "candidate", "pending", "inferred", "generated"} else candidates).append(item)
     return verified, candidates
+
+
+def _answerable_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return citations whose excerpt supports the complete query claim.
+
+    ``verified`` is deliberately document-level: it means the citation points
+    at a real, fresh, non-pending document.  That is useful for recall and
+    qrels evaluation, but it is not permission to answer a composite question.
+    Only ``direct`` claim support is answerable without an additional evidence
+    lookup.  Partial/unknown hits remain visible as verified documents and
+    candidates for diagnostics, while the top-level result abstains.
+    """
+
+    return [
+        item for item in items
+        if str((item.get("support") or {}).get("claim_support") or "") == "direct"
+    ]
 
 
 def _fallback_items(view: SourceView, query: str, limit: int, deep: bool, *, stale: bool = False) -> list[dict[str, Any]]:
@@ -492,15 +564,40 @@ def _memory_items(view: SourceView, adapter: Adapter, query: str, limit: int) ->
         native_items = adapter.memory_search(query, limit)
     except AdapterError as exc:
         return [], {"source": view.spec.id, "adapter": "memorycore", "memory": memory, "repository_skipped": True, "fallback": True, "reason": str(exc)}
-    normalized = [normalize_item(item, view, memory.get("backend") or "memorycore", query) for item in native_items]
-    return normalized[:limit], {"source": view.spec.id, "adapter": memory.get("backend") or "memorycore", "memory": memory, "repository_skipped": True, "native_memory_count": len(native_items), "fallback": bool(memory.get("fallback"))}
+    normalized = [
+        normalize_item(item, view, item.get("_memory_backend") or memory.get("backend") or "memorycore", query)
+        for item in native_items
+    ]
+    providers = sorted({str(item.get("source")) for item in normalized if item.get("source")})
+    semantic = memory.get("embedding") if isinstance(memory.get("embedding"), dict) else {"available": False, "strategy": "keyword-only"}
+    if isinstance(memory.get("providers"), dict):
+        memmy = memory["providers"].get("memmy")
+        if isinstance(memmy, dict) and isinstance(memmy.get("embedding"), dict) and memmy["embedding"].get("available") is True:
+            semantic = memmy["embedding"]
+    return normalized[:limit], {
+        "source": view.spec.id,
+        "adapter": memory.get("backend") or "memorycore",
+        "memory": memory,
+        "repository_skipped": True,
+        "native_memory_count": len(native_items),
+        "providers": providers,
+        "semantic": semantic,
+        "fallback": bool(memory.get("fallback")),
+    }
 
 
 def _package_search(query: str, mode: str, scope: str, views: list[SourceView], groups: dict[str, dict[str, Any]], diagnostics: list[dict[str, Any]], limit: int) -> dict[str, Any]:
     selected = groups[scope] if scope != "all" else {"verified": [], "candidates": [], "results": []}
     memory_ready = any(entry.get("memory", {}).get("status") == "ready" for entry in diagnostics if isinstance(entry.get("memory"), dict))
-    retrieval_mode = "grouped" if scope == "all" else "keyword-only" if scope == "memory" and memory_ready else "lexical"
+    semantic_ready = any(
+        isinstance(entry.get("semantic"), dict) and entry["semantic"].get("available") is True
+        for entry in diagnostics
+    )
+    retrieval_mode = "grouped" if scope == "all" else "hybrid" if scope == "memory" and semantic_ready else "keyword-only" if scope == "memory" and memory_ready else "lexical"
     result_count = sum(len(group.get("verified", [])) for group in groups.values()) if scope == "all" else len(selected["verified"])
+    answerable_count = sum(len(group.get("answerable", [])) for group in groups.values()) if scope == "all" else len(selected.get("answerable", []))
+    answerable = [] if scope == "all" else selected.get("answerable", [])[:limit]
+    abstain = answerable_count == 0
     candidate_count = sum(len(group.get("candidates", [])) for group in groups.values()) if scope == "all" else len(selected["candidates"])
     return {
         "schema_version": SCHEMA_VERSION,
@@ -511,17 +608,22 @@ def _package_search(query: str, mode: str, scope: str, views: list[SourceView], 
         "sources": [_source_payload(view) for view in views],
         "verified": selected["verified"][:limit],
         "candidates": selected["candidates"][:limit],
-        "results": selected["verified"][:limit],
+        # ``results`` is the safe answer surface.  Keep ``verified`` separate
+        # for document-level retrieval metrics and citation diagnostics.
+        "results": answerable,
+        "answerable": answerable,
         "groups": groups if scope == "all" else None,
-        "abstain": not any(group.get("verified") for group in (groups.values() if scope == "all" else [selected])),
-        "freshness": {view.spec.id: view.freshness for view in views},
+        "abstain": abstain,
+        "freshness": {view.spec.id: _freshness(view) for view in views},
         "diagnostics": {
             "scope": scope,
             "adapters": diagnostics,
             "result_count": result_count,
+            "answerable_count": answerable_count,
             "candidate_count": candidate_count,
+            "claim_abstain": abstain and result_count > 0,
             "retrieval_mode": retrieval_mode,
-            "semantic_available": False if memory_ready else None,
+            "semantic_available": semantic_ready if memory_ready else None,
             "query_terms": query_terms(query),
         },
     }
@@ -564,8 +666,9 @@ def search(root: Path | None, query: str, limit: int = 5, deep: bool = False, so
     for group in groups.values():
         group["verified"] = group["verified"][:limit]
         group["candidates"] = group["candidates"][:limit]
-        group["results"] = group["verified"]
-        group["abstain"] = not group["verified"]
+        group["answerable"] = _answerable_items(group["verified"])
+        group["results"] = group["answerable"]
+        group["abstain"] = not group["answerable"]
     return _package_search(query, mode, scope, views, groups, diagnostics, limit)
 
 
@@ -689,6 +792,45 @@ def source_list() -> dict[str, Any]:
     return {"schema_version": SCHEMA_VERSION, "sources": configured_sources(), "config": config_summary(), "canonical_repo_changed": False}
 
 
+def memmy_gui(open_window: bool = False) -> dict[str, Any]:
+    """Expose the existing Memmy panel without creating a second GUI."""
+
+    client = memmy_memory_client()
+    health = client.health()
+    endpoint = client.config.endpoint
+    if not endpoint:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "ok": False,
+            "status": "not_configured",
+            "error": "Memmy is not configured; run repository-memory memmy configure",
+            "canonical_repo_changed": False,
+        }
+    url = endpoint.rstrip("/") + "/"
+    opened = False
+    open_error = None
+    if open_window:
+        if sys.platform != "darwin":
+            open_error = "--open is currently supported only on macOS"
+        else:
+            try:
+                subprocess.run(["open", url], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                opened = True
+            except (OSError, subprocess.CalledProcessError) as exc:
+                open_error = str(exc)[:240]
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "ok": health.get("reachable") is True and open_error is None,
+        "backend": "memmy",
+        "url": url,
+        "reachable": health.get("reachable") is True,
+        "health": health,
+        "opened": opened,
+        "error": open_error,
+        "canonical_repo_changed": False,
+    }
+
+
 def ingest_session_payload(root: Path | None, payload: Any, source_id: str | None = None) -> dict[str, Any]:
     """Explicit MCP-friendly session ingestion without requiring a local file path."""
 
@@ -732,8 +874,9 @@ def capture_turn(root: Path | None, payload: Any, source_id: str | None = None) 
     """Capture one completed OpenClaw turn without exposing a write MCP tool.
 
     L0 is written and verified through the configured adapter.  L1 is observed
-    asynchronously.  A durable turn creates only an L2 ``candidate``.  L3 is
-    intentionally untouched and can only be changed by an explicit promotion.
+    asynchronously.  Native L2 is produced by the MemoryCore pipeline and is
+    only reported when a scenario is read back.  L3 is intentionally untouched
+    and can only be changed by an explicit promotion.
     """
 
     from autocapture import candidate_markdown, candidate_path, candidate_store_path, normalize_turn, should_create_candidate
@@ -755,6 +898,19 @@ def capture_turn(root: Path | None, payload: Any, source_id: str | None = None) 
     if _capture_seen(key):
         return {"schema_version": SCHEMA_VERSION, "ok": True, "duplicate": True, "idempotency_key": key, "canonical_repo_changed": False}
 
+    native_scenarios_before: dict[str, str] = {}
+    native_accepted_before: dict[str, str] = {}
+    if native.configured:
+        try:
+            native_scenarios_before = native.scenario_snapshot()
+            for scenario_path in native_scenarios_before:
+                record = native.read_scenario(scenario_path)
+                content = str(record.get("content") or "")
+                if _native_lifecycle_status(content, "generated") == "accepted":
+                    native_accepted_before[scenario_path] = content
+        except Exception:
+            native_scenarios_before = {}
+            native_accepted_before = {}
     session_payload = {"sessions": [{"sessionKey": turn["session_id"], "messages": turn["messages"]}]}
     l0_result = ingest_session_payload(root, session_payload, source_id)
     native_result = l0_result.get("result") if isinstance(l0_result.get("result"), dict) else {}
@@ -778,42 +934,62 @@ def capture_turn(root: Path | None, payload: Any, source_id: str | None = None) 
                 break
             time.sleep(0.25)
 
-    candidate: dict[str, Any] = {"created": False, "status": "skipped", "reason": "not durable"}
+    candidate: dict[str, Any] = {"created": False, "status": "skipped", "reason": "not durable", "backend": "native-pipeline"}
     if should_create_candidate(turn) and native.configured and l0["l0_verified"]:
-        path = candidate_path(turn)
-        content = candidate_markdown(turn, l0, l1)
-        try:
-            native.write_scenario(path, content, summary="OpenClaw completed-turn candidate")
-            observed = native.read_scenario(path)
-            observed_content = str(observed.get("content") or "")
+        # Do not call scenario/write here: the native endpoint is update-only
+        # and a fabricated local file is not an L2 memory.  L2 creation belongs
+        # to the MemoryCore scene extractor triggered by conversation/add.
+        observed = native.wait_for_scenario(native_scenarios_before, timeout=float(os.environ.get("REPOSITORY_MEMORY_L2_WAIT", "8")))
+        if observed:
+            path = str(observed.get("path") or "")
+            observed_content = str((observed.get("record") or {}).get("content") or "")
+            accepted_before = native_accepted_before.get(path)
+            if accepted_before and observed.get("status") != "accepted" and observed_content != accepted_before:
+                # The native pipeline is allowed to propose an update, but it
+                # must not silently revoke an explicitly accepted scenario.
+                # Preserve the accepted native record and put the new turn in
+                # the normal user-level pending candidate store instead.
+                native.write_scenario(path, accepted_before, summary="Preserved accepted repository-memory L2 scenario")
+                restored = native.read_scenario(path)
+                if _native_lifecycle_status(str(restored.get("content") or ""), "generated") != "accepted":
+                    raise RuntimeError("accepted native L2 scenario could not be restored after pipeline update")
+                relative_candidate = candidate_path(turn)
+                candidate_file = candidate_store_path(data_root(), relative_candidate, identity)
+                candidate_file.parent.mkdir(parents=True, exist_ok=True)
+                candidate_file.write_text(candidate_markdown(turn, l0, l1), encoding="utf-8")
+                candidate = {
+                    "created": True,
+                    "status": "pending",
+                    "verified": False,
+                    "backend": "local-candidate",
+                    "path": relative_candidate,
+                    "id": f"autocapture:L2:{relative_candidate}",
+                    "evidence_status": "pending",
+                    "native_path": path,
+                    "native_update_preserved": True,
+                    "reason": "native pipeline proposed an update to an accepted scenario; explicit re-review is required",
+                }
+            else:
+                candidate = {
+                    "created": True,
+                    "status": "candidate" if observed.get("status") != "accepted" else "accepted",
+                    "verified": bool(observed_content),
+                    "backend": "memorycore",
+                    "path": path,
+                    "id": f"memorycore:L2:{path}",
+                    "evidence_status": observed.get("status") or "generated",
+                }
+        else:
             candidate = {
-                "created": True,
-                "status": "candidate",
-                "verified": observed_content == content,
-                "path": path,
-                "id": f"memorycore:L2:{path}",
-                "evidence_status": "pending",
-            }
-        except Exception as exc:  # candidate failure must not hide a verified L0 write
-            # The native API only updates an existing scenario file; a fresh
-            # L2 candidate therefore lives in the user-level derived store
-            # until the native scene extractor or an explicit reviewer adopts
-            # it.  It remains a candidate and is never returned as verified.
-            local_path = candidate_store_path(data_root(), path, native.config.identity)
-            local_path.parent.mkdir(parents=True, exist_ok=True)
-            local_path.write_text(content, encoding="utf-8")
-            candidate = {
-                "created": True,
-                "status": "candidate",
-                "verified": True,
-                "backend": "local_pending",
-                "native_error": str(exc)[:240],
-                "path": path,
-                "id": f"autocapture:L2:{path}",
+                "created": False,
+                "status": "pending",
+                "backend": "native-pipeline",
+                "reason": "native scene extraction has not produced a read-back scenario within the observation window",
                 "evidence_status": "pending",
             }
     elif not native.configured:
-        candidate["reason"] = "MemoryCore not configured; no L2 candidate backend"
+        candidate["backend"] = "native-pipeline"
+        candidate["reason"] = "MemoryCore not configured; native L2 pipeline unavailable"
     elif not l0["l0_verified"]:
         candidate["reason"] = "L0 was not verified"
 
@@ -869,49 +1045,57 @@ def capture_turn(root: Path | None, payload: Any, source_id: str | None = None) 
 
 
 def promote_l3(candidate_id: str) -> dict[str, Any]:
-    """Explicitly accept one L2 candidate into the native L3 profile."""
+    """Explicitly accept one native L2 scenario and write/read back L3.
 
-    from autocapture import candidate_store_path
+    The operation is intentionally idempotent.  Re-running promotion for an
+    already accepted scenario must not append another copy of the same L2
+    block to the L3 profile.
+    """
 
-    if not candidate_id or not candidate_id.startswith("autocapture:L2:"):
-        raise RuntimeError("promote-l3 only accepts an autocapture L2 candidate id")
+    if not candidate_id or not candidate_id.startswith("memorycore:L2:"):
+        raise RuntimeError("promote-l3 requires a native memorycore:L2 id; local pending candidates are not promotable")
     native = native_memory_client()
     if not native.configured:
         raise RuntimeError("MemoryCore is not configured")
+    path = candidate_id.split(":", 2)[-1]
     candidate = native.get(candidate_id)
     memory = candidate.get("memory") if isinstance(candidate.get("memory"), dict) else {}
     content = str(memory.get("content") or "").strip()
     if not content:
-        raise RuntimeError("candidate has no content")
-    accepted = (
-        content.replace("status: candidate", "status: accepted", 1)
-        .replace("layer: L2", "layer: L3", 1)
-        .replace("evidence_status: pending", "evidence_status: accepted", 1)
+        raise RuntimeError("native L2 scenario has no content")
+    accepted_l2 = _with_native_lifecycle(content, status="accepted", layer="L2", source_l2=path)
+    native.write_scenario(path, accepted_l2, summary="Explicitly accepted repository-memory L2 scenario")
+    l2_readback = native.read_scenario(path)
+    l2_content = str(l2_readback.get("content") or "")
+    if _native_lifecycle_status(l2_content) != "accepted":
+        raise RuntimeError("native L2 scenario write did not read back as accepted")
+
+    accepted = _with_native_lifecycle(
+        "# Repository Memory Profile\n\n" + l2_content,
+        status="accepted",
+        layer="L3",
+        source_l2=path,
     )
     current = native.read_core()
     previous = str(current.get("content") or "").strip()
-    combined = accepted if not previous else previous + "\n\n" + accepted
-    native.write_core(combined)
+    marker = f"source_l2: {path}"
+    if marker not in previous:
+        combined = accepted if not previous else previous + "\n\n" + accepted
+        native.write_core(combined)
     verified = native.read_core()
     verified_content = str(verified.get("content") or "")
-
-    relative = candidate_id.split(":", 2)[-1]
-    local_path = candidate_store_path(data_root(), relative, native.config.identity)
-    # Keep accepted records outside ``candidates`` so the default pending
-    # search cannot surface an already-promoted L2 document a second time.
-    promoted_path = local_path.parent.parent.parent / "promoted" / local_path.name
-    if local_path.is_file():
-        promoted_path.parent.mkdir(parents=True, exist_ok=True)
-        local_path.replace(promoted_path)
+    if _native_lifecycle_status(verified_content) != "accepted" or path not in verified_content:
+        raise RuntimeError("native L3 core write did not read back as accepted")
     return {
         "schema_version": SCHEMA_VERSION,
-        "ok": accepted in verified_content,
+        "ok": True,
         "candidate": candidate_id,
+        "l2": {"id": candidate_id, "path": path, "status": "accepted", "readback": True},
         "layer": "L3",
         "id": "memorycore:L3:profile",
         "status": "accepted",
-        "verified": accepted in verified_content,
-        "candidate_archived": str(promoted_path) if promoted_path.is_file() else None,
+        "verified": True,
+        "readback": True,
         "canonical_repo_changed": False,
     }
 
@@ -938,21 +1122,96 @@ def _memory_get_result(result_id: str, explain: bool = False) -> dict[str, Any]:
             "errors": [{"source": memory.get("backend") or "memorycore", "adapter": memory.get("backend") or "memorycore", "error": str(exc), "freshness": memory}],
             "reason": "memory result not found or MemoryCore unavailable",
         }
-    backend = "local-memory" if result_id.startswith("autocapture:") else memory.get("backend") or ("memorycore" if adapter.native_memory.configured else "local-memory")
-    result = {"schema_version": SCHEMA_VERSION, "found": True, "id": result_id, "source": backend, "repository": None, "commit": None, "result": value, "freshness": memory}
+    backend = "memmy" if result_id.startswith("memmy:") else "local-memory" if result_id.startswith("autocapture:") else memory.get("backend") or ("memorycore" if adapter.native_memory.configured else "local-memory")
+    raw_layer = value.get("layer") or value.get("memoryLayer") if isinstance(value, dict) else None
+    if not raw_layer:
+        match = re.match(r"^(?:memorycore|memmy|local|autocapture):(L[0-3]|Skill):", result_id)
+        raw_layer = match.group(1) if match else None
+    layer = str(raw_layer or "") or None
+    payload = value.get("memory") if isinstance(value, dict) and isinstance(value.get("memory"), dict) else (value if isinstance(value, dict) else {})
+    content = str(payload.get("content") or payload.get("body") or payload.get("text") or payload.get("excerpt") or payload.get("summary") or "")
+    citation = value.get("citation") if isinstance(value, dict) and isinstance(value.get("citation"), dict) else {}
+    memory_id = str(citation.get("memory_id") or payload.get("id") or (result_id.split(":", 2)[-1] if ":" in result_id else result_id))
+    memory_path = citation.get("path") or payload.get("path")
+    if not memory_path and layer == "L2":
+        memory_path = f"scenario/{memory_id}"
+    if not memory_path and layer == "L3":
+        memory_path = "core/profile"
+    accepted = bool(
+        citation.get("accepted") is True
+        or payload.get("accepted") is True
+        or payload.get("status") in {"activated", "active", "accepted"}
+        or _native_lifecycle_status(content, "") == "accepted"
+    )
+    generated = bool(citation.get("generated") is True or payload.get("generated") is True or _native_lifecycle_status(content, "") == "generated")
+    if layer in {"L2", "L3"}:
+        status = "accepted" if accepted else (_native_lifecycle_status(content, "generated" if generated else "pending"))
+    else:
+        status = "verified"
+    provenance = value.get("provenance") if isinstance(value, dict) else None
+    provenance = provenance or citation.get("provenance") or value.get("linked_evidence") if isinstance(value, dict) else None
+    provenance = provenance or {
+        "source": backend,
+        "repository": None,
+        "commit": None,
+        "path": memory_path,
+        "locator": citation.get("locator"),
+    }
+    readback = {
+        "verified": True,
+        "status": "verified",
+        "source": backend,
+        "memory_id": memory_id,
+        "layer": layer,
+        "receipt": "native-memorycore-readback" if backend == "memorycore" else "memmy-readback" if backend == "memmy" else "local-memory-readback",
+    }
+    result = {
+        "schema_version": SCHEMA_VERSION,
+        "found": True,
+        "id": result_id,
+        "source": backend,
+        "repository": None,
+        "commit": None,
+        "layer": layer,
+        "memory_id": memory_id,
+        "status": status,
+        "generated": generated,
+        "accepted": accepted,
+        "citation": citation or {
+            "source": backend,
+            "memory_id": memory_id,
+            "layer": layer,
+            "evidence": content,
+            "locator": {"memory_id": memory_id},
+            "valid": bool(content),
+            "accepted": accepted,
+            "generated": generated,
+        },
+        "provenance": provenance,
+        "readback": readback,
+        "result": value,
+        "freshness": memory,
+    }
     if explain:
         result["doctor"] = doctor(None)
     return result
 
 
-def get_result(root: Path | None, result_id: str, explain: bool = False, expected_commit: str | None = None) -> dict[str, Any]:
+def get_result(
+    root: Path | None,
+    result_id: str,
+    explain: bool = False,
+    expected_commit: str | None = None,
+    line_start: int | None = None,
+    line_end: int | None = None,
+) -> dict[str, Any]:
     if result_id.startswith("team:"):
         value = team_memory_store().get(result_id)
         if explain:
             value["doctor"] = doctor(root)
         return value
     errors = []
-    if result_id.startswith(("memorycore:", "local:", "autocapture:")):
+    if result_id.startswith(("memorycore:", "memmy:", "local:", "autocapture:")):
         return _memory_get_result(result_id, explain)
     try:
         specs = discover_sources(str(root) if root else None)
@@ -971,11 +1230,20 @@ def get_result(root: Path | None, result_id: str, explain: bool = False, expecte
                 safe_document = _safe_document(view.path, relative)
                 if safe_document:
                     _document, content_lines = safe_document
-                    # get/explain intentionally returns a larger evidence
-                    # window than search, while remaining bounded for giant
-                    # generated documents.
-                    window = content_lines[:200]
-                    start, end = 1, len(window)
+                    # A search result can pass its citation locator back to
+                    # get/explain.  Prefer that exact evidence window so a
+                    # large standup/report does not silently return lines
+                    # 1-200 for a hit at line 455.  Without a locator retain
+                    # the bounded first-window compatibility behavior.
+                    requested_start = max(1, int(line_start or 1))
+                    requested_end = max(requested_start, int(line_end or min(200, len(content_lines))))
+                    if line_start is not None or line_end is not None:
+                        start = min(requested_start, len(content_lines) or 1)
+                        end = min(requested_end, len(content_lines) or start)
+                        window = content_lines[start - 1:end]
+                    else:
+                        window = content_lines[:200]
+                        start, end = 1, len(window)
                     dirty_local = view.dirty and view.commit_type == "local_worktree"
                     citation = {
                         "source": "repository",
@@ -1002,13 +1270,30 @@ def get_result(root: Path | None, result_id: str, explain: bool = False, expecte
                         "line_start": start,
                         "line_end": end,
                         "excerpt": "\n".join(window),
-                        "evidence_window": {"line_start": start, "line_end": end, "truncated": len(content_lines) > len(window)},
+                        "evidence_window": {"line_start": start, "line_end": end, "requested_line_start": line_start, "requested_line_end": line_end, "truncated": len(content_lines) > len(window)},
                         "support": {"matched_terms": [], "unmatched_terms": [], "coverage": 1.0, "claim_support": "unknown", "supporting_spans": []},
                         "citation": citation,
                         "evidence_status": "stale" if dirty_local else "secondary",
                         "freshness": view.freshness,
+                        "layer": "repository",
+                        "status": "stale" if dirty_local else "verified",
+                        "provenance": {
+                            "source": spec.id,
+                            "repository": spec.repository,
+                            "commit": view.commit,
+                            "path": relative,
+                            "locator": {"start_line": start, "end_line": end},
+                        },
+                        "readback": {
+                            "verified": not dirty_local,
+                            "status": "stale" if dirty_local else "verified",
+                            "source": spec.id,
+                            "memory_id": result_id,
+                            "layer": "repository",
+                            "receipt": "repository-citation-readback",
+                        },
                     }
-                    result = {"schema_version": SCHEMA_VERSION, "found": True, "id": result_id, "source": spec.id, "repository": spec.repository, "commit": view.commit, "result": value, "freshness": view.freshness}
+                    result = {"schema_version": SCHEMA_VERSION, "found": True, "id": result_id, "source": spec.id, "repository": spec.repository, "commit": view.commit, "layer": "repository", "memory_id": result_id, "status": "stale" if dirty_local else "verified", "provenance": value["provenance"], "readback": value["readback"], "result": value, "freshness": view.freshness}
                     if explain:
                         result["doctor"] = doctor(root, source_id=spec.id)
                     return result
@@ -1042,9 +1327,26 @@ def doctor(root: Path | None = None, source_id: str | None = None) -> dict[str, 
         memory_adapter = Adapter(None, _memory_view())
         memory_report = memory_adapter.memory_status()
         if memory_adapter.native_memory.configured:
-            memory_report = memory_adapter.native_memory.health(refresh=True, probe_layers=True)
-        memory_configured = bool(memory_report.get("configured"))
-        memory_ready = memory_report.get("status") == "ready"
+            native_report = memory_adapter.native_memory.health(refresh=True, probe_layers=True)
+            memory_report = native_report
+            if memory_adapter.memmy.configured:
+                memmy_report = memory_adapter.memmy.health()
+                memory_report["providers"] = {
+                    "memorycore": {**native_report, "providers": None},
+                    "memmy": memmy_report,
+                }
+        provider_reports = memory_report.get("providers") if isinstance(memory_report.get("providers"), dict) else {}
+        provider_configured = any(
+            isinstance(report, dict) and report.get("configured") is True
+            for report in provider_reports.values()
+        )
+        provider_ready = any(
+            isinstance(report, dict) and report.get("status") == "ready"
+            for report in provider_reports.values()
+        )
+        memory_configured = bool(memory_report.get("configured") or provider_configured)
+        memory_ready = memory_report.get("status") == "ready" or provider_ready
+        native_ready = bool(memory_adapter.native_memory.configured and memory_report.get("status") == "ready")
         team_report = team_memory_store().health()
         routing = _openclaw_routing()
         capabilities = ["init", "source-add", "memory-init"]
@@ -1053,17 +1355,18 @@ def doctor(root: Path | None = None, source_id: str | None = None) -> dict[str, 
         return {
             "schema_version": SCHEMA_VERSION,
             "ok": memory_ready,
-            "active_adapter": "native-memorycore" if memory_report.get("backend") != "local-memory" and memory_configured else "local-memory" if memory_configured else None,
+            "active_adapter": "native-memorycore" if native_ready else "memmy" if isinstance(provider_reports.get("memmy"), dict) and provider_reports["memmy"].get("status") == "ready" else "local-memory" if memory_configured else None,
             "capabilities": sorted(set(capabilities)),
             "memory": memory_report,
             "team_memory": team_report,
             "repository": {"status": "not_configured", "source_count": 0},
-            "knowledge_service": {"configured": False, "required": False, "status": "optional"},
+            "knowledge_service": {"required": False, **KnowledgeClient().health()},
             "semantic": memory_report.get("embedding", {"available": False, "strategy": "keyword-only"}),
             "routing": routing,
             "agents": routing.get("agents", {"configured": [], "covered": []}),
             "sources": [],
             "config": config_summary(),
+            "upstream_components": vendor_components_report(),
             "actions": ["init --path <directory>", "source add --path <directory>", "search --scope memory", "ingest-session (explicit write)"] if memory_configured else ["init --path <directory>", "source add --path <directory>", "memorycore configure"],
             "status": "ready" if memory_ready else "not_configured",
             "error": message,
@@ -1139,7 +1442,7 @@ def doctor(root: Path | None = None, source_id: str | None = None) -> dict[str, 
     healthy = all(report.get("healthy", True) for report in reports)
     routing = _openclaw_routing()
     active_values = unique_values(active)
-    return {"schema_version": SCHEMA_VERSION, "ok": healthy, "status": "ready" if healthy else "degraded", "active_adapter": active_values[0] if len(active_values) == 1 else active_values, "capabilities": capabilities, "memory": memory[0] if len(memory) == 1 else memory, "team_memory": team_memory_store().health(), "repository": {"status": "ready" if reports else "not_configured", "source_count": len(reports)}, "knowledge_service": {"configured": False, "required": False, "status": "optional"}, "semantic": semantic[0] if len(semantic) == 1 else ({"available": False, "strategy": "keyword-only"} if native_ready else semantic), "routing": routing, "agents": routing.get("agents", {"configured": [], "covered": []}), "sources": reports, "config": config_summary(), "actions": actions}
+    return {"schema_version": SCHEMA_VERSION, "ok": healthy, "status": "ready" if healthy else "degraded", "active_adapter": active_values[0] if len(active_values) == 1 else active_values, "capabilities": capabilities, "memory": memory[0] if len(memory) == 1 else memory, "team_memory": team_memory_store().health(), "repository": {"status": "ready" if reports else "not_configured", "source_count": len(reports)}, "knowledge_service": {"required": False, **KnowledgeClient().health()}, "semantic": semantic[0] if len(semantic) == 1 else ({"available": False, "strategy": "keyword-only"} if native_ready else semantic), "routing": routing, "agents": routing.get("agents", {"configured": [], "covered": []}), "sources": reports, "config": config_summary(), "upstream_components": vendor_components_report(), "actions": actions}
 
 
 def feedback(root: Path | None, result_id: str, note: str, rating: str | None = None, feedback_id: str | None = None) -> dict[str, Any]:
@@ -1335,8 +1638,8 @@ def build_parser() -> argparse.ArgumentParser:
     common("doctor").add_argument("--json", action="store_true")
     sync = common("sync"); sync.add_argument("--deep", action="store_true"); sync.add_argument("--local", action="store_true"); sync.add_argument("--all", action="store_true"); sync.add_argument("--json", action="store_true")
     search_parser = common("search"); search_parser.add_argument("query"); search_parser.add_argument("--limit", type=int, default=5); search_parser.add_argument("--deep", action="store_true"); search_parser.add_argument("--local", action="store_true"); search_parser.add_argument("--scope", choices=("repository", "memory", "all"), default="repository"); search_parser.add_argument("--json", action="store_true")
-    get_parser = common("get"); get_parser.add_argument("result_id"); get_parser.add_argument("--commit"); get_parser.add_argument("--json", action="store_true")
-    explain_parser = common("explain"); explain_parser.add_argument("result_id"); explain_parser.add_argument("--commit"); explain_parser.add_argument("--json", action="store_true")
+    get_parser = common("get"); get_parser.add_argument("result_id"); get_parser.add_argument("--commit"); get_parser.add_argument("--line-start", type=int); get_parser.add_argument("--line-end", type=int); get_parser.add_argument("--json", action="store_true")
+    explain_parser = common("explain"); explain_parser.add_argument("result_id"); explain_parser.add_argument("--commit"); explain_parser.add_argument("--line-start", type=int); explain_parser.add_argument("--line-end", type=int); explain_parser.add_argument("--json", action="store_true")
     feedback_parser = common("feedback"); feedback_parser.add_argument("result_id"); feedback_parser.add_argument("--note", required=True); feedback_parser.add_argument("--rating"); feedback_parser.add_argument("--feedback-id"); feedback_parser.add_argument("--json", action="store_true")
     promote_parser = common("promote"); promote_parser.add_argument("--input", required=True); promote_parser.add_argument("--json", action="store_true")
     publish_parser = common("publish"); publish_parser.add_argument("--input", required=True); publish_parser.add_argument("--status", choices=("candidate", "active"), default="candidate"); publish_parser.add_argument("--json", action="store_true")
@@ -1351,6 +1654,7 @@ def build_parser() -> argparse.ArgumentParser:
     source_parser = sub.add_parser("source"); source_parser.add_argument("action", choices=("add", "list", "remove")); source_parser.add_argument("--path"); source_parser.add_argument("--id", dest="source_id"); source_parser.add_argument("--repository"); source_parser.add_argument("--profile"); source_parser.add_argument("--local-only", action="store_true"); source_parser.add_argument("--no-sync", action="store_true"); source_parser.add_argument("--json", action="store_true")
     evaluate_parser = common("evaluate"); evaluate_parser.add_argument("--queries", required=True); evaluate_parser.add_argument("--qrels", required=True); evaluate_parser.add_argument("--limit", type=int, default=5); evaluate_parser.add_argument("--deep", action="store_true"); evaluate_parser.add_argument("--local", action="store_true"); evaluate_parser.add_argument("--scope", choices=("repository", "memory", "all"), default="repository"); evaluate_parser.add_argument("--revision"); evaluate_parser.add_argument("--fallback-only", action="store_true"); evaluate_parser.add_argument("--json", action="store_true")
     team_evaluate_parser = common("team-evaluate"); team_evaluate_parser.add_argument("--records", required=True); team_evaluate_parser.add_argument("--queries", required=True); team_evaluate_parser.add_argument("--qrels", required=True); team_evaluate_parser.add_argument("--limit", type=int, default=5); team_evaluate_parser.add_argument("--gate", action="store_true"); team_evaluate_parser.add_argument("--min-p1", type=float, default=1.0); team_evaluate_parser.add_argument("--min-recall", type=float, default=1.0); team_evaluate_parser.add_argument("--min-negative", type=float, default=1.0); team_evaluate_parser.add_argument("--max-candidate-contamination", type=float, default=0.0); team_evaluate_parser.add_argument("--json", action="store_true")
+    compact_parser = common("team-compact"); compact_parser.add_argument("--keep", type=int, default=1); compact_parser.add_argument("--json", action="store_true")
     memorycore = sub.add_parser("memorycore")
     memorycore.add_argument("action", choices=["configure", "install", "start", "stop", "status", "promote-l3"])
     memorycore.add_argument("--memorycore-root")
@@ -1361,9 +1665,39 @@ def build_parser() -> argparse.ArgumentParser:
     memorycore.add_argument("--team-id")
     memorycore.add_argument("--agent-id")
     memorycore.add_argument("--user-id")
+    memorycore.add_argument("--pipeline-mode", choices=("native", "fast"))
     memorycore.add_argument("--candidate")
     memorycore.add_argument("--accept", action="store_true")
     memorycore.add_argument("--json", action="store_true")
+    knowledge = sub.add_parser("knowledge")
+    knowledge.add_argument("action", choices=("status", "configure", "install", "start", "stop", "create", "sync", "search"))
+    knowledge.add_argument("--root", default=argparse.SUPPRESS)
+    knowledge.add_argument("--source")
+    knowledge.add_argument("--wiki-id")
+    knowledge.add_argument("--endpoint")
+    knowledge.add_argument("--port", type=int)
+    knowledge.add_argument("--state-dir")
+    knowledge.add_argument("--service-id")
+    knowledge.add_argument("--team-id")
+    knowledge.add_argument("--user-id")
+    knowledge.add_argument("--agent-id")
+    knowledge.add_argument("--node-modules")
+    knowledge.add_argument("--name")
+    knowledge.add_argument("--query")
+    knowledge.add_argument("--limit", type=int, default=5)
+    knowledge.add_argument("--deep", action="store_true")
+    knowledge.add_argument("--json", action="store_true")
+    memmy = sub.add_parser("memmy")
+    memmy.add_argument("action", choices=("status", "configure", "search"))
+    memmy.add_argument("--endpoint")
+    memmy.add_argument("--profile-id")
+    memmy.add_argument("--user-id")
+    memmy.add_argument("--query")
+    memmy.add_argument("--limit", type=int, default=5)
+    memmy.add_argument("--json", action="store_true")
+    gui = sub.add_parser("gui")
+    gui.add_argument("--open", action="store_true")
+    gui.add_argument("--json", action="store_true")
     common("mcp")
     return parser
 
@@ -1378,7 +1712,13 @@ def _mcp_dispatch(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     if name == "memory_search":
         return search(root, str(arguments.get("query") or ""), int(arguments.get("limit") or 5), bool(arguments.get("deep")), source, bool(arguments.get("local")), str(arguments.get("scope") or "repository"))
     if name == "memory_get":
-        return get_result(root, str(arguments.get("id") or ""), expected_commit=str(arguments.get("commit") or "") or None)
+        return get_result(
+            root,
+            str(arguments.get("id") or ""),
+            expected_commit=str(arguments.get("commit") or "") or None,
+            line_start=int(arguments["line_start"]) if arguments.get("line_start") is not None else None,
+            line_end=int(arguments["line_end"]) if arguments.get("line_end") is not None else None,
+        )
     if name == "memory_context":
         return memory_context(root, str(arguments.get("query") or ""), limit=int(arguments.get("limit") or 5), source_id=source, repo=str(arguments.get("repo") or "") or None, issue=str(arguments.get("issue") or "") or None, branch=str(arguments.get("branch") or "") or None, agent=str(arguments.get("agent") or "") or None, local=bool(arguments.get("local")))
     if name == "memory_team_sync":
@@ -1449,7 +1789,7 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
                 return _mcp_dispatch(name, arguments)
             return serve(dispatch)
         gate_failed = False
-        root = None if args.command in {"init", "source", "doctor", "sync", "search", "get", "explain", "feedback", "promote", "publish", "team-activate", "team-export", "team-import", "team-evaluate", "context", "supersede", "ingest-session", "capture-turn"} else resolve_root(root_arg)
+        root = None if args.command in {"init", "source", "doctor", "sync", "search", "get", "explain", "feedback", "promote", "publish", "team-activate", "team-export", "team-import", "team-evaluate", "team-compact", "context", "supersede", "ingest-session", "capture-turn", "knowledge", "memmy", "gui"} else resolve_root(root_arg)
         if args.command in {"init", "source"} and root_arg:
             root = resolve_root(root_arg)
         if args.command == "doctor":
@@ -1459,9 +1799,9 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
         elif args.command == "search":
             value = search(root if root_arg else None, args.query, args.limit, args.deep, getattr(args, "source", None), args.local, args.scope)
         elif args.command == "get":
-            value = get_result(root if root_arg else None, args.result_id, expected_commit=args.commit)
+            value = get_result(root if root_arg else None, args.result_id, expected_commit=args.commit, line_start=args.line_start, line_end=args.line_end)
         elif args.command == "explain":
-            value = get_result(root if root_arg else None, args.result_id, explain=True, expected_commit=args.commit)
+            value = get_result(root if root_arg else None, args.result_id, explain=True, expected_commit=args.commit, line_start=args.line_start, line_end=args.line_end)
         elif args.command == "feedback":
             value = feedback(root, args.result_id, args.note, args.rating, args.feedback_id)
         elif args.command == "promote":
@@ -1492,6 +1832,11 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
                 gate_failed = bool(failures)
                 value["ok"] = not gate_failed
                 value["gate"] = {"passed": not gate_failed, "failures": failures, "thresholds": {"min_p1": args.min_p1, "min_recall": args.min_recall, "min_negative": args.min_negative, "max_candidate_contamination": args.max_candidate_contamination}}
+        elif args.command == "team-compact":
+            from team_memory import team_memory_backend
+
+            backend = team_memory_backend()
+            value = backend.compact(keep=args.keep)
         elif args.command == "context":
             value = memory_context(root if root_arg else None, args.query, limit=args.limit, source_id=getattr(args, "source", None), repo=args.repo, issue=args.issue, branch=args.branch, agent=args.agent, local=args.local)
         elif args.command == "supersede":
@@ -1506,6 +1851,78 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
             except json.JSONDecodeError:
                 payload = [json.loads(line) for line in raw.splitlines() if line.strip()]
             value = capture_turn(root if root_arg else None, payload, getattr(args, "source", None))
+        elif args.command == "knowledge":
+            from knowledge import KnowledgeClient
+
+            client = KnowledgeClient()
+            if args.action in {"configure", "install", "start", "stop"}:
+                from knowledge_service import main as knowledge_service_main
+
+                service_args = [args.action]
+                if args.action == "configure":
+                    for name in ("root", "endpoint", "port", "state_dir", "service_id", "team_id", "user_id", "agent_id", "wiki_id", "node_modules"):
+                        value = getattr(args, name, None)
+                        if value is not None:
+                            service_args.extend([f"--{name.replace('_', '-')}", str(value)])
+                return knowledge_service_main(service_args)
+            if args.action == "status":
+                value = {"schema_version": SCHEMA_VERSION, **client.health(), "wiki_id": client.wiki_id, "code_graph_id": client.code_graph_id}
+            elif args.action == "create":
+                if not args.name:
+                    raise RuntimeError("knowledge create requires --name")
+                value = {"schema_version": SCHEMA_VERSION, "ok": True, "operation": "create-wiki", "result": client.create_wiki(args.name), "canonical_repo_changed": False}
+            elif args.action == "search":
+                if not args.query:
+                    raise RuntimeError("knowledge search requires --query")
+                wiki_id = args.wiki_id or client.wiki_id
+                if not wiki_id:
+                    raise RuntimeError("knowledge search requires --wiki-id or a configured knowledge.wiki_id")
+                raw = client.search(wiki_id, args.query, max(1, min(args.limit, 100)))
+                # MemoryKnowledge pages do not inherently carry the Git
+                # commit/line contract.  Keep them as candidates until a
+                # caller validates the returned path against repository view.
+                value = {"schema_version": SCHEMA_VERSION, "ok": True, "source": "tencentdb-memoryknowledge", "wiki_id": wiki_id, "verified": [], "candidates": raw.get("results", raw.get("items", [])), "abstain": not bool(raw.get("results", raw.get("items", []))), "retrieval_mode": "keyword-only", "citation_policy": "unverified-until-repository-readback", "canonical_repo_changed": False}
+            elif args.action == "sync":
+                if root is None and not args.source:
+                    root = resolve_root(root_arg)
+                wiki_id = args.wiki_id or client.wiki_id
+                if not wiki_id:
+                    raise RuntimeError("knowledge sync requires --wiki-id or a configured knowledge.wiki_id")
+                specs = discover_sources(str(root) if root is not None else None, args.source)
+                if len(specs) != 1:
+                    raise RuntimeError("knowledge sync requires one source; pass --source <id>")
+                view = prepare_view(specs[0], local=False)
+                value = {
+                    "schema_version": SCHEMA_VERSION,
+                    "operation": "knowledge-sync",
+                    "source": specs[0].id,
+                    "repository": specs[0].repository,
+                    "commit": view.commit,
+                    "commit_type": view.commit_type,
+                    "freshness": view.freshness,
+                    **client.sync_source(view.path, wiki_id, deep=args.deep),
+                }
+        elif args.command == "memmy":
+            client = memmy_memory_client()
+            if args.action == "status":
+                value = {"schema_version": SCHEMA_VERSION, **client.health(), "canonical_repo_changed": False}
+            elif args.action == "configure":
+                if not args.endpoint:
+                    raise RuntimeError("memmy configure requires --endpoint")
+                value = {"schema_version": SCHEMA_VERSION, **configure_memmy(args.endpoint, args.profile_id, args.user_id), "canonical_repo_changed": False}
+            elif args.action == "search":
+                if not args.query:
+                    raise RuntimeError("memmy search requires --query")
+                value = {
+                    "schema_version": SCHEMA_VERSION,
+                    "ok": True,
+                    "provider": "memmy",
+                    "retrieval_mode": client.health().get("embedding", {}).get("strategy", "keyword-only"),
+                    "results": client.search(args.query, args.limit),
+                    "canonical_repo_changed": False,
+                }
+        elif args.command == "gui":
+            value = memmy_gui(args.open)
         elif args.command == "init":
             value = init_source(args.path, args.source_id, args.repository, args.profile, not args.no_sync, args.local_only)
         elif args.command == "source":
@@ -1538,7 +1955,7 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
 
             service_args = [args.action]
             if args.action == "configure":
-                for name in ("memorycore_root", "endpoint", "llm_base_url", "state_dir", "team_id", "agent_id", "user_id"):
+                for name in ("memorycore_root", "endpoint", "llm_base_url", "state_dir", "team_id", "agent_id", "user_id", "pipeline_mode"):
                     value = getattr(args, name, None)
                     if value:
                         service_args.extend([f"--{name.replace('_', '-')}", str(value)])

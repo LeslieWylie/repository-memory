@@ -20,7 +20,8 @@ import core
 from citation import locate, validate
 from evaluate import evaluate_queries
 from fallback import paths, query_terms
-from memorycore import MemoryCoreClient, MemoryCoreConfig
+from memorycore import MemoryCoreClient, MemoryCoreConfig, MemoryCoreError
+from memmy import MemmyClient, MemmyConfig
 from mcp_server import SERVER_VERSION
 from snapshot import _snapshot_lock, prepare_view, snapshot_lock_backend
 from team_memory import TeamMemoryStore
@@ -109,14 +110,15 @@ class RepositoryMemoryTest(unittest.TestCase):
     def test_runtime_version_comes_from_skill_version_file(self):
         self.assertEqual(SERVER_VERSION, VERSION)
         self.assertEqual(VERSION, (SCRIPTS.parent / "VERSION").read_text(encoding="utf-8").strip())
-        self.assertEqual(VERSION, "0.2.0")
+        self.assertEqual(VERSION, "0.3.1")
 
     def test_multisource_search_has_verified_and_candidates(self):
         result = core.search(None, "Atlas evidence", limit=5)
         self.assertFalse(result["abstain"])
         self.assertEqual({item["source"] for item in result["verified"]}, {"alpha", "beta"})
         self.assertEqual(result["verified"][0]["citation"]["valid"], True)
-        self.assertEqual(result["results"], result["verified"])
+        self.assertEqual(result["results"], result["answerable"])
+        self.assertEqual(len(result["answerable"]), len(result["verified"]))
 
         pending = core.search(None, "pending candidate", limit=5)
         self.assertTrue(pending["abstain"])
@@ -398,6 +400,97 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(imported["imported"]["inserted"], 20)
         self.assertEqual(TeamMemoryStore(imported_db).health()["record_count"], 20)
 
+    def test_team_memory_import_replays_feedback(self):
+        """Cross-machine feedback import recalculates confidence/status; duplicate is idempotent."""
+        a_path = Path(self.temp.name) / "feedback-a.sqlite3"
+        node_a = TeamMemoryStore(a_path, node_id="node-a")
+        pub = node_a.publish({
+            "type": "decision", "title": "Import replay target",
+            "content": "Used to verify feedback replay on cross-machine import.",
+            "status": "active", "confidence": 0.9,
+        }, default_status="active")
+        mid = pub["memory"]["id"]
+        self.assertEqual(node_a.get(mid)["result"]["status"], "active")
+        self.assertAlmostEqual(node_a.get(mid)["result"]["confidence"], 0.9)
+
+        # Feedbacks that should reduce confidence / trigger lifecycle transitions
+        node_a.feedback(mid, "wrong", "rejected on A", agent="reviewer-a", feedback_id="fb-1")
+        a_after = node_a.get(mid)["result"]
+        self.assertEqual(a_after["status"], "stale")
+        self.assertAlmostEqual(a_after["confidence"], 0.8)
+        bundle = node_a.export_bundle()
+
+        # Machine B: same initial state, import bundle → should replay transition
+        b_path = Path(self.temp.name) / "feedback-b.sqlite3"
+        node_b = TeamMemoryStore(b_path, node_id="node-b")
+        pub_b = node_b.publish({
+            "type": "decision", "title": "Import replay target",
+            "content": "Used to verify feedback replay on cross-machine import.",
+            "status": "active", "confidence": 0.9,
+        }, default_status="active")
+        self.assertEqual(pub_b["memory"]["id"], mid)
+        self.assertEqual(node_b.get(mid)["result"]["status"], "active")
+        self.assertAlmostEqual(node_b.get(mid)["result"]["confidence"], 0.9)
+
+        result = node_b.import_bundle(bundle)
+        self.assertEqual(result["imported"]["feedback_added"], 1)
+        self.assertEqual(result["imported"]["feedback_replayed"], 1)
+        b_after = node_b.get(mid)["result"]
+        self.assertEqual(b_after["status"], "stale")
+        self.assertAlmostEqual(b_after["confidence"], 0.8)
+
+        # Duplicate import must not double-de-rank
+        dup = node_b.import_bundle(bundle)
+        self.assertEqual(dup["imported"]["feedback_added"], 0)
+        self.assertEqual(dup["imported"]["feedback_replayed"], 0)
+        b_dup = node_b.get(mid)["result"]
+        self.assertEqual(b_dup["status"], "stale")
+        self.assertAlmostEqual(b_dup["confidence"], 0.8)
+        self.assertEqual(b_dup["revision"], b_after["revision"])
+
+        # "stale" rating with 2 agents triggers status transition on import
+        c_path = Path(self.temp.name) / "feedback-c.sqlite3"
+        node_c = TeamMemoryStore(c_path, node_id="node-c")
+        node_c.publish({
+            "type": "decision", "title": "Stale-by-import",
+            "content": "Will receive stale feedback via import from two agents.",
+            "status": "active", "confidence": 0.9,
+        }, default_status="active")
+
+        bundle_a = TeamMemoryStore(Path(self.temp.name) / "fb-stale-a.sqlite3", node_id="agent-a").publish({
+            "type": "decision", "title": "Stale-by-import",
+            "content": "Will receive stale feedback via import from two agents.",
+            "status": "active", "confidence": 0.9,
+        }, default_status="active")
+        # Build a bundle with "stale" feedback from agent-x
+        tmp_x_path = Path(self.temp.name) / "tmp-x.sqlite3"
+        node_x = TeamMemoryStore(tmp_x_path, node_id="node-x")
+        node_x.publish({
+            "type": "decision", "title": "Stale-by-import",
+            "content": "Will receive stale feedback via import from two agents.",
+            "status": "active", "confidence": 0.9,
+        }, default_status="active")
+        node_x.feedback(bundle_a["memory"]["id"], "stale", "old", agent="agent-x", feedback_id="sfb-1")
+        r1 = node_c.import_bundle(node_x.export_bundle())
+        self.assertEqual(r1["imported"]["feedback_replayed"], 1)
+        c_after_1 = node_c.get(bundle_a["memory"]["id"])["result"]
+        self.assertEqual(c_after_1["status"], "active")  # only 1 agent, not stale yet
+        self.assertAlmostEqual(c_after_1["confidence"], 0.8)
+
+        tmp_y_path = Path(self.temp.name) / "tmp-y.sqlite3"
+        node_y = TeamMemoryStore(tmp_y_path, node_id="node-y")
+        node_y.publish({
+            "type": "decision", "title": "Stale-by-import",
+            "content": "Will receive stale feedback via import from two agents.",
+            "status": "active", "confidence": 0.9,
+        }, default_status="active")
+        node_y.feedback(bundle_a["memory"]["id"], "stale", "also old", agent="agent-y", feedback_id="sfb-2")
+        r2 = node_c.import_bundle(node_y.export_bundle())
+        self.assertEqual(r2["imported"]["feedback_replayed"], 1)
+        c_after_2 = node_c.get(bundle_a["memory"]["id"])["result"]
+        self.assertEqual(c_after_2["status"], "stale")  # 2 agents → stale
+        self.assertAlmostEqual(c_after_2["confidence"], 0.7)
+
     def test_team_memory_activation_and_causal_merge_conflict(self):
         base_path = Path(self.temp.name) / "base.sqlite3"
         node_a = TeamMemoryStore(base_path, node_id="node-a")
@@ -518,7 +611,6 @@ class RepositoryMemoryTest(unittest.TestCase):
             {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {"_meta": modern_meta}},
             {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"_meta": modern_meta, "name": "memory_search", "arguments": {"query": "Atlas evidence"}}},
             {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"_meta": modern_meta, "name": "not-a-memory-tool", "arguments": {"source": "alpha"}}},
-            {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"_meta": modern_meta, "name": "memory_context", "arguments": {"query": "Atlas evidence"}}},
         ]
         process = subprocess.run(command, input="\n".join(json.dumps(item) for item in requests) + "\n", text=True, capture_output=True, check=True)
         responses = [json.loads(line) for line in process.stdout.splitlines() if line.strip()]
@@ -526,16 +618,13 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(responses[0]["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "repository-memory")
         self.assertEqual(responses[0]["result"]["resultType"], "complete")
         self.assertEqual(responses[1]["result"]["resultType"], "complete")
-        self.assertEqual({tool["name"] for tool in responses[1]["result"]["tools"]}, {"memory_doctor", "memory_sync", "memory_search", "memory_get", "memory_init", "memory_ingest", "memory_context", "memory_team_sync", "memory_team_activate", "memory_publish", "memory_feedback", "memory_supersede"})
+        self.assertEqual({tool["name"] for tool in responses[1]["result"]["tools"]}, {"memory_doctor", "memory_sync", "memory_search", "memory_get"})
         payload = responses[2]["result"]["structuredContent"]
         self.assertEqual(responses[2]["result"]["resultType"], "complete")
         self.assertIn("verified", payload)
         self.assertIn("candidates", payload)
         self.assertFalse(payload["abstain"])
         self.assertEqual({item["source"] for item in payload["verified"]}, {"alpha"})
-        context_payload = responses[4]["result"]["structuredContent"]
-        self.assertIn("repository_evidence", context_payload["context"])
-        self.assertEqual(context_payload["semantic_available"], False)
         error_data = responses[3]["error"]["data"]
         self.assertEqual(error_data["adapter"], "repository-memory-runtime")
         self.assertEqual(error_data["source"], "alpha")
@@ -584,7 +673,8 @@ class RepositoryMemoryTest(unittest.TestCase):
             {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {"_meta": meta}},
             {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"_meta": meta, "name": "memory_search", "arguments": {"query": "Atlas evidence"}}},
         ]
-        process = subprocess.run(command, input="\n".join(json.dumps(item) for item in requests) + "\n", text=True, capture_output=True, check=True)
+        environment = {**os.environ, "REPOSITORY_MEMORY_AGENT_ID": "yaole"}
+        process = subprocess.run(command, input="\n".join(json.dumps(item) for item in requests) + "\n", text=True, capture_output=True, check=True, env=environment)
         responses = [json.loads(line) for line in process.stdout.splitlines() if line.strip()]
         self.assertEqual(len(responses), 3)
         self.assertIn("verified", responses[2]["result"]["structuredContent"])
@@ -596,9 +686,11 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertTrue(search_request["query_sha256"])
         self.assertEqual(search_request["protocol_version"], "2026-07-28")
         self.assertTrue(search_request["modern_protocol"])
+        self.assertEqual(search_request["agent"], "yaole")
         self.assertNotIn("Atlas evidence", audit_log.read_text(encoding="utf-8"))
         self.assertEqual(search_response["verified_count"], 1)
         self.assertEqual(search_response["protocol_version"], "2026-07-28")
+        self.assertEqual(search_response["agent"], "yaole")
 
     def test_audit_proxy_labels_legacy_host_after_negotiation(self):
         audit_log = Path(self.temp.name) / "legacy-audit.jsonl"
@@ -706,6 +798,10 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(normalized["memory"], {"layer": "L1", "type": "atomic", "query_source": "memorycore", "strategy": "keyword"})
         self.assertTrue(normalized["citation"]["valid"])
         self.assertEqual(normalized["repository"], "alpha")
+        self.assertEqual(normalized["layer"], "L1")
+        self.assertEqual(normalized["status"], "secondary")
+        self.assertEqual(normalized["readback"]["receipt"], "repository-citation-readback")
+        self.assertEqual(normalized["provenance"]["repository"], "alpha")
 
     def test_explicit_session_ingest_uses_legacy_adapter_and_reports_layers(self):
         legacy = Path(self.temp.name) / "legacy-adapter.py"
@@ -780,7 +876,7 @@ class RepositoryMemoryTest(unittest.TestCase):
             self.assertEqual(normalized["source"], "memorycore")
             self.assertIsNone(normalized["path"])
 
-    def test_memorycore_doctor_probes_each_supported_layer(self):
+    def test_memorycore_doctor_reports_empty_layers_without_claiming_population(self):
         config = MemoryCoreConfig(endpoint="http://127.0.0.1:8420", api_key=None, team_id="team", agent_id="agent", user_id="user")
         client = MemoryCoreClient(config)
         responses = iter([
@@ -793,11 +889,144 @@ class RepositoryMemoryTest(unittest.TestCase):
         with patch.object(client, "_request", side_effect=lambda *_args, **_kwargs: next(responses)):
             report = client.health(refresh=True, probe_layers=True)
         self.assertEqual(set(report["layers"]), {"L0", "L1", "L2", "L3"})
-        self.assertTrue(all(item["reachable"] for item in report["layers"].values()))
+        for layer in ("L0", "L1", "L2", "L3"):
+            state = report["layers"][layer]
+            self.assertEqual(state["capability"], "supported")
+            self.assertEqual(state["api_status"], "ready")
+            self.assertEqual(state["population"], "empty")
+            self.assertEqual(state["readback"], "verified")
+
+    def test_memorycore_health_reports_gateway_embedding_capability(self):
+        config = MemoryCoreConfig(endpoint="http://127.0.0.1:8420", api_key=None, team_id="team", agent_id="agent", user_id="user")
+        client = MemoryCoreClient(config)
+        with patch.object(client, "_request", return_value={"code": 0, "data": {"status": "ok", "stores": {"vectorStore": True, "embeddingService": True}}}):
+            report = client.health(refresh=True)
+        self.assertTrue(report["embedding"]["available"])
+        self.assertEqual(report["embedding"]["strategy"], "hybrid")
+        self.assertTrue(report["server_stores"]["embedding_service"])
+
+    def test_memorycore_get_pages_until_l0_record_is_found(self):
+        config = MemoryCoreConfig(endpoint="http://127.0.0.1:8420", api_key=None, team_id="team", agent_id="agent", user_id="user")
+        client = MemoryCoreClient(config)
+
+        def request(method, path, body=None):
+            self.assertEqual(method, "POST")
+            self.assertEqual(path, "/v3/conversation/query")
+            offset = body.get("offset", 0)
+            if offset == 0:
+                return {"code": 0, "data": {"messages": [{"id": "msg-first", "content": "first"}], "total": 101}}
+            return {"code": 0, "data": {"messages": [{"id": "msg-late", "content": "late evidence"}], "total": 101}}
+
+        with patch.object(client, "_request", side_effect=request):
+            result = client.get("memorycore:L0:msg-late")
+        self.assertEqual(result["memory"]["content"], "late evidence")
+        self.assertEqual(result["citation"]["memory_id"], "msg-late")
+        self.assertTrue(result["citation"]["valid"])
+
+    def test_memmy_client_preserves_local_embedding_and_layer_identity(self):
+        client = MemmyClient(MemmyConfig("http://127.0.0.1:18960", True, "repository-memory", "repository-memory", "user"))
+        with patch.object(client, "_request", return_value={
+            "debug": {"hits": [{"id": "trace-1", "kind": "trace", "memoryLayer": "L1", "status": "activated", "snippet": "local semantic memory", "score": 0.9}]}
+        }):
+            results = client.search("semantic", 5)
+        self.assertEqual(results[0]["id"], "memmy:L1:trace-1")
+        self.assertEqual(results[0]["_memory_backend"], "memmy")
+        self.assertEqual(results[0]["citation"]["source"], "memmy")
+
+    def test_memmy_get_preserves_skill_layer_and_citation(self):
+        client = MemmyClient(MemmyConfig("http://127.0.0.1:18960", True, "repository-memory", "repository-memory", "user"))
+        with patch.object(client, "_request", return_value={
+            "id": "skill-1",
+            "kind": "skill",
+            "memoryLayer": "Skill",
+            "status": "resolving",
+            "body": "a provider skill",
+        }):
+            result = client.get("memmy:Skill:skill-1")
+        self.assertEqual(result["memory_layer"], "Skill")
+        self.assertEqual(result["citation"]["layer"], "Skill")
+        self.assertEqual(result["citation"]["memory_id"], "skill-1")
+
+    def test_memorycore_doctor_maps_present_l0_l1_and_empty_l2_l3(self):
+        config = MemoryCoreConfig(endpoint="http://127.0.0.1:8420", api_key=None, team_id="team", agent_id="agent", user_id="user")
+        client = MemoryCoreClient(config)
+        responses = iter([
+            {"code": 0, "data": {"status": "ok"}},
+            {"code": 0, "data": {"messages": [{"id": "message-1", "content": "raw"}], "total": 1}},
+            {"code": 0, "data": {"items": [{"id": "atomic-1", "content": "fact"}], "total": 1}},
+            {"code": 0, "data": {"entries": [], "total": 0}},
+            {"code": 0, "data": {"content": ""}},
+        ])
+        with patch.object(client, "_request", side_effect=lambda *_args, **_kwargs: next(responses)):
+            layers = client.health(refresh=True, probe_layers=True)["layers"]
+        self.assertEqual(layers["L0"]["population"], "present")
+        self.assertEqual(layers["L0"]["record_count"], 1)
+        self.assertEqual(layers["L1"]["population"], "present")
+        self.assertEqual(layers["L1"]["record_count"], 1)
+        self.assertEqual(layers["L2"]["population"], "empty")
+        self.assertEqual(layers["L3"]["population"], "empty")
+
+    def test_memorycore_doctor_preserves_pending_and_unknown_responses(self):
+        config = MemoryCoreConfig(endpoint="http://127.0.0.1:8420", api_key=None, team_id="team", agent_id="agent", user_id="user")
+        client = MemoryCoreClient(config)
+        responses = iter([
+            {"code": 0, "data": {"status": "ok"}},
+            {"code": 0, "data": {"messages": [], "total": 0}},
+            {"code": 0, "data": {"status": "pending", "items": [], "total": 0}},
+            {"code": 0, "data": {}},
+            {"code": 0, "data": {"status": "pending", "content": ""}},
+        ])
+        with patch.object(client, "_request", side_effect=lambda *_args, **_kwargs: next(responses)):
+            layers = client.health(refresh=True, probe_layers=True)["layers"]
+        self.assertEqual(layers["L1"]["population"], "empty")
+        self.assertEqual(layers["L1"]["readback"], "pending")
+        self.assertEqual(layers["L2"]["api_status"], "ready")
+        self.assertEqual(layers["L2"]["population"], "unknown")
+        self.assertEqual(layers["L2"]["readback"], "unknown")
+        self.assertEqual(layers["L3"]["population"], "empty")
+        self.assertEqual(layers["L3"]["readback"], "pending")
+
+    def test_memorycore_doctor_marks_layer_population_unknown_when_unreachable(self):
+        config = MemoryCoreConfig(endpoint="http://127.0.0.1:8420", api_key=None, team_id="team", agent_id="agent", user_id="user")
+        client = MemoryCoreClient(config)
+        with patch.object(client, "_request", side_effect=MemoryCoreError("service unavailable")):
+            report = client.health(refresh=True, probe_layers=True)
+        self.assertEqual(report["status"], "unreachable")
+        for state in report["layers"].values():
+            self.assertEqual(state["capability"], "supported")
+            self.assertEqual(state["api_status"], "unreachable")
+            self.assertEqual(state["population"], "unknown")
+            self.assertEqual(state["readback"], "unknown")
+
+    def test_memorycore_doctor_isolates_one_unreachable_layer_api(self):
+        config = MemoryCoreConfig(endpoint="http://127.0.0.1:8420", api_key=None, team_id="team", agent_id="agent", user_id="user")
+        client = MemoryCoreClient(config)
+        responses = iter([
+            {"code": 0, "data": {"status": "ok"}},
+            {"code": 0, "data": {"messages": [], "total": 0}},
+            MemoryCoreError("atomic API unavailable"),
+            {"code": 0, "data": {"entries": [], "total": 0}},
+            {"code": 0, "data": {"content": ""}},
+        ])
+
+        def respond(*_args, **_kwargs):
+            value = next(responses)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        with patch.object(client, "_request", side_effect=respond):
+            layers = client.health(refresh=True, probe_layers=True)["layers"]
+        self.assertEqual(layers["L0"]["api_status"], "ready")
+        self.assertEqual(layers["L1"]["api_status"], "unreachable")
+        self.assertEqual(layers["L1"]["population"], "unknown")
+        self.assertEqual(layers["L1"]["readback"], "unknown")
+        self.assertEqual(layers["L2"]["api_status"], "ready")
+        self.assertEqual(layers["L3"]["api_status"], "ready")
 
     def test_document_verification_is_independent_from_claim_coverage(self):
         composite = self.alpha / "docs" / "composite.md"
-        composite.write_text("# Composite\nAtlas and alpha are introduced here.\n" + ("context line\n" * 14) + "beta is documented in the same record.\n", encoding="utf-8")
+        composite.write_text("# Composite\nAtlas and alpha are introduced here.\n" + ("context line\n" * 30) + "beta is documented in the same record.\n", encoding="utf-8")
         subprocess.run(["git", "-C", str(self.alpha), "add", str(composite)], check=True)
         subprocess.run(["git", "-C", str(self.alpha), "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "composite"], check=True)
         self.write_config({"sources": [{"id": "alpha", "root": str(self.alpha)}]})
@@ -808,6 +1037,9 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(hit["support"]["claim_support"], "partial")
         self.assertIn("beta", hit["support"]["unmatched_terms"])
         self.assertGreaterEqual(hit["line_end"], hit["line_start"])
+        self.assertTrue(result["abstain"])
+        self.assertEqual(result["answerable"], [])
+        self.assertTrue(result["diagnostics"]["claim_abstain"])
 
     def test_unrelated_adapter_excerpt_cannot_become_verified(self):
         view = prepare_view(SourceSpec("alpha", self.alpha, "alpha"), local=True)
@@ -848,6 +1080,19 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertFalse(mismatch["found"])
         self.assertEqual(mismatch["errors"][0]["expected_commit"], "different-commit")
 
+    def test_get_can_pin_search_line_window(self):
+        document = self.alpha / "docs" / "long.md"
+        document.write_text("\n".join([f"line {index}" for index in range(1, 31)]) + "\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.alpha), "add", str(document)], check=True)
+        subprocess.run(["git", "-C", str(self.alpha), "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "long"], check=True)
+        self.write_config({"sources": [{"id": "alpha", "root": str(self.alpha)}]})
+        fetched = core.get_result(self.alpha, "alpha:docs/long.md", line_start=21, line_end=23)
+        self.assertTrue(fetched["found"])
+        self.assertEqual(fetched["result"]["citation"]["line_start"], 21)
+        self.assertEqual(fetched["result"]["citation"]["line_end"], 23)
+        self.assertEqual(fetched["result"]["evidence_window"], {"line_start": 21, "line_end": 23, "requested_line_start": 21, "requested_line_end": 23, "truncated": True})
+        self.assertEqual(fetched["result"]["excerpt"], "line 21\nline 22\nline 23")
+
     def test_scope_routes_repository_and_memory_without_score_fusion(self):
         native = Mock()
         native.configured = True
@@ -868,6 +1113,9 @@ class RepositoryMemoryTest(unittest.TestCase):
             adapter.memory_search.assert_not_called()
             memory = core.search(self.alpha, "conversation evidence", local=True, scope="memory")
             self.assertEqual(memory["verified"][0]["memory"]["layer"], "L0")
+            self.assertEqual(memory["verified"][0]["layer"], "L0")
+            self.assertEqual(memory["verified"][0]["status"], "verified")
+            self.assertTrue(memory["verified"][0]["readback"]["verified"])
             adapter.memory_search.assert_called_once()
             combined = core.search(self.alpha, "conversation evidence", local=True, scope="all")
             self.assertIn("repository", combined["groups"])
@@ -980,6 +1228,8 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertIn("repository-memory", alpha["skills"])
         self.assertNotIn("rlvr-memory", alpha["skills"])
         self.assertIn("repository-memory__memory_search", alpha["tools"]["alsoAllow"])
+        self.assertNotIn("repository-memory__memory_context", alpha["tools"]["alsoAllow"])
+        self.assertNotIn("repository-memory__memory_publish", alpha["tools"]["alsoAllow"])
         self.assertNotIn("repository-memory", beta.get("skills", []))
         self.assertNotIn("repository-memory__memory_search", beta.get("tools", {}).get("alsoAllow", []))
         wrapper = machine / ".local" / "bin" / ("repository-memory.cmd" if os.name == "nt" else "repository-memory")
@@ -1081,6 +1331,11 @@ class RepositoryMemoryTest(unittest.TestCase):
     def test_local_memory_fallback_is_durable_without_native_backend(self):
         self.write_config({})
         os.environ["REPOSITORY_MEMORY_AUTODISCOVER"] = "0"
+        empty_memory = core.doctor(None)["memory"]
+        self.assertEqual(empty_memory["layers"]["L0"]["population"], "empty")
+        self.assertEqual(empty_memory["layers"]["L1"]["population"], "empty")
+        self.assertEqual(empty_memory["layers"]["L2"]["capability"], "unsupported")
+        self.assertEqual(empty_memory["layers"]["L2"]["population"], "unknown")
         session = Path(self.temp.name) / "local-session.json"
         session.write_text(json.dumps({
             "session_id": "local-session",
@@ -1090,6 +1345,8 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertTrue(ingested["ok"])
         self.assertEqual(ingested["source"], "local-memory")
         self.assertEqual(ingested["memory"]["supported_layers"], ["L0", "L1"])
+        self.assertEqual(ingested["memory"]["layers"]["L0"]["population"], "present")
+        self.assertEqual(ingested["memory"]["layers"]["L1"]["population"], "present")
         found = core.search(None, "portable local memory", scope="memory")
         self.assertFalse(found["abstain"])
         self.assertEqual(found["verified"][0]["source"], "local-memory")
@@ -1120,6 +1377,42 @@ class RepositoryMemoryTest(unittest.TestCase):
         context = core.memory_context(None, "独立 worktree canonical clone")
         self.assertEqual(context["context"]["team_memory"], [])
         self.assertTrue(context["context"]["team_candidates"])
+
+    def test_native_l2_to_l3_promotion_is_idempotent(self):
+        class FakeNative:
+            configured = True
+
+            def __init__(self):
+                self.l2 = "status: generated\nlayer: L2\n\nA durable scenario"
+                self.l3 = "status: accepted\nlayer: L3\n\nExisting profile"
+
+            def get(self, _candidate_id):
+                return {"memory": {"content": self.l2}}
+
+            def write_scenario(self, _path, content, summary=None):
+                self.l2 = content
+                return {"content": content, "summary": summary}
+
+            def read_scenario(self, _path):
+                return {"content": self.l2}
+
+            def read_core(self):
+                return {"content": self.l3}
+
+            def write_core(self, content):
+                self.l3 = content
+                return {"content": content}
+
+        native = FakeNative()
+        with patch("core.native_memory_client", return_value=native):
+            first = core.promote_l3("memorycore:L2:scenario.md")
+            first_length = len(native.l3)
+            second = core.promote_l3("memorycore:L2:scenario.md")
+
+        self.assertTrue(first["verified"])
+        self.assertTrue(second["verified"])
+        self.assertEqual(native.l3.count("source_l2: scenario.md"), 1)
+        self.assertEqual(len(native.l3), first_length)
 
     def test_memory_ingest_does_not_require_repository_source(self):
         client = Mock()
@@ -1181,6 +1474,118 @@ class RepositoryMemoryTest(unittest.TestCase):
         all_report = evaluate_queries(self.alpha, queries, qrels, local=True, revision=commit, scope="all")
         self.assertEqual(all_report["precision_at_1"], 1.0)
         self.assertEqual(all_report["rows"][0]["selected_scope"], "repository")
+
+
+class TeamMemoryRetentionTest(unittest.TestCase):
+    """Retention and compaction for memory_revisions."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.db = Path(self.temp.name) / "retention.sqlite3"
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _populate(self, store, count: int = 3):
+        """Publish a memory and create ``count`` revisions by repeated activation/export-import."""
+        pub = store.publish({
+            "type": "decision",
+            "title": "Retention decision",
+            "content": "Should survive compaction.",
+            "status": "candidate",
+            "author_agent": "agent-a",
+        }, default_status="candidate")
+        mid = pub["memory"]["id"]
+        # Activate to bump the revision, then export-import to clone revisions
+        store.activate(mid, reviewer="reviewer-a")
+        for _ in range(count - 2):
+            bundle = store.export_bundle()
+            clone = TeamMemoryStore(Path(self.temp.name) / f"clone-{id(store)}-{_}.sqlite3")
+            clone.import_bundle(bundle)
+            clone.activate(mid, reviewer="reviewer-a")
+            store.import_bundle(clone.export_bundle())
+        return mid
+
+    def test_compact_keep_1_preserves_current_revision(self):
+        store = TeamMemoryStore(self.db)
+        mid = self._populate(store, count=4)
+        before = store.health()["retention"][mid]
+        self.assertGreater(before["total_revisions"], 1)
+        result = store.compact(keep=1)
+        self.assertGreaterEqual(result["purged"], 0)
+        after = store.health()["retention"][mid]
+        self.assertGreaterEqual(after["total_revisions"], 1)
+        # current record is still there
+        self.assertEqual(store.get(mid)["result"]["id"], mid)
+
+    def test_compact_protects_ancestor_chain(self):
+        store = TeamMemoryStore(self.db)
+        mid = self._populate(store, count=5)
+        before_chain = store.health()["retention"][mid]["current_ancestor_chain"]
+        store.compact(keep=100)
+        after = store.health()["retention"][mid]
+        # ancestor chain is never shortened by compaction
+        self.assertGreaterEqual(after["current_ancestor_chain"], 1)
+        self.assertEqual(store.get(mid)["result"]["id"], mid)
+
+    def test_compact_keep_2_preserves_extra_unprotected(self):
+        store = TeamMemoryStore(self.db)
+        mid = self._populate(store, count=4)
+        before = store.health()["retention"][mid]["total_revisions"]
+        store.compact(keep=2)
+        after = store.health()["retention"][mid]["total_revisions"]
+        # keep=2 should preserve at least 2 unprotected + ancestors
+        self.assertGreaterEqual(after, 2)
+        self.assertLessEqual(after, before)
+
+    def test_compact_rejects_keep_0(self):
+        store = TeamMemoryStore(self.db)
+        with self.assertRaises(ValueError):
+            store.compact(keep=0)
+
+    def test_health_reports_retention_diagnostics(self):
+        store = TeamMemoryStore(self.db)
+        mid = self._populate(store, count=3)
+        health = store.health()
+        self.assertIn("retention", health)
+        self.assertIn(mid, health["retention"])
+        entry = health["retention"][mid]
+        self.assertIn("total_revisions", entry)
+        self.assertIn("current_ancestor_chain", entry)
+        self.assertGreaterEqual(entry["total_revisions"], 1)
+        self.assertGreaterEqual(entry["current_ancestor_chain"], 1)
+
+    def test_import_reports_conflict_for_missing_ancestor(self):
+        """Import a record whose parent_revision does not exist locally."""
+        store = TeamMemoryStore(self.db)
+        bundle = {
+            "kind": "repository-memory-team-bundle",
+            "schema_version": 3,
+            "records": [
+                {
+                    "id": "team:decision:orphan",
+                    "memory_type": "decision",
+                    "title": "Orphan memory",
+                    "content": "Parent revision was compacted away on source.",
+                    "summary": "orphan test",
+                    "scope": "{}",
+                    "provenance": "{}",
+                    "confidence": 0.5,
+                    "status": "active",
+                    "created_at": "2026-01-01T00:00:00",
+                    "updated_at": "2026-01-01T00:00:00",
+                    "revision": 5,
+                    "origin_node": "source-node",
+                    "parent_revision": "source-node:4",
+                }
+            ],
+            "revisions": [],
+            "feedback": [],
+        }
+        result = store.import_bundle(bundle)
+        self.assertEqual(result["imported"]["inserted"], 0)
+        self.assertEqual(result["imported"]["conflicts"], 1)
+        self.assertIn("parent_revision not found locally", result["imported"]["conflict_records"][0]["reason"])
 
 
 if __name__ == "__main__":

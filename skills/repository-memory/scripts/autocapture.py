@@ -26,10 +26,22 @@ DURABLE_HINTS = re.compile(
     r"决定|完成|修复|实现|计划|偏好|记住|配置|提交|合并|阻塞|结论|以后|迁移|上线|规则|decision|done|fixed|implemented|plan|prefer|remember|config|commit|merge|blocked|conclusion|policy",
     re.I,
 )
+INJECTED_CONTEXT = re.compile(
+    r"<(?:relevant-memories|user-persona|relevant-scenes|scene-navigation|memory-tools-guide|"
+    r"current_task_context|history_task_context)[^>]*>[\s\S]*?</(?:relevant-memories|user-persona|"
+    r"relevant-scenes|scene-navigation|memory-tools-guide|current_task_context|history_task_context)>",
+    re.I,
+)
 
 
 def sanitize_text(value: Any, max_chars: int) -> str:
     text = value if isinstance(value, str) else str(value or "")
+    # The upstream OpenClaw client strips injected recall blocks before L0
+    # capture.  Without this, a prompt-injected memory becomes the next
+    # conversation's apparent user/assistant evidence and creates a feedback
+    # loop in L1 extraction.
+    text = INJECTED_CONTEXT.sub("", text)
+    text = re.sub(r"\[\[reply_to[^\]]*\]\]\s*", "", text, flags=re.I)
     for pattern in SECRET_PATTERNS:
         text = pattern.sub("[REDACTED_SECRET]", text)
     text = text.replace("\x00", " ").strip()
@@ -68,6 +80,11 @@ def normalize_turn(payload: dict[str, Any], *, max_messages: int = 24, max_messa
         if role not in {"user", "assistant"}:
             continue
         content = sanitize_text(_content_text(raw.get("content")), max_message_chars)
+        if role == "assistant":
+            # Match the upstream capture boundary: code is useful for a
+            # coding answer but too noisy to promote into durable memory.
+            content = re.sub(r"```[^\n]*\n[\s\S]*?```", "", content)
+            content = re.sub(r"\n{3,}", "\n\n", content).strip()
         if content:
             messages.append({"role": role, "content": content})
     if not any(message["role"] == "user" for message in messages):

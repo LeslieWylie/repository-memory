@@ -16,9 +16,9 @@ Before running a query, establish which interface is actually available:
    configuration file or a model-written receipt.
 3. Call `memory_doctor` or `doctor --json` and retain its real adapter/source,
    index, freshness, MemoryCore, and semantic fields.
-4. Call `memory_init` only after the operator has supplied the repository root.
-   Do not register an arbitrary current directory merely to make doctor look
-   ready.
+4. Call the CLI `init --path <root>` only after the operator has supplied the
+   repository root. Do not register an arbitrary current directory merely to
+   make doctor look ready.
 5. Call `memory_sync` for a missing/stale index, then repeat doctor. Finish
    setup with one positive citation query and one fabricated negative query.
 
@@ -33,8 +33,8 @@ repository-memory source add --path <knowledge-directory> [--id <stable-id>] [--
 repository-memory source list --json
 repository-memory sync [--source <id>|--all] [--local] --json
 repository-memory search "<query>" [--source <id>] [--scope repository|memory|all] [--deep] [--local] --json
-repository-memory get "<result-id>" [--commit <citation-commit>] --json
-repository-memory explain "<result-id>" [--commit <citation-commit>] --json
+repository-memory get "<result-id>" [--commit <citation-commit>] [--line-start N --line-end N] --json
+repository-memory explain "<result-id>" [--commit <citation-commit>] [--line-start N --line-end N] --json
 repository-memory feedback "<result-id>" --note "..." [--feedback-id <stable-id>] --json
 repository-memory promote --input <file> --json
 repository-memory ingest-session --input <json-or-jsonl> --json
@@ -45,7 +45,9 @@ repository-memory team-activate --id <team-memory-id> [--reviewer <agent>] --jso
 repository-memory memorycore promote-l3 --candidate <autocapture:L2:id> --accept --json
 repository-memory evaluate --queries <queries.jsonl> --qrels <qrels.jsonl> [--revision <commit>] [--scope repository|memory|all] --json
 repository-memory team-evaluate --records <records.jsonl> --queries <queries.jsonl> --qrels <qrels.jsonl> [--gate] --json
+repository-memory team-compact [--keep N] --json
 repository-memory memorycore configure|start|stop|status
+repository-memory knowledge status|configure|install|start|stop|create|sync|search
 repository-memory mcp
 ```
 
@@ -56,35 +58,27 @@ and latency, but not full queries, excerpts, or response bodies. Use host
 transcripts or this audit stream to verify actual MCP usage; a model-written
 receipt alone is not proof.
 
-The MCP entrypoint uses local stdio and exposes the read/query tools plus
-explicit setup and session-ingest tools with the same JSON contract:
+The MCP entrypoint uses local stdio and exposes only the read/diagnostic tools
+with the same JSON contract. Explicit setup, session ingest, review, feedback,
+and promotion remain CLI operations so an agent cannot mutate memory merely by
+having access to the query MCP:
 
 ```text
 memory_doctor
 memory_sync
 memory_search
 memory_get
-memory_init
-memory_ingest
-memory_context
-memory_team_sync
-memory_team_activate
-memory_publish
-memory_feedback
-memory_supersede
 ```
 
-`memory_init` registers a user-provided knowledge directory and builds a
-disposable local lexical index. It may be called repeatedly for different
-sources; source IDs are stable handles, not assumptions about a particular
-repository. It never edits canonical documents. `memory_ingest` is an explicit
-write and accepts a session object or JSONL value; it is not part of ordinary
-retrieval.
+Use the CLI `init`, `source add`, `ingest-session`, `feedback`, `promote`, and
+the team-memory commands for explicit writes. They may update user config,
+derived cache, or user-level memory state, but never canonical documents unless
+the operator separately commits an approved repository change.
 
-`team-export`/`team-import` and `memory_team_sync` move the user-level Team
-Memory plane as an explicit JSON bundle. They are idempotent merge operations,
-not repository snapshot sync and not a claim that a hosted cross-machine
-service exists.
+`team-export`/`team-import` move the user-level Team Memory plane as an explicit
+JSON bundle. They are idempotent merge operations, not repository snapshot sync
+and not a claim that a hosted cross-machine service exists. The corresponding
+Team Memory MCP write/sync tools are intentionally not in the public tool list.
 
 The native ingest response is intentionally conservative: it can verify the
 durable L0 conversation write while reporting L1 extraction as `pending` or
@@ -94,6 +88,22 @@ backend's `supported_layers`/`reachable` fields describe capability and
 readiness, not the amount or quality of stored memory.
 
 `sync` updates only remote snapshots and derived indexes. It does not pull, commit, push, or overwrite the working tree. Use `--local` only when local checkout state is intentionally desired. For an intentionally detached or offline snapshot, register the source with `--local-only`; this makes the configured local commit the declared source of truth and reports `commit_type=local_worktree` with `freshness.state=fresh` when the checkout is clean. It does not claim that the snapshot is the latest remote revision. Dirty local-only sources remain `dirty` and are not verified.
+
+The optional TencentDB MemoryKnowledge plane is separate from MemoryCore. Use
+`knowledge status` to check it; use `knowledge create`, `knowledge sync`, and
+`knowledge search` only when a Wiki asset is explicitly configured. Knowledge
+service results remain candidates until the repository runtime validates a Git
+path, commit, line range, and excerpt. A ready MemoryCore endpoint does not
+mean that Wiki or CodeGraph is populated.
+
+`verified` means the document citation is real and traceable; it does not mean
+the excerpt supports every part of a composite question. The answer-safe
+surface is `answerable` (also returned as `results`), which contains only
+directly supported claims. If `verified` is non-empty but `answerable` is
+empty, preserve the citations for diagnosis/evaluation and abstain from the
+complete claim. Pass the returned commit and line range to `get`/`explain` to
+inspect the exact evidence window instead of silently reading a document's
+first page.
 
 `evaluate --revision` evaluates an immutable detached snapshot in the user
 cache and records the evaluated commit, branch, qrels revision, scope, and

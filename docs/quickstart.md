@@ -38,14 +38,26 @@ Look for:
   "routing": {"repository_mcp": "ready"},
   "memory": {
     "supported_layers": ["L0", "L1", "L2", "L3"],
-    "semantic_available": false
+    "layers": {
+      "L0": {
+        "capability": "supported",
+        "api_status": "ready",
+        "population": "empty",
+        "readback": "verified"
+      }
+    }
   }
 }
 ```
 
 The exact adapter and counts are environment-specific. `supported_layers`
 means the adapter knows how to inspect those layers; it does not mean every
-layer contains accepted records.
+layer contains records. Read each `layers.L*` object as four independent facts:
+`capability` says whether the adapter implements the layer, `api_status` says
+whether that layer API is usable, `population` says whether the response proves
+records are present or empty, and `readback` records whether the probe was
+verified, explicitly pending, or unknown. Never infer `population=present`
+from `supported_layers`, global `reachable`, or `api_status=ready`.
 
 ## 3. Hydrate a multi-agent task
 

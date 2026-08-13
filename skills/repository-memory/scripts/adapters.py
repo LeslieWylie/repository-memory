@@ -17,9 +17,10 @@ from urllib.parse import urlsplit, urlunsplit
 
 from discovery import adapter_config, adapter_protocol, configured_adapter
 from local_memory import local_memory_store
+from memmy import MemmyError, memmy_memory_client
 from memorycore import MemoryCoreError, native_memory_client
 
-from models import SourceView
+from models import MEMORY_LAYERS, SourceView, memory_layer_state
 
 SECRET_NAME_RE = __import__("re").compile(r"(^|/)(\.env(?:\.|$)|.*\.(?:pem|key|p12|pfx|secret|secrets?))$", __import__("re").I)
 SECRET_CONTENT_RE = __import__("re").compile(r"-----BEGIN .*PRIVATE KEY-----|(?:api[_-]?key|access[_-]?token|password|secret)\s*[:=]\s*['\"]?[A-Za-z0-9_\-/.+=]{16,}|\bsk-[A-Za-z0-9_-]{16,}", __import__("re").I)
@@ -90,6 +91,7 @@ class Adapter:
         self.name = executable.name if executable else LOCAL_REPOSITORY_ADAPTER
         self._memory_probe: dict[str, Any] | None = None
         self.native_memory = native_memory_client()
+        self.memmy = memmy_memory_client()
         # An adapter without an external repository executable can still own
         # the native MemoryCore plane.  Expose that fact in ingest/doctor
         # receipts instead of leaking the repository fallback name.
@@ -137,7 +139,15 @@ class Adapter:
     def memory_status(self) -> dict[str, Any]:
         """Report support and live reachability for the optional memory plane."""
         if self.native_memory.configured:
-            return self.native_memory.health()
+            native = self.native_memory.health()
+            # Memmy is an optional semantic memory provider.  Keep its health
+            # nested so the native TencentDB L0-L3 status is never confused
+            # with the Memmy L1-L3/search plane.
+            memmy = self.memmy.health()
+            native["providers"] = {"memorycore": {**native, "providers": None}, "memmy": memmy}
+            return native
+        if self.memmy.configured:
+            return self.memmy.health()
         if self._memory_probe is not None:
             return dict(self._memory_probe)
         supported = ["L0", "L1", "L2", "L3"] if self.protocol == "legacy-legacy-memory" else []
@@ -147,6 +157,14 @@ class Adapter:
             "configured": bool(endpoint),
             "reachable": False if not endpoint else None,
             "status": "not_configured" if not endpoint else "unknown",
+            "layers": {
+                layer: memory_layer_state(
+                    "supported" if layer in supported else "unsupported",
+                    "not_configured" if layer in supported else "unsupported",
+                    "unknown", "unknown",
+                )
+                for layer in MEMORY_LAYERS
+            },
         }
         if not endpoint:
             if self.protocol == "local-fallback":
@@ -168,6 +186,15 @@ class Adapter:
                 result.update({"reachable": 200 <= response.status < 400, "status": "ready" if response.status < 400 else "error"})
         except (OSError, urllib.error.URLError, ValueError) as exc:
             result.update({"reachable": False, "status": "unreachable", "error": str(exc).replace(str(endpoint), safe_endpoint)[:240]})
+        layer_api_status = "unknown" if result.get("reachable") is True else "unreachable"
+        result["layers"] = {
+            layer: memory_layer_state(
+                "supported" if layer in supported else "unsupported",
+                layer_api_status if layer in supported else "unsupported",
+                "unknown", "unknown",
+            )
+            for layer in MEMORY_LAYERS
+        }
         self._memory_probe = result
         if result.get("reachable") is True:
             return result
@@ -182,20 +209,65 @@ class Adapter:
         return self.memory_status().get("reachable") is True
 
     def memory_search(self, query: str, limit: int) -> list[dict[str, Any]]:
-        if not self.native_memory.configured:
-            return self.local_memory.search(query, limit) if self.protocol == "local-fallback" else []
-        try:
-            return self.native_memory.search(query, limit)
-        except MemoryCoreError as exc:
+        # Keep provider lanes separate.  A single global slice would let the
+        # native fallback candidates crowd out Memmy's local semantic hits,
+        # making a configured provider look unused.  We intentionally
+        # interleave lanes without comparing scores across backends.
+        lanes: list[list[dict[str, Any]]] = []
+        native_error: MemoryCoreError | None = None
+        if self.native_memory.configured:
             try:
-                fallback = self.local_memory.search(query, limit)
-            except (OSError, RuntimeError, ValueError):
-                fallback = []
-            if fallback:
-                return fallback
-            raise AdapterError(str(exc)) from exc
+                native_results = self.native_memory.search(query, limit)
+                if native_results:
+                    lanes.append(native_results)
+            except MemoryCoreError as exc:
+                native_error = exc
+        if self.memmy.configured:
+            try:
+                memmy_results = self.memmy.search(query, limit)
+                if memmy_results:
+                    # Put the configured semantic lane first, but do not
+                    # merge or re-score it with native MemoryCore results.
+                    lanes.insert(0, memmy_results)
+            except MemmyError:
+                # Memmy is an optional semantic lane; native retrieval remains
+                # usable when its local service is restarting or out of scope.
+                pass
+        results: list[dict[str, Any]] = []
+        while lanes and len(results) < max(1, int(limit)):
+            next_lanes: list[list[dict[str, Any]]] = []
+            for lane in lanes:
+                if lane:
+                    results.append(lane.pop(0))
+                    if len(results) >= max(1, int(limit)):
+                        break
+                if lane:
+                    next_lanes.append(lane)
+            lanes = next_lanes
+        if results:
+            return results
+        if not self.native_memory.configured:
+            if self.protocol == "local-fallback":
+                return self.local_memory.search(query, limit)
+            if self.memmy.configured:
+                raise AdapterError("no memory provider returned a result")
+            return []
+        try:
+            fallback = self.local_memory.search(query, limit)
+        except (OSError, RuntimeError, ValueError):
+            fallback = []
+        if fallback:
+            return fallback
+        if native_error is not None:
+            raise AdapterError(str(native_error)) from native_error
+        return []
 
     def memory_get(self, result_id: str) -> dict[str, Any]:
+        if result_id.startswith("memmy:"):
+            try:
+                return self.memmy.get(result_id)
+            except MemmyError as exc:
+                raise AdapterError(str(exc)) from exc
         if result_id.startswith("local:") or (not self.native_memory.configured and self.protocol == "local-fallback"):
             try:
                 return self.local_memory.get(result_id)
@@ -322,26 +394,38 @@ def discover_adapter(source: SourceView) -> Adapter:
 def adapter_status(adapter: Adapter, probe_memory_layers: bool = False) -> dict[str, Any]:
     native_health = adapter.native_memory.health(refresh=probe_memory_layers, probe_layers=probe_memory_layers) if adapter.native_memory.configured else adapter.memory_status()
     native_ready = adapter.native_memory.configured and native_health.get("status") == "ready"
+    memmy_report = adapter.memmy.health() if adapter.memmy.configured and not native_ready else None
+    memmy_ready = isinstance(memmy_report, dict) and memmy_report.get("status") == "ready"
     local_ready = native_health.get("backend") == "local-memory" and native_health.get("status") == "ready"
-    if native_ready or local_ready:
+    if native_ready or memmy_ready or local_ready:
         capabilities = ["memory-doctor", "memory-search", "memory-get", "ingest-session", "local-search"]
+        if memmy_ready:
+            capabilities.append("memmy-search")
     elif adapter.available and adapter.protocol == "legacy-legacy-memory":
         capabilities = ["doctor", "sync", "search", "get", "memory-search", "ingest-session"]
     elif adapter.available:
         capabilities = ["doctor", "sync", "search", "get"]
-    elif adapter.native_memory.configured:
+    elif adapter.native_memory.configured or adapter.memmy.configured:
         capabilities = ["memory-doctor", "memory-search", "memory-get", "ingest-session"]
     else:
         capabilities = ["local-search"]
     value: dict[str, Any] = {
-        "name": "native-memorycore" if native_ready else "local-memory" if local_ready else adapter.name,
-        "protocol": "memorycore" if native_ready else "local-memory" if local_ready else adapter.protocol,
-        "path": None if native_ready or local_ready else (str(adapter.executable) if adapter.executable else None),
-        "available": adapter.available or adapter.native_memory.configured or local_ready,
+        "name": "native-memorycore" if native_ready else "memmy" if memmy_ready else "local-memory" if local_ready else adapter.name,
+        "protocol": "memorycore" if native_ready else "memmy" if memmy_ready else "local-memory" if local_ready else adapter.protocol,
+        "path": None if native_ready or memmy_ready or local_ready else (str(adapter.executable) if adapter.executable else None),
+        "available": adapter.available or adapter.native_memory.configured or adapter.memmy.configured or local_ready,
         "capabilities": capabilities,
     }
     value["memory"] = native_health
     if native_ready:
+        memory_report = adapter.memory_status()
+        if isinstance(memory_report.get("providers"), dict):
+            value["memory"] = {**native_health, "providers": memory_report["providers"]}
+        semantic = memory_report.get("embedding", {"available": False, "strategy": "keyword-only"})
+        providers = memory_report.get("providers") if isinstance(memory_report.get("providers"), dict) else {}
+        memmy_report = providers.get("memmy") if isinstance(providers, dict) else None
+        if isinstance(memmy_report, dict) and isinstance(memmy_report.get("embedding"), dict) and memmy_report["embedding"].get("available") is True:
+            semantic = {**memmy_report["embedding"], "scope": "memory", "provider_backend": "memmy"}
         value.update({
             "healthy": True,
             "repository_backend": {
@@ -349,8 +433,18 @@ def adapter_status(adapter: Adapter, probe_memory_layers: bool = False) -> dict[
                 "legacy_adapter": adapter.name if adapter.available else None,
                 "required": False,
             },
-            "semantic": adapter.memory_status().get("embedding", {"available": False, "strategy": "keyword-only"}),
+            "semantic": semantic,
+            "semantic_providers": {"memorycore": memory_report.get("embedding"), "memmy": memmy_report.get("embedding") if isinstance(memmy_report, dict) else None},
         })
+        return value
+    if memmy_ready:
+        value.update({
+            "healthy": True,
+            "repository_backend": {"status": "local_on_demand", "legacy_adapter": adapter.name if adapter.available else None, "required": False},
+            "semantic": memmy_report.get("embedding", {"available": False, "strategy": "keyword-only"}),
+            "semantic_providers": {"memorycore": None, "memmy": memmy_report.get("embedding")},
+        })
+        value["memory"] = memmy_report
         return value
     if local_ready:
         value.update({
@@ -361,7 +455,7 @@ def adapter_status(adapter: Adapter, probe_memory_layers: bool = False) -> dict[
         return value
     if adapter.available:
         pass
-    elif adapter.native_memory.configured:
+    elif adapter.native_memory.configured or adapter.memmy.configured:
         value["healthy"] = adapter.memory_status().get("status") == "ready"
         if not value["healthy"]:
             value["error"] = adapter.memory_status().get("error") or "MemoryCore is not reachable"

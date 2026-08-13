@@ -10,16 +10,20 @@ MemoryCore instance does not silently become a shared global memory bucket.
 from __future__ import annotations
 
 import getpass
+import hashlib
 import json
 import os
 import re
 import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib import error, request
 from urllib.parse import urlsplit, urlunsplit
+
+from models import MEMORY_LAYERS, memory_layer_state
 
 
 class MemoryCoreError(RuntimeError):
@@ -108,6 +112,102 @@ def _first_string(*values: Any) -> str | None:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return None
+
+
+def _lifecycle_status(content: str, default: str = "generated") -> str:
+    """Read lifecycle markers from native L2/L3 content.
+
+    MemoryCore's profile APIs return the document body as the stable read-back
+    surface.  Some backends also expose status fields, but the standalone
+    gateway does not consistently do so.  Prefer an explicit accepted marker
+    anywhere in the document, then fall back to the first known marker.
+    """
+
+    matches = re.findall(
+        r"(?im)^\s*(?:memory_status|status|evidence_status)\s*:\s*([a-z_-]+)\s*$",
+        content or "",
+    )
+    normalized = [value.strip().lower() for value in matches]
+    for value in normalized:
+        if value == "accepted":
+            return "accepted"
+    for value in normalized:
+        if value in {"candidate", "pending", "generated", "inferred", "stale"}:
+            return value
+    return default
+
+
+def _with_lifecycle_markers(content: str, *, status: str, layer: str, source_l2: str | None = None) -> str:
+    """Update or prepend explicit lifecycle markers without losing content."""
+
+    value = str(content or "").rstrip()
+    replacements = {
+        "status": status,
+        "evidence_status": status,
+        "layer": layer,
+    }
+    if source_l2:
+        replacements["source_l2"] = source_l2
+    for key, marker in replacements.items():
+        pattern = re.compile(rf"(?im)^(\s*{re.escape(key)}\s*:\s*)[^\n]*$")
+        value, count = pattern.subn(rf"\g<1>{marker}", value, count=1)
+        if count == 0:
+            value = f"{key}: {marker}\n" + value
+    return value + "\n"
+
+
+def _runtime_report() -> dict[str, Any]:
+    """Describe the process/config relationship without exposing credentials."""
+
+    config = _read_json(_config_path())
+    memory = config.get("memorycore") if isinstance(config.get("memorycore"), dict) else {}
+    configured_root = _first_string(memory.get("root"))
+    state_dir = _first_string(memory.get("state_dir"))
+    process_lines: list[str] = []
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        process_lines = [line.strip() for line in result.stdout.splitlines() if "memorycore_service.py run" in line]
+    except (OSError, subprocess.SubprocessError):
+        process_lines = []
+    # The launchd service intentionally runs the installed Skill copy rather
+    # than the caller's checkout.  Comparing the process with ``__file__``
+    # therefore made a healthy installed runtime look inconsistent whenever a
+    # developer invoked the CLI from a Git worktree.  Extract the actual
+    # service script and validate that it is a real repository-memory runtime.
+    service_script: str | None = None
+    service_root: str | None = None
+    for line in process_lines:
+        match = re.search(r"(?:^|\s)(/[^\s]+/memorycore_service\.py)\s+run(?:\s|$)", line)
+        if not match:
+            continue
+        candidate = Path(match.group(1)).resolve()
+        if candidate.is_file():
+            service_script = str(candidate)
+            service_root = str(candidate.parents[1])
+            break
+    process_current = bool(service_script and service_root and configured_root and Path(configured_root).is_dir())
+    configured_state = Path(state_dir).expanduser() if state_dir else None
+    return {
+        "config_path": str(_config_path()),
+        "skill_runtime": str(Path(__file__).resolve().parents[1]),
+        "service_runtime": service_root,
+        "service_script": service_script,
+        "memorycore_root": configured_root,
+        "data_dir": state_dir,
+        "service_label": os.environ.get("REPOSITORY_MEMORY_LAUNCHD_LABEL", "com.repository-memorycore"),
+        "process": {
+            "found": bool(process_lines),
+            "current_runtime": process_current,
+            "count": len(process_lines),
+        },
+        "consistent": bool(configured_root and configured_state and configured_state.is_dir() and process_current),
+    }
 
 
 @dataclass(frozen=True)
@@ -250,6 +350,55 @@ class MemoryCoreClient:
         data = value.get("data")
         return data if isinstance(data, dict) else value
 
+    @staticmethod
+    def _explicit_readback(payload: dict[str, Any]) -> str | None:
+        """Map only backend-provided lifecycle signals into read-back state."""
+
+        value = payload.get("readback")
+        if isinstance(value, dict):
+            value = value.get("status")
+        if payload.get("readback_status") is not None:
+            value = payload.get("readback_status")
+        elif value is None:
+            value = payload.get("status")
+        if payload.get("pending") is True:
+            return "pending"
+        normalized = str(value or "").strip().lower()
+        if normalized in {"pending", "processing", "queued"}:
+            return "pending"
+        if normalized in {"verified", "complete", "completed"}:
+            return "verified"
+        if normalized == "unknown":
+            return "unknown"
+        return None
+
+    @staticmethod
+    def _collection_population(payload: dict[str, Any], *keys: str) -> tuple[str, int | None, int | None, bool]:
+        """Return population/counts only when the adapter response proves them."""
+
+        values: list[Any] | None = None
+        for key in keys:
+            if key in payload:
+                raw = payload.get(key)
+                if isinstance(raw, list):
+                    values = raw
+                    break
+        total = payload.get("total")
+        total_count = total if isinstance(total, int) and not isinstance(total, bool) and total >= 0 else None
+        sampled_count = len(values) if values is not None else None
+        if total_count is not None:
+            return ("present" if total_count else "empty", total_count, sampled_count, True)
+        if values is not None:
+            return ("present" if values else "empty", len(values), len(values), True)
+        return "unknown", None, sampled_count, False
+
+    @classmethod
+    def _readback_state(cls, payload: dict[str, Any], shape_known: bool) -> str:
+        explicit = cls._explicit_readback(payload)
+        if explicit is not None:
+            return explicit
+        return "verified" if shape_known else "unknown"
+
     def health(self, refresh: bool = False, probe_layers: bool = False) -> dict[str, Any]:
         if self._health is not None and not refresh and (not probe_layers or "layers" in self._health):
             return dict(self._health)
@@ -258,7 +407,7 @@ class MemoryCoreClient:
         model_ref = _first_string(memory_config.get("llm_model"))
         model_name = model_ref.rsplit("/", 1)[-1] if model_ref else None
         result: dict[str, Any] = {
-            "supported_layers": ["L0", "L1", "L2", "L3"],
+            "supported_layers": list(MEMORY_LAYERS),
             "configured": self.config.configured,
             "reachable": False,
             "status": "not_configured" if not self.config.configured else "unreachable",
@@ -272,15 +421,35 @@ class MemoryCoreClient:
                 "model": model_name,
                 "base_url": _redacted_endpoint(_first_string(memory_config.get("llm_base_url"))),
             },
+            "runtime": _runtime_report(),
         }
         if not self.config.configured:
-            result["layers"] = {layer: {"status": "not_configured", "reachable": False} for layer in result["supported_layers"]}
+            result["layers"] = {
+                layer: memory_layer_state("supported", "not_configured", "unknown", "unknown")
+                for layer in result["supported_layers"]
+            }
             self._health = result
             return dict(result)
         try:
             response = self._request("GET", "/health")
             data = self._data(response)
+            stores = data.get("stores") if isinstance(data.get("stores"), dict) else None
             result.update({"reachable": True, "status": "ready", "server": {k: data.get(k) for k in ("status", "version", "uptime", "stores") if k in data}})
+            # Do not infer semantic capability from a configured strategy. The
+            # gateway health response is the source of truth: a vector store
+            # can exist while the embedding service is disabled.
+            if stores is not None and "embeddingService" in stores:
+                available = stores.get("embeddingService") is True
+                result["embedding"] = {
+                    "available": available,
+                    "strategy": "hybrid" if available else "keyword-only",
+                    "provider": "runtime" if available else None,
+                    "server_reported": True,
+                }
+                result["server_stores"] = {
+                    "vector_store": stores.get("vectorStore"),
+                    "embedding_service": stores.get("embeddingService"),
+                }
             if probe_layers:
                 probes = {
                     "L0": ("/v3/conversation/query", {"limit": 1}),
@@ -293,53 +462,88 @@ class MemoryCoreClient:
                     try:
                         probe_response = self._data(self._request("POST", endpoint, self._scoped(body)))
                         if layer in {"L0", "L1"}:
-                            values = probe_response.get("messages" if layer == "L0" else "items", [])
-                            values = values if isinstance(values, list) else []
-                            count = len(values)
-                            data_status = "present" if count else "empty"
-                            layer_status[layer] = {
-                                "status": "ready",
-                                "reachable": True,
-                                "endpoint": endpoint,
-                                "data_status": data_status,
-                                "record_count_sampled": count,
-                                "readback_verified": True,
-                            }
+                            population, count, sampled, shape_known = self._collection_population(
+                                probe_response,
+                                "messages" if layer == "L0" else "items",
+                            )
+                            details = {"endpoint": endpoint}
+                            if count is not None:
+                                details["record_count"] = count
+                            if sampled is not None:
+                                details["record_count_sampled"] = sampled
+                            layer_status[layer] = memory_layer_state(
+                                "supported", "ready", population,
+                                self._readback_state(probe_response, shape_known), **details,
+                            )
                         elif layer == "L2":
-                            entries = probe_response.get("entries") or probe_response.get("items") or []
-                            entries = entries if isinstance(entries, list) else []
-                            accepted = sum(1 for item in entries if isinstance(item, dict) and item.get("accepted") is True)
-                            pending = max(0, len(entries) - accepted)
-                            layer_status[layer] = {
-                                "status": "ready",
-                                "reachable": True,
-                                "endpoint": endpoint,
-                                "data_status": "empty" if not entries else "accepted" if accepted else "candidate",
-                                "record_count": len(entries),
-                                "accepted_count": accepted,
-                                "pending_count": pending,
-                                "readback_verified": True,
-                            }
+                            entries_value = probe_response.get("entries") if "entries" in probe_response else probe_response.get("items")
+                            entries = entries_value if isinstance(entries_value, list) else None
+                            population, count, sampled, shape_known = self._collection_population(probe_response, "entries", "items")
+                            details = {"endpoint": endpoint}
+                            if count is not None:
+                                details["record_count"] = count
+                            if sampled is not None:
+                                details["record_count_sampled"] = sampled
+                            if entries is not None:
+                                accepted = 0
+                                pending = 0
+                                generated = 0
+                                for item in entries:
+                                    if not isinstance(item, dict):
+                                        continue
+                                    status = "accepted" if item.get("accepted") is True else "generated"
+                                    path = str(item.get("path") or "")
+                                    if path and not path.endswith("/"):
+                                        try:
+                                            scenario = self._data(self._request("POST", "/v3/scenario/read", self._scoped({"path": path})))
+                                            content = str(scenario.get("content") or "")
+                                            status = _lifecycle_status(content, status)
+                                        except MemoryCoreError:
+                                            status = "unknown"
+                                    if status == "accepted":
+                                        accepted += 1
+                                    elif status in {"candidate", "pending", "generated", "inferred", "stale"}:
+                                        pending += 1
+                                    else:
+                                        generated += 1
+                                details["accepted_count_sampled"] = accepted
+                                details["pending_count_sampled"] = pending
+                                details["generated_count_sampled"] = generated
+                                if count == len(entries):
+                                    details["accepted_count"] = accepted
+                                    details["pending_count"] = pending
+                                    details["generated_count"] = generated
+                            layer_status[layer] = memory_layer_state(
+                                "supported", "ready", population,
+                                self._readback_state(probe_response, shape_known), **details,
+                            )
                         else:
-                            content = str(probe_response.get("content") or "").strip()
+                            content_known = "content" in probe_response
+                            content = str(probe_response.get("content") or "").strip() if content_known else ""
                             metadata = probe_response.get("metadata") if isinstance(probe_response.get("metadata"), dict) else {}
-                            accepted = probe_response.get("accepted") is True or metadata.get("status") == "accepted" or metadata.get("accepted") is True
-                            layer_status[layer] = {
-                                "status": "ready",
-                                "reachable": True,
-                                "endpoint": endpoint,
-                                "data_status": "accepted" if accepted else "present" if content else "empty",
-                                "record_count": 1 if content else 0,
-                                "accepted": bool(accepted),
-                                "readback_verified": True,
-                            }
+                            content_status = _lifecycle_status(content, "") if content else ""
+                            accepted = probe_response.get("accepted") is True or metadata.get("status") == "accepted" or metadata.get("accepted") is True or content_status == "accepted"
+                            population = "present" if content else "empty" if content_known else "unknown"
+                            details = {"endpoint": endpoint, "accepted": bool(accepted), "status": content_status or "empty"}
+                            if content_known:
+                                details["record_count"] = 1 if content else 0
+                            layer_status[layer] = memory_layer_state(
+                                "supported", "ready", population,
+                                self._readback_state(probe_response, content_known), **details,
+                            )
                     except MemoryCoreError as exc:
-                        layer_status[layer] = {"status": "unavailable", "reachable": False, "endpoint": endpoint, "error": str(exc)}
+                        layer_status[layer] = memory_layer_state(
+                            "supported", "unreachable", "unknown", "unknown",
+                            endpoint=endpoint, error=str(exc),
+                        )
                 result["layers"] = layer_status
         except MemoryCoreError as exc:
             result.update({"error": str(exc)})
             if probe_layers:
-                result["layers"] = {layer: {"status": "unreachable", "reachable": False} for layer in result["supported_layers"]}
+                result["layers"] = {
+                    layer: memory_layer_state("supported", "unreachable", "unknown", "unknown")
+                    for layer in result["supported_layers"]
+                }
         self._health = result
         return dict(result)
 
@@ -441,7 +645,7 @@ class MemoryCoreClient:
         }
 
     def write_scenario(self, path: str, content: str, summary: str | None = None) -> dict[str, Any]:
-        """Write an L2 scenario candidate; acceptance is deliberately separate."""
+        """Update an existing native L2 scenario; creation belongs to pipeline."""
 
         return self._data(self._request("POST", "/v3/scenario/write", self._scoped({
             "path": path,
@@ -451,6 +655,53 @@ class MemoryCoreClient:
 
     def read_scenario(self, path: str) -> dict[str, Any]:
         return self._data(self._request("POST", "/v3/scenario/read", self._scoped({"path": path})))
+
+    def list_scenarios(self) -> list[dict[str, Any]]:
+        """List native L2 records, never local pending files."""
+
+        data = self._data(self._request("POST", "/v3/scenario/ls", self._scoped({})))
+        entries = data.get("entries") if isinstance(data.get("entries"), list) else data.get("items")
+        return [item for item in entries if isinstance(item, dict)] if isinstance(entries, list) else []
+
+    def scenario_snapshot(self) -> dict[str, str]:
+        """Return content hashes for native scenarios before a pipeline run."""
+
+        snapshot: dict[str, str] = {}
+        for entry in self.list_scenarios():
+            path = str(entry.get("path") or "")
+            if not path or path.endswith("/"):
+                continue
+            try:
+                content = str(self.read_scenario(path).get("content") or "")
+            except MemoryCoreError:
+                continue
+            snapshot[path] = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        return snapshot
+
+    def wait_for_scenario(self, before: dict[str, str], timeout: float = 8.0, poll: float = 0.5) -> dict[str, Any] | None:
+        """Observe a pipeline-created or pipeline-updated native L2 record."""
+
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            try:
+                entries = self.list_scenarios()
+            except MemoryCoreError:
+                entries = []
+            for entry in entries:
+                path = str(entry.get("path") or "")
+                if not path or path.endswith("/"):
+                    continue
+                try:
+                    record = self.read_scenario(path)
+                except MemoryCoreError:
+                    continue
+                content = str(record.get("content") or "")
+                digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                if before.get(path) != digest and content.strip():
+                    return {"path": path, "record": record, "status": _lifecycle_status(content, "generated")}
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(min(max(0.05, poll), max(0.05, deadline - time.monotonic())))
 
     def delete_scenario(self, path: str) -> dict[str, Any]:
         """Remove an explicitly targeted scenario, primarily for test cleanup."""
@@ -502,9 +753,10 @@ class MemoryCoreClient:
                     if score <= 0:
                         continue
                     metadata = file_data.get("metadata") if isinstance(file_data.get("metadata"), dict) else {}
-                    generated = bool(entry.get("generated") or file_data.get("generated") or metadata.get("generated"))
-                    accepted = bool(entry.get("accepted") is True or file_data.get("accepted") is True or metadata.get("accepted") is True)
-                    evidence_status = "generated" if generated else "primary" if accepted else "pending"
+                    lifecycle = _lifecycle_status(content, "generated")
+                    generated = bool(entry.get("generated") or file_data.get("generated") or metadata.get("generated") or lifecycle == "generated")
+                    accepted = bool(entry.get("accepted") is True or file_data.get("accepted") is True or metadata.get("accepted") is True or lifecycle == "accepted")
+                    evidence_status = "primary" if accepted else lifecycle
                     results.append({
                         "id": f"memorycore:L2:{path}", "kind": "scenario", "title": path,
                         "content": content, "excerpt": content[:800], "path": f"scenario/{path}",
@@ -521,9 +773,10 @@ class MemoryCoreClient:
             score = sum(content.casefold().count(term) for term in terms)
             if content and score > 0:
                 metadata = profile.get("metadata") if isinstance(profile.get("metadata"), dict) else {}
-                generated = bool(profile.get("generated") or metadata.get("generated"))
-                accepted = bool(profile.get("accepted") is True or metadata.get("accepted") is True)
-                evidence_status = "generated" if generated else "primary" if accepted else "pending"
+                lifecycle = _lifecycle_status(content, "pending")
+                generated = bool(profile.get("generated") or metadata.get("generated") or lifecycle == "generated")
+                accepted = bool(profile.get("accepted") is True or metadata.get("accepted") is True or lifecycle == "accepted")
+                evidence_status = "primary" if accepted else lifecycle
                 results.append({
                     "id": "memorycore:L3:profile", "kind": "profile", "title": "profile",
                     "content": content, "excerpt": content[:800], "path": "core/profile",
@@ -619,14 +872,37 @@ class MemoryCoreClient:
         if match:
             layer, record_id = match.groups()
             endpoint = "/v3/conversation/query" if layer == "L0" else "/v3/atomic/query"
-            data = self._data(self._request("POST", endpoint, self._scoped({"limit": 100})))
-            values = data.get("messages" if layer == "L0" else "items", [])
-            for item in values if isinstance(values, list) else []:
-                if isinstance(item, dict) and str(item.get("id")) == record_id:
-                    return {"id": result_id, "layer": layer, "memory": item, "citation": {"source": "memorycore", "memory_id": record_id, "layer": layer, "valid": True}}
+            collection = "messages" if layer == "L0" else "items"
+            offset = 0
+            while True:
+                data = self._data(self._request("POST", endpoint, self._scoped({"limit": 100, "offset": offset})))
+                values = data.get(collection, [])
+                page = values if isinstance(values, list) else []
+                for item in page:
+                    if isinstance(item, dict) and str(item.get("id")) == record_id:
+                        content = str(item.get("content") or item.get("message_text") or "")
+                        return {
+                            "id": result_id,
+                            "layer": layer,
+                            "memory": item,
+                            "citation": {
+                                "source": "memorycore",
+                                "memory_id": record_id,
+                                "layer": layer,
+                                "evidence": content,
+                                "locator": {"layer": layer, "memory_id": record_id},
+                                "valid": bool(content),
+                            },
+                        }
+                total = data.get("total")
+                if not page or not isinstance(total, int) or offset + len(page) >= total:
+                    break
+                offset += len(page)
             raise MemoryCoreError(f"MemoryCore record not found: {result_id}")
         if result_id == "memorycore:L3:profile":
-            return {"id": result_id, "layer": "L3", "memory": self._data(self._request("POST", "/v3/core/read", self._scoped({}))), "citation": {"source": "memorycore", "memory_id": "profile", "layer": "L3", "valid": True}}
+            memory = self._data(self._request("POST", "/v3/core/read", self._scoped({})))
+            content = str(memory.get("content") or "") if isinstance(memory, dict) else ""
+            return {"id": result_id, "layer": "L3", "memory": memory, "citation": {"source": "memorycore", "memory_id": "profile", "layer": "L3", "evidence": content, "locator": {"path": "core/profile"}, "valid": bool(content)}}
         if result_id.startswith("memorycore:L2:"):
             path = result_id.split(":", 2)[-1]
             return {"id": result_id, "layer": "L2", "memory": self._data(self._request("POST", "/v3/scenario/read", self._scoped({"path": path}))), "citation": {"source": "memorycore", "memory_id": path, "layer": "L2", "path": path, "valid": True}}

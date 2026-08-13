@@ -9,18 +9,20 @@ The important idea is simple:
 
 > An answer is a fact only when the runtime can show where it came from.
 
-It ships as one generic Skill with a shared Python runtime:
+It ships as one generic Skill with a shared Python runtime and a pinned,
+source-only TencentDB component snapshot:
 
 - a citation-first repository index and CLI;
 - a local stdio MCP server for Claude, Codex, OpenClaw, and other hosts;
-- an optional MemoryCore adapter for L0-L3 conversation memory;
-- an optional OpenClaw lifecycle extension for conservative post-turn capture;
+- a MemoryCore adapter for L0-L3 conversation memory;
+- an OpenClaw lifecycle extension for before-prompt recall and conservative post-turn capture;
 - a metadata-only audit proxy and an advisory guard that validates evidence
   receipts without blocking normal coding, shell, Git, or debugging tools.
 
-The mainline is a shared Team Memory plane. Agents can explicitly publish and
-reuse compact decisions, failures, discoveries, solutions, and handoffs; the
-runtime keeps that experience provenance separate from Git citations.
+The mainline is citation-first repository retrieval. An optional user-level
+Team Memory plane can store compact decisions, failures, discoveries, solutions,
+and handoffs, but it remains separate from Git citations and is never required
+for repository search.
 
 The repository itself is the source of truth. Indexes, snapshots, audit logs,
 conversation data, and credentials stay in user-level data/config/cache
@@ -53,9 +55,10 @@ flowchart LR
 `scope=repository` searches Git-backed evidence only. `scope=memory` searches
 the configured conversation-memory plane. `scope=all` returns two separate
 groups; it never fuses scores or turns a conversation into a Git citation.
-For multi-agent work, `memory_context` is the preferred task-start call: it
-packages repository evidence and Team Memory sections together without making
-experience look like a Git citation.
+For multi-agent work, the CLI `memory_context` command can package repository
+evidence and Team Memory sections together without making experience look like
+a Git citation. The public MCP surface remains deliberately read-only and uses
+`memory_search` with an explicit `scope` when native memory is needed.
 
 ## Install
 
@@ -124,17 +127,19 @@ Every search response has two layers:
 - `candidates`: related or incomplete material, including stale, generated,
   inferred, pending, dirty, or citation-incomplete results.
 
-Agents should answer from `verified` only. A document-level verified result
-does not prove every part of a compound claim. Check `support.claim_support`
-and use `get` or `explain` for the full evidence window before making a claim
-marked `partial` or `unknown`.
+Agents should answer from `answerable` (also returned as `results`) only.
+`verified` is the document-retrieval/evaluation lane: it proves that a citation
+is real, not that one excerpt supports every part of a compound claim. If
+`verified` is populated but `answerable` is empty, the runtime must abstain or
+narrow the answer. Check `support.claim_support` and use `get` or `explain`
+with the returned commit and line range before making a claim marked
+`partial` or `unknown`.
 
 The runtime does not require embeddings. When no semantic provider is
-configured, doctor and search say `retrieval_mode=lexical` and
+configured, doctor and search say `retrieval_mode=keyword-only` and
 `semantic_available=false`; this is a supported fallback, not a hidden
-semantic claim. `memory_context` reports `retrieval_mode=multi-source-lexical`:
-repository and Team Memory recall run in parallel, then remain in separate
-provenance sections. No black-box cross-backend RRF is used.
+semantic claim. `scope=all` returns repository and MemoryCore lanes in separate
+groups. No black-box cross-backend RRF is used.
 
 ## Shared Team Memory
 
@@ -187,44 +192,104 @@ repository evidence:
 
 An API being reachable is not the same as having useful data. Doctor reports
 capability, reachability, record counts, pending candidates, and read-back
-verification separately.
+verification separately. Every `memory.layers.L*` entry uses the same four-way
+contract: `capability`, `api_status`, `population`, and `readback`. Population
+is only `present` when the layer's actual query/read response returns records
+or content; unsupported, unreachable, malformed, or unprobed states remain
+`unknown` rather than being inferred from global health.
 
-MemoryCore is optional and is not bundled in this repository. Its endpoint,
-model, provider, and credentials are discovered from user configuration or
-environment at runtime. Credentials are never committed to Git. If it is not
-available, repository search still works and explicit session ingest can use
-the conservative local fallback with clearly reported layer support.
+The repository bundles a clean source snapshot of upstream MemoryCore and
+MemoryKnowledge components under the Skill's `vendor/` directory. The Python
+adapter still owns the public JSON contract and citations, but the installed
+MemoryCore service can run directly from that clean snapshot: it installs the
+runtime dependencies into the user data directory, applies the small
+repository-memory isolation/L3 policy patch there, and never mutates the Git
+vendor snapshot or an unrelated dirty checkout. The manifest pins the modules
+used for L0 capture, L1 extraction, L2 navigation, L3 profile recall, and
+Wiki/code-graph adapter design.
+
+The live MemoryCore endpoint, model, provider, and credentials are discovered
+from user configuration or environment at runtime. Credentials are never
+committed to Git. If the service is unavailable, repository search still works
+and explicit session ingest uses the conservative local fallback with clearly
+reported layer support. `doctor --json` reports the actual runtime root and
+process so a vendored service cannot be confused with an external checkout.
+
+## Optional local Memmy provider
+
+This project can also call an already-installed local Memmy service through a
+small adapter. We reuse its SQLite/FTS5 storage, native local-vector search,
+layer-aware results, idempotent jobs, and existing panel; Memmy remains an
+optional provider and is not copied into or made canonical by this repository.
+
+```bash
+repository-memory memmy status --json
+repository-memory memmy configure --endpoint <memmy-endpoint> --json
+repository-memory search "the user's question" --scope memory --json
+repository-memory gui --json
+```
+
+The runtime reports provider capabilities separately. For example, native
+MemoryCore can remain `keyword-only` while Memmy reports `local-hybrid` from
+its local embedding model. Results are interleaved by provider lane without
+cross-provider score fusion and retain `source`, `layer`, `memory_id`, and
+provider citation metadata. See [memory-providers](docs/memory-providers.md)
+for the integration contract and failure behavior.
+
+## TencentDB MemoryKnowledge (Wiki / CodeGraph)
+
+MemoryCore and MemoryKnowledge are different services:
+
+- MemoryCore stores and recalls L0–L3 conversation memory.
+- MemoryKnowledge builds Wiki pages and CodeGraph indexes from repository
+  content.
+- The repository citation index remains the default fact/evaluation path. A
+  MemoryKnowledge result without a matching Git path, commit, line range and
+  excerpt is returned as a candidate, never silently promoted to verified.
+
+The Knowledge service is optional and can be enabled per installation:
+
+```bash
+repository-memory knowledge configure --json
+repository-memory knowledge install
+repository-memory knowledge status --json
+repository-memory knowledge create --name project-docs --json
+repository-memory knowledge sync --wiki-id <wiki-id> --json
+repository-memory knowledge search --wiki-id <wiki-id> --query "..." --json
+```
+
+`knowledge sync` writes only the derived Wiki index. It filters hidden files,
+secrets, binaries, oversized files and operational output directories; it does
+not commit, push, pull, or rewrite the source repository. If the Knowledge
+service is not configured or reachable, `doctor` reports `not_configured` or
+`unreachable` while repository citation search and MemoryCore continue to work.
 
 ## MCP
 
-The server uses local stdio and supports the modern MCP discovery/metadata
+The server uses local stdio and advertises the modern MCP discovery/metadata
 path first, while retaining a small compatibility handshake for hosts that
-have not migrated yet. Current tool names are:
+have not migrated yet. The public tool list is intentionally limited to
+read/diagnostic operations:
 
 ```text
 memory_doctor
 memory_sync
 memory_search
 memory_get
-memory_init       # explicit source setup
-memory_ingest     # explicit write
-memory_context    # task context: repository + Team Memory
-memory_team_sync  # explicit Team Memory bundle status/export/import
-memory_publish    # explicit shared memory write
-memory_feedback   # reuse feedback
-memory_supersede  # explicit correction
 ```
 
-The MCP and CLI call the same runtime and return the same JSON contract. The
-server is not bound to a port.
+Use the CLI for `init`, `source add`, `ingest-session`, `feedback`, Team Memory
+publish/activate, and `memorycore promote-l3`. The MCP and CLI share the same
+runtime and return the same read/query contract; the server is not bound to a
+port.
 
 ## OpenClaw capture and guard
 
 The OpenClaw extension is optional. It can:
 
 1. observe whether project-fact turns use the repository-memory MCP route;
-2. audit the bare built-in memory tool and high-confidence direct-file fallback
-   without blocking normal tool use;
+2. audit the bare built-in memory tool and direct-file fallback without
+   blocking normal tool use;
 3. audit tool metadata without storing full prompts or answers;
 4. capture bounded user/assistant text after a completed turn into L0;
 5. leave L2 as a reviewable candidate and never write L3 automatically.
@@ -239,7 +304,7 @@ that direct-file access is technically blocked.
 This project contains generic runtime code, fixtures, and documentation only.
 It intentionally does not contain private repositories, organization-specific
 evaluation sets, credentials, model names, internal hostnames, or user data.
-Use `memory_init`/`source add` to attach the repositories that are appropriate
+Use `init`/`source add` to attach the repositories that are appropriate
 for your own environment.
 
 See [docs/quickstart.md](docs/quickstart.md),
