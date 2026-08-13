@@ -18,7 +18,7 @@ repository-memory = "repository_memory:cli"
 
 [project.optional-dependencies]
 test = [
-  "pytest>=8,<9",
+  "pytest>=8,<10",
   "pytest-cov>=6,<8",
 ]
 semantic = [
