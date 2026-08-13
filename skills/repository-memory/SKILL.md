@@ -7,8 +7,9 @@ description: Search durable project and research memory across discovered knowle
 
 Use this Skill for durable repository knowledge, shared team experience, and
 explicitly imported long-term memory, not transient conversation context. The bundled runtime discovers
-sources and adapters at execution time; do not invent paths, providers, models,
-indexes, or deployment details.
+sources and the local runtime at execution time; do not invent paths,
+providers, models, indexes, or deployment details. The bundled runtime is
+standalone by default and does not require a vendor service.
 
 Prefer the host's registered stdio MCP. When using the CLI, invoke the bundled
 `scripts/repository-memory` (or `scripts/repository-memory.py`) relative to this Skill's
@@ -33,8 +34,8 @@ or registered its MCP. Before claiming that setup is complete:
    `not_installed` and ask the operator for the Skill package/registration;
    never claim that configuration succeeded.
 2. Run `memory_doctor` (or the bundled CLI's `doctor --json`). Record the
-   actual adapter, sources, index, freshness, MemoryCore layers, and semantic
-   capability.
+   actual runtime, sources, index, freshness, L0-L3 layer state, and semantic
+   capability. `status=ready` is not the same as a populated layer.
 3. If no repository source is configured and the operator supplied a Git root,
    call the CLI `init --path <root>` with that path. Otherwise ask which repository is the
    intended knowledge source. Do not silently register an arbitrary current
@@ -124,14 +125,12 @@ through the public MCP tool list.
 An installed lifecycle extension may separately capture a completed host turn;
 that capture is still a write and must be reported as L0 verified, L1
 pending/verified, and L2 candidate until a human accepts it. It never writes
-L3 by itself. A native memory service, if configured, may expose L0-L3. The
-current native write contract verifies the durable L0 conversation and normally
-reports L1 extraction as `pending` until a later observation confirms it; it
-does not promise synchronous L2/L3 creation. Only report L2/L3 as populated
-when the adapter actually returns those records and their status. Otherwise
-the runtime's local durable backend proves only L0/L1 and reports L2/L3 as
-unsupported; do not upgrade either state to a richer memory system in the
-answer.
+L3 by itself. The default local runtime persists all four layers: L0/L1 are
+created by explicit ingest or opt-in capture, L2 is a reviewable candidate, and
+L3 requires explicit promotion plus read-back. Only report L2/L3 as populated
+when `doctor` or `get` returns an actual record with its status. An optional
+vendor runtime may be enabled separately, but its readiness must not replace
+the standalone runtime's receipts.
 
 Read the relevant reference only when needed:
 

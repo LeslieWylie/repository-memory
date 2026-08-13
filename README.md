@@ -1,6 +1,9 @@
 # Repository Memory
 
 Repository Memory is a small, source-backed memory layer for AI agents.
+It is standalone by default: the Python process owns the local SQLite memory
+store and repository index, so a fresh install does not require TencentDB,
+Memmy, Node, an embedding service, or an API key.
 It gives an agent one consistent way to answer questions about project
 documents, research notes, reports, source-code evidence, and explicitly
 imported conversation memory.
@@ -10,11 +13,12 @@ The important idea is simple:
 > An answer is a fact only when the runtime can show where it came from.
 
 It ships as one generic Skill with a shared Python runtime and a pinned,
-source-only TencentDB component snapshot:
+source-only upstream component reference snapshot:
 
 - a citation-first repository index and CLI;
 - a local stdio MCP server for Claude, Codex, OpenClaw, and other hosts;
-- a MemoryCore adapter for L0-L3 conversation memory;
+- an in-process L0-L3 conversation memory runtime, with vendor backends only as
+  explicit compatibility options;
 - an OpenClaw lifecycle extension for before-prompt recall and conservative post-turn capture;
 - a metadata-only audit proxy and an advisory guard that validates evidence
   receipts without blocking normal coding, shell, Git, or debugging tools.
@@ -180,7 +184,7 @@ runtime does not pretend to provide a hosted Team Memory service.
 
 ## Four memory layers
 
-The optional MemoryCore adapter keeps conversation memory distinct from
+The bundled standalone memory runtime keeps conversation memory distinct from
 repository evidence:
 
 | Layer | Meaning | Default write policy |
@@ -198,22 +202,17 @@ is only `present` when the layer's actual query/read response returns records
 or content; unsupported, unreachable, malformed, or unprobed states remain
 `unknown` rather than being inferred from global health.
 
-The repository bundles a clean source snapshot of upstream MemoryCore and
-MemoryKnowledge components under the Skill's `vendor/` directory. The Python
-adapter still owns the public JSON contract and citations, but the installed
-MemoryCore service can run directly from that clean snapshot: it installs the
-runtime dependencies into the user data directory, applies the small
-repository-memory isolation/L3 policy patch there, and never mutates the Git
-vendor snapshot or an unrelated dirty checkout. The manifest pins the modules
-used for L0 capture, L1 extraction, L2 navigation, L3 profile recall, and
-Wiki/code-graph adapter design.
+The repository also bundles a clean source snapshot of upstream MemoryCore and
+MemoryKnowledge components as implementation references. They are not needed
+by the default executable path. The standalone runtime owns the public JSON
+contract, citations, SQLite state, and L0-L3 lifecycle; the vendor service is
+only an explicit compatibility mode for users who choose to run it.
 
-The live MemoryCore endpoint, model, provider, and credentials are discovered
-from user configuration or environment at runtime. Credentials are never
-committed to Git. If the service is unavailable, repository search still works
-and explicit session ingest uses the conservative local fallback with clearly
-reported layer support. `doctor --json` reports the actual runtime root and
-process so a vendored service cannot be confused with an external checkout.
+No live endpoint, model, provider, or credential is needed for the default
+runtime. If an external mode is explicitly enabled, its endpoint and
+credentials are discovered from user configuration or environment at runtime
+and never committed to Git. `doctor --json` reports whether the actual backend
+is `standalone-memory` or an explicitly selected external runtime.
 
 ## Optional local Memmy provider
 
@@ -279,7 +278,7 @@ memory_get
 ```
 
 Use the CLI for `init`, `source add`, `ingest-session`, `feedback`, Team Memory
-publish/activate, and `memorycore promote-l3`. The MCP and CLI share the same
+publish/activate, and `memory promote-l3`. The MCP and CLI share the same
 runtime and return the same read/query contract; the server is not bound to a
 port.
 

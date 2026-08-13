@@ -42,7 +42,7 @@ repository-memory capture-turn --input <bounded-turn.json> --json  # lifecycle a
 repository-memory team-export --output <bundle.json> --json
 repository-memory team-import --input <bundle.json> --json
 repository-memory team-activate --id <team-memory-id> [--reviewer <agent>] --json
-repository-memory memorycore promote-l3 --candidate <autocapture:L2:id> --accept --json
+repository-memory memory promote-l3 --candidate <autocapture:L2:id> --accept --json
 repository-memory evaluate --queries <queries.jsonl> --qrels <qrels.jsonl> [--revision <commit>] [--scope repository|memory|all] --json
 repository-memory team-evaluate --records <records.jsonl> --queries <queries.jsonl> --qrels <qrels.jsonl> [--gate] --json
 repository-memory team-compact [--keep N] --json
@@ -114,18 +114,16 @@ branch and never modifies the canonical repository.
 JSONL through the selected adapter's conversation-to-memory pipeline when that
 adapter provides one. It may write the adapter's configured canonical memory
 store, so it must only be run after the user explicitly requests ingestion.
-For native conversation stores, a successful response verifies the durable L0
-write; L1 extraction may be asynchronous and must remain `pending`/`unknown`
-until a later search or doctor call observes it. Do not report L1 as complete
-just because the HTTP mutation returned successfully. If no native or external
-adapter is available, the runtime persists a local L0 raw record and
-deterministic L1 atomic record in the user data directory; the result identifies
-`local-memory` and its actual layer support.
+For the standalone conversation store, a successful response verifies durable
+L0 and deterministic L1 by read-back. It creates no accepted L2/L3 implicitly;
+L2 remains a candidate until explicit review and L3 requires explicit
+promotion/read-back. An optional vendor backend may report asynchronous L1, but
+that external mode is never needed for a fresh install.
 
 `capture-turn` is not an ordinary query command. A host lifecycle extension may
 invoke it after a successful turn with bounded user/assistant messages. It
 redacts and de-duplicates the payload, verifies L0, observes L1, and writes only
-an unaccepted L2 candidate. `memorycore promote-l3` is a separate explicit
+an unaccepted L2 candidate. `memory promote-l3` is a separate explicit
 review operation; it reads the candidate, writes L3, reads L3 back, and archives
 the candidate outside the pending search tree. It requires `--accept` and is
 not exposed as a normal MCP tool.

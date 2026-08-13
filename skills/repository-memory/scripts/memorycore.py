@@ -978,5 +978,28 @@ class MemoryCoreClient:
         }
 
 
+def _external_mode_enabled() -> bool:
+    """Opt into an external MemoryCore only when the user says so.
+
+    A configured endpoint is not an installation requirement.  Earlier
+    versions treated any endpoint in the user config as the default backend,
+    which made a supposedly standalone install depend on a separately
+    running service.  Keep compatibility for users who explicitly select the
+    vendor runtime, but make the in-process store authoritative by default.
+    """
+
+    value = os.environ.get("REPOSITORY_MEMORY_EXTERNAL_MEMORY", "")
+    if value.casefold() in {"1", "true", "yes", "on"}:
+        return True
+    config = _read_json(_config_path())
+    memory = config.get("memorycore") if isinstance(config.get("memorycore"), dict) else {}
+    mode = str(memory.get("mode") or memory.get("backend") or "").casefold()
+    return mode in {"external", "native", "tencentdb", "memorycore"}
+
+
 def native_memory_client() -> MemoryCoreClient:
+    if not _external_mode_enabled():
+        from standalone_memory import standalone_memory_client
+
+        return standalone_memory_client()  # type: ignore[return-value]
     return MemoryCoreClient()

@@ -8,8 +8,9 @@ Repository Memory has four deliberately separate boundaries:
    document roots. They remain user-owned and are never rewritten by search.
 2. **Derived repository indexes** are disposable local cache data. A source
    commit, path, line range, and excerpt are stored with each result.
-3. **Conversation memory** is an optional adapter. It preserves L0/L1/L2/L3
-   layer identity and never becomes repository evidence.
+3. **Conversation memory** is an in-process SQLite L0-L3 runtime by default.
+   It preserves layer identity and never becomes repository evidence. A vendor
+   MemoryCore endpoint is an explicit compatibility option, not a prerequisite.
 4. **Shared Team Memory** is a user-level derived SQLite plane for reusable
    decisions, failures, discoveries, solutions, and handoffs. Its experience
    provenance is separate from Git citations and its lifecycle supports
@@ -27,7 +28,7 @@ MCP / CLI
   -> doctor and source discovery
   -> scope router
        repository -> snapshot -> structured local index -> citation validator
-       memory     -> native MemoryCore or local memory fallback
+       memory     -> standalone SQLite L0-L3 store (external MemoryCore is opt-in)
        all        -> both branches, returned as separate groups
   -> normalized verified/candidates contract
 ```

@@ -96,7 +96,7 @@ class Adapter:
         # the native MemoryCore plane.  Expose that fact in ingest/doctor
         # receipts instead of leaking the repository fallback name.
         if self.native_memory.configured:
-            self.name = "native-memorycore"
+            self.name = getattr(self.native_memory, "backend", "native-memorycore")
         self.local_memory = local_memory_store()
 
     @property
@@ -140,10 +140,17 @@ class Adapter:
         """Report support and live reachability for the optional memory plane."""
         if self.native_memory.configured:
             native = self.native_memory.health()
+            if getattr(self.native_memory, "backend", "") == "standalone-memory":
+                return native
             # Memmy is an optional semantic memory provider.  Keep its health
             # nested so the native TencentDB L0-L3 status is never confused
             # with the Memmy L1-L3/search plane.
-            memmy = self.memmy.health()
+            memmy = self.memmy.health() if getattr(self.native_memory, "backend", "") != "standalone-memory" else {
+                "configured": False,
+                "reachable": False,
+                "status": "optional_disabled",
+                "backend": "memmy",
+            }
             native["providers"] = {"memorycore": {**native, "providers": None}, "memmy": memmy}
             return native
         if self.memmy.configured:
@@ -268,9 +275,14 @@ class Adapter:
                 return self.memmy.get(result_id)
             except MemmyError as exc:
                 raise AdapterError(str(exc)) from exc
-        if result_id.startswith("local:") or (not self.native_memory.configured and self.protocol == "local-fallback"):
+        if result_id.startswith("local:") and getattr(self.native_memory, "backend", "") != "standalone-memory":
             try:
                 return self.local_memory.get(result_id)
+            except (KeyError, OSError, RuntimeError, ValueError) as exc:
+                raise AdapterError(str(exc)) from exc
+        if result_id.startswith("local:") and getattr(self.native_memory, "backend", "") == "standalone-memory":
+            try:
+                return self.native_memory.get(result_id)
             except (KeyError, OSError, RuntimeError, ValueError) as exc:
                 raise AdapterError(str(exc)) from exc
         if not self.native_memory.configured:
@@ -369,10 +381,15 @@ class Adapter:
 
     def ingest_session(self, input_path: Path) -> dict[str, Any]:
         """Explicitly submit a generic session payload to the adapter."""
+        # A user-configured legacy repository command is an explicit opt-in;
+        # preserve its contract for that source instead of letting the global
+        # standalone memory store shadow it.
+        if self.protocol == "legacy-legacy-memory" and self.executable:
+            return self._invoke(["ingest-session", "--input", str(input_path)])
         if self.native_memory.configured:
             try:
                 return self.native_memory.ingest(input_path)
-            except MemoryCoreError as exc:
+            except (MemoryCoreError, OSError, RuntimeError, ValueError) as exc:
                 fallback = self.local_memory.ingest(input_path)
                 fallback["native_error"] = str(exc)
                 fallback["fallback"] = True
@@ -396,7 +413,7 @@ def adapter_status(adapter: Adapter, probe_memory_layers: bool = False) -> dict[
     native_ready = adapter.native_memory.configured and native_health.get("status") == "ready"
     memmy_report = adapter.memmy.health() if adapter.memmy.configured and not native_ready else None
     memmy_ready = isinstance(memmy_report, dict) and memmy_report.get("status") == "ready"
-    local_ready = native_health.get("backend") == "local-memory" and native_health.get("status") == "ready"
+    local_ready = native_health.get("backend") in {"local-memory", "standalone-memory"} and native_health.get("status") == "ready"
     if native_ready or memmy_ready or local_ready:
         capabilities = ["memory-doctor", "memory-search", "memory-get", "ingest-session", "local-search"]
         if memmy_ready:
@@ -410,8 +427,8 @@ def adapter_status(adapter: Adapter, probe_memory_layers: bool = False) -> dict[
     else:
         capabilities = ["local-search"]
     value: dict[str, Any] = {
-        "name": "native-memorycore" if native_ready else "memmy" if memmy_ready else "local-memory" if local_ready else adapter.name,
-        "protocol": "memorycore" if native_ready else "memmy" if memmy_ready else "local-memory" if local_ready else adapter.protocol,
+        "name": native_health.get("backend") if native_ready else "memmy" if memmy_ready else native_health.get("backend", "local-memory") if local_ready else adapter.name,
+        "protocol": "memorycore" if native_ready and native_health.get("backend") != "standalone-memory" else "standalone" if local_ready and native_health.get("backend") == "standalone-memory" else "memmy" if memmy_ready else "local-memory" if local_ready else adapter.protocol,
         "path": None if native_ready or memmy_ready or local_ready else (str(adapter.executable) if adapter.executable else None),
         "available": adapter.available or adapter.native_memory.configured or adapter.memmy.configured or local_ready,
         "capabilities": capabilities,

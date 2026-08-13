@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "repository-memory"
-version = "0.3.0"
-description = "Citation-first repository memory Skill, CLI, MCP server, and optional MemoryCore adapter"
+version = "0.4.0"
+description = "Standalone citation-first repository memory Skill, CLI, MCP server, and local L0-L3 runtime"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -40,8 +40,12 @@ py-modules = [
   "fallback",
   "index",
   "install",
+  "knowledge",
+  "knowledge_service",
   "local_index",
   "local_memory",
+  "memmy",
+  "standalone_memory",
   "mcp_server",
   "memorycore",
   "memorycore_service",

@@ -332,7 +332,7 @@ def normalize_item(item: dict[str, Any], view: SourceView, source_type: str, que
         start, end = locate(view.path, path, excerpt)
     commit = citation.get("commit") or item.get("commit") or item.get("_commit") or metadata.get("commit") or metadata.get("revision") or view.commit
     status = evidence_status(item, citation)
-    memory_backend = citation.get("source") if citation.get("source") in {"memorycore", "local-memory", "memmy"} else None
+    memory_backend = citation.get("source") if citation.get("source") in {"memorycore", "standalone-memory", "local-memory", "memmy"} else None
     native = bool(item.get("_native_memory") or memory_backend)
     memory_backend = memory_backend or (item.get("_memory_backend") if native else None) or ("memorycore" if native else None)
     checked = validate_memory(citation, excerpt) if native else validate(view.path, path, start, end, excerpt, commit, view.commit)
@@ -727,10 +727,26 @@ def sync_index(root: Path | None, deep: bool = False, source_id: str | None = No
 def ingest_session(root: Path | None, input_path: str, source_id: str | None = None) -> dict[str, Any]:
     """Explicitly send a generic session JSON/JSONL payload to the adapter."""
     native = native_memory_client()
-    if native.configured:
+    configured_source_adapter: Adapter | None = None
+    if root is not None and source_id:
+        try:
+            specs = discover_sources(str(root), source_id)
+            if len(specs) == 1:
+                candidate_view = prepare_view(specs[0], local=True)
+                candidate_adapter = discover_adapter(candidate_view)
+                if candidate_adapter.available and candidate_adapter.protocol == "legacy-legacy-memory":
+                    configured_source_adapter = candidate_adapter
+        except (RuntimeError, OSError, ValueError):
+            configured_source_adapter = None
+    if configured_source_adapter is not None:
+        view = configured_source_adapter.source
+        adapter = configured_source_adapter
+        source_name = source_id or adapter.source.spec.id
+    elif native.configured:
         view = _memory_view()
         adapter = Adapter(None, view)
-        source_name = "memorycore"
+        native_backend = getattr(native, "backend", None)
+        source_name = native_backend if isinstance(native_backend, str) else "memorycore"
     else:
         try:
             specs = discover_sources(str(root) if root else None, source_id)
@@ -974,9 +990,9 @@ def capture_turn(root: Path | None, payload: Any, source_id: str | None = None) 
                     "created": True,
                     "status": "candidate" if observed.get("status") != "accepted" else "accepted",
                     "verified": bool(observed_content),
-                    "backend": "memorycore",
+                    "backend": getattr(native, "backend", "memorycore"),
                     "path": path,
-                    "id": f"memorycore:L2:{path}",
+                    "id": f"{getattr(native, 'backend', 'memorycore')}:L2:{path}",
                     "evidence_status": observed.get("status") or "generated",
                 }
         else:
@@ -1052,14 +1068,20 @@ def promote_l3(candidate_id: str) -> dict[str, Any]:
     block to the L3 profile.
     """
 
-    if not candidate_id or not candidate_id.startswith("memorycore:L2:"):
-        raise RuntimeError("promote-l3 requires a native memorycore:L2 id; local pending candidates are not promotable")
+    if not candidate_id or not re.match(r"^(?:memorycore|standalone-memory|local):L2:", candidate_id):
+        raise RuntimeError("promote-l3 requires an L2 scenario id; local pending candidates are not promotable")
     native = native_memory_client()
     if not native.configured:
         raise RuntimeError("MemoryCore is not configured")
     path = candidate_id.split(":", 2)[-1]
     candidate = native.get(candidate_id)
     memory = candidate.get("memory") if isinstance(candidate.get("memory"), dict) else {}
+    if getattr(native, "backend", "") == "standalone-memory":
+        try:
+            metadata = json.loads(str(memory.get("metadata") or "{}"))
+        except json.JSONDecodeError:
+            metadata = {}
+        path = str(metadata.get("path") or path)
     content = str(memory.get("content") or "").strip()
     if not content:
         raise RuntimeError("native L2 scenario has no content")
@@ -1092,7 +1114,7 @@ def promote_l3(candidate_id: str) -> dict[str, Any]:
         "candidate": candidate_id,
         "l2": {"id": candidate_id, "path": path, "status": "accepted", "readback": True},
         "layer": "L3",
-        "id": "memorycore:L3:profile",
+        "id": f"{getattr(native, 'backend', 'memorycore')}:L3:profile",
         "status": "accepted",
         "verified": True,
         "readback": True,
@@ -1122,10 +1144,10 @@ def _memory_get_result(result_id: str, explain: bool = False) -> dict[str, Any]:
             "errors": [{"source": memory.get("backend") or "memorycore", "adapter": memory.get("backend") or "memorycore", "error": str(exc), "freshness": memory}],
             "reason": "memory result not found or MemoryCore unavailable",
         }
-    backend = "memmy" if result_id.startswith("memmy:") else "local-memory" if result_id.startswith("autocapture:") else memory.get("backend") or ("memorycore" if adapter.native_memory.configured else "local-memory")
+    backend = "memmy" if result_id.startswith("memmy:") else "local-memory" if result_id.startswith("autocapture:") else memory.get("backend") or (getattr(adapter.native_memory, "backend", "memorycore") if adapter.native_memory.configured else "local-memory")
     raw_layer = value.get("layer") or value.get("memoryLayer") if isinstance(value, dict) else None
     if not raw_layer:
-        match = re.match(r"^(?:memorycore|memmy|local|autocapture):(L[0-3]|Skill):", result_id)
+        match = re.match(r"^(?:memorycore|standalone-memory|memmy|local|autocapture):(L[0-3]|Skill):", result_id)
         raw_layer = match.group(1) if match else None
     layer = str(raw_layer or "") or None
     payload = value.get("memory") if isinstance(value, dict) and isinstance(value.get("memory"), dict) else (value if isinstance(value, dict) else {})
@@ -1163,7 +1185,7 @@ def _memory_get_result(result_id: str, explain: bool = False) -> dict[str, Any]:
         "source": backend,
         "memory_id": memory_id,
         "layer": layer,
-        "receipt": "native-memorycore-readback" if backend == "memorycore" else "memmy-readback" if backend == "memmy" else "local-memory-readback",
+        "receipt": "standalone-memory-readback" if backend == "standalone-memory" else "native-memorycore-readback" if backend == "memorycore" else "memmy-readback" if backend == "memmy" else "local-memory-readback",
     }
     result = {
         "schema_version": SCHEMA_VERSION,
@@ -1211,7 +1233,7 @@ def get_result(
             value["doctor"] = doctor(root)
         return value
     errors = []
-    if result_id.startswith(("memorycore:", "memmy:", "local:", "autocapture:")):
+    if result_id.startswith(("memorycore:", "standalone-memory:", "memmy:", "local:", "autocapture:")):
         return _memory_get_result(result_id, explain)
     try:
         specs = discover_sources(str(root) if root else None)
@@ -1355,7 +1377,7 @@ def doctor(root: Path | None = None, source_id: str | None = None) -> dict[str, 
         return {
             "schema_version": SCHEMA_VERSION,
             "ok": memory_ready,
-            "active_adapter": "native-memorycore" if native_ready else "memmy" if isinstance(provider_reports.get("memmy"), dict) and provider_reports["memmy"].get("status") == "ready" else "local-memory" if memory_configured else None,
+            "active_adapter": memory_report.get("backend") if memory_ready else "memmy" if isinstance(provider_reports.get("memmy"), dict) and provider_reports["memmy"].get("status") == "ready" else None,
             "capabilities": sorted(set(capabilities)),
             "memory": memory_report,
             "team_memory": team_report,
@@ -1467,6 +1489,8 @@ def promote(root: Path, input_path: str) -> dict[str, Any]:
     destination = data_root() / "candidates"
     destination.mkdir(parents=True, exist_ok=True)
     written = []
+    native_candidates = []
+    native = native_memory_client()
     for index, item in enumerate(items):
         if not isinstance(item, dict) or not str(item.get("content") or item.get("title") or "").strip():
             raise RuntimeError("promote input items require content or title")
@@ -1475,7 +1499,10 @@ def promote(root: Path, input_path: str) -> dict[str, Any]:
         candidate = {"schema_version": SCHEMA_VERSION, "id": identifier, "status": "candidate", "evidence_status": "pending", "source": item.get("source"), "citation": item.get("citation"), "title": item.get("title"), "content": item.get("content")}
         target.write_text(json.dumps(candidate, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         written.append(str(target))
-    return {"schema_version": SCHEMA_VERSION, "status": "candidate", "written": written, "canonical_repo_changed": False}
+        if getattr(native, "backend", "") == "standalone-memory":
+            scenario = native.write_scenario(identifier, str(item.get("content") or item.get("title") or ""), summary=str(item.get("title") or identifier))
+            native_candidates.append({"id": scenario.get("id"), "path": identifier, "status": scenario.get("status"), "readback": bool(scenario.get("content"))})
+    return {"schema_version": SCHEMA_VERSION, "status": "candidate", "written": written, "native_l2": native_candidates, "canonical_repo_changed": False}
 
 
 def _read_json_or_jsonl(input_path: str) -> Any:
@@ -1669,6 +1696,11 @@ def build_parser() -> argparse.ArgumentParser:
     memorycore.add_argument("--candidate")
     memorycore.add_argument("--accept", action="store_true")
     memorycore.add_argument("--json", action="store_true")
+    memory = sub.add_parser("memory", help="Inspect or explicitly promote the standalone local memory runtime")
+    memory.add_argument("action", choices=["status", "promote-l3"])
+    memory.add_argument("--candidate")
+    memory.add_argument("--accept", action="store_true")
+    memory.add_argument("--json", action="store_true")
     knowledge = sub.add_parser("knowledge")
     knowledge.add_argument("action", choices=("status", "configure", "install", "start", "stop", "create", "sync", "search"))
     knowledge.add_argument("--root", default=argparse.SUPPRESS)
@@ -1789,7 +1821,7 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
                 return _mcp_dispatch(name, arguments)
             return serve(dispatch)
         gate_failed = False
-        root = None if args.command in {"init", "source", "doctor", "sync", "search", "get", "explain", "feedback", "promote", "publish", "team-activate", "team-export", "team-import", "team-evaluate", "team-compact", "context", "supersede", "ingest-session", "capture-turn", "knowledge", "memmy", "gui"} else resolve_root(root_arg)
+        root = None if args.command in {"init", "source", "doctor", "sync", "search", "get", "explain", "feedback", "promote", "publish", "team-activate", "team-export", "team-import", "team-evaluate", "team-compact", "context", "supersede", "ingest-session", "capture-turn", "knowledge", "memmy", "gui", "memory", "memorycore"} else resolve_root(root_arg)
         if args.command in {"init", "source"} and root_arg:
             root = resolve_root(root_arg)
         if args.command == "doctor":
@@ -1944,11 +1976,28 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
             if args.fallback_only:
                 os.environ["REPOSITORY_MEMORY_DISABLE_ADAPTER"] = "1"
             value = evaluate_queries(root, Path(args.queries).expanduser(), Path(args.qrels).expanduser(), limit=args.limit, deep=args.deep, local=args.local, scope=args.scope, revision=args.revision)
+        elif args.command == "memory":
+            if args.action == "promote-l3" and not args.accept:
+                raise RuntimeError("memory promote-l3 requires explicit --accept")
+            client = native_memory_client()
+            if args.action == "status":
+                value = {"schema_version": SCHEMA_VERSION, **client.health(refresh=True, probe_layers=True), "external_mode": getattr(client, "backend", "") != "standalone-memory", "canonical_repo_changed": False}
+            else:
+                value = promote_l3(args.candidate or "")
         elif args.command == "memorycore":
             if args.action == "promote-l3":
                 if not args.accept:
                     raise RuntimeError("promote-l3 requires explicit --accept")
                 value = promote_l3(args.candidate or "")
+                print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
+                return 0
+            if args.action == "status":
+                # `memorycore status` is a public compatibility command.  It
+                # must describe the actual default runtime and must not force
+                # users to start the optional vendor service just to inspect
+                # readiness.
+                client = native_memory_client()
+                value = {"schema_version": SCHEMA_VERSION, **client.health(refresh=True, probe_layers=True), "external_mode": getattr(client, "backend", "") != "standalone-memory", "canonical_repo_changed": False}
                 print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
                 return 0
             from memorycore_service import main as memorycore_main

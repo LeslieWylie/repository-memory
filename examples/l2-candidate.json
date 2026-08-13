@@ -1,0 +1,10 @@
+{
+  "id": "standalone-memory-demo",
+  "title": "Repository memory operating policy",
+  "content": "Repository-memory repository evidence uses citation-first retrieval. L0 and L1 are written automatically when a session is explicitly imported; L2 requires review and L3 requires explicit promotion.",
+  "source": "manual-test",
+  "citation": {
+    "source": "manual-test",
+    "evidence_status": "pending"
+  }
+}

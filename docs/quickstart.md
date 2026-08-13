@@ -24,6 +24,11 @@ The source root must be a Git repository or a directory explicitly intended
 as a knowledge source. The installer writes user config and derived cache;
 the source files stay untouched.
 
+The install is self-contained. Do not start a vendor MemoryCore, Memmy, Wiki,
+or embedding service. The first `doctor` creates the user-level SQLite state
+and reports `memory.backend=standalone-memory`, `external_dependency=false`,
+and `embedding.strategy=keyword-only`.
+
 ## 2. Inspect readiness
 
 ```bash
@@ -119,7 +124,9 @@ repository-memory ingest-session --input examples/session.json --json
 ```
 
 Ingestion is a write. It must be requested explicitly. It reports the actual
-L0/L1 read-back status and never silently creates an accepted L2 or L3 record.
+L0/L1 read-back status. The standalone runtime also supports L2 candidates and
+explicitly accepted L2/L3 records; it never silently creates an accepted L2 or
+L3 record.
 
 ## 8. MCP smoke test
 

@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""Small durable, provider-free conversation memory fallback.
+"""Compatibility L0/L1 store used by legacy source adapters.
 
-The native MemoryCore adapter remains the preferred L0-L3 backend.  This
-store exists so a freshly installed Skill can still persist and retrieve
-explicitly imported sessions before a remote or local memory service is
-configured.  It intentionally provides only the layers it can prove:
-raw conversations (L0) and deterministic atomic records (L1).  It never
-pretends to have L2/L3 summarisation or profile semantics.
+The public default runtime lives in :mod:`standalone_memory` and owns all four
+layers.  This small class remains for old source commands and migration tests;
+it deliberately keeps its historical L0/L1-only contract instead of pretending
+that a legacy fallback is a full long-term memory implementation.
 """
 
 from __future__ import annotations

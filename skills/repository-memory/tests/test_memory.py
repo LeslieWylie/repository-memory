@@ -110,7 +110,7 @@ class RepositoryMemoryTest(unittest.TestCase):
     def test_runtime_version_comes_from_skill_version_file(self):
         self.assertEqual(SERVER_VERSION, VERSION)
         self.assertEqual(VERSION, (SCRIPTS.parent / "VERSION").read_text(encoding="utf-8").strip())
-        self.assertEqual(VERSION, "0.3.1")
+        self.assertEqual(VERSION, "0.4.0")
 
     def test_multisource_search_has_verified_and_candidates(self):
         result = core.search(None, "Atlas evidence", limit=5)
@@ -1334,8 +1334,8 @@ class RepositoryMemoryTest(unittest.TestCase):
         empty_memory = core.doctor(None)["memory"]
         self.assertEqual(empty_memory["layers"]["L0"]["population"], "empty")
         self.assertEqual(empty_memory["layers"]["L1"]["population"], "empty")
-        self.assertEqual(empty_memory["layers"]["L2"]["capability"], "unsupported")
-        self.assertEqual(empty_memory["layers"]["L2"]["population"], "unknown")
+        self.assertEqual(empty_memory["layers"]["L2"]["capability"], "supported")
+        self.assertEqual(empty_memory["layers"]["L2"]["population"], "empty")
         session = Path(self.temp.name) / "local-session.json"
         session.write_text(json.dumps({
             "session_id": "local-session",
@@ -1343,18 +1343,54 @@ class RepositoryMemoryTest(unittest.TestCase):
         }), encoding="utf-8")
         ingested = core.ingest_session(None, str(session))
         self.assertTrue(ingested["ok"])
-        self.assertEqual(ingested["source"], "local-memory")
-        self.assertEqual(ingested["memory"]["supported_layers"], ["L0", "L1"])
+        self.assertEqual(ingested["source"], "standalone-memory")
+        self.assertEqual(ingested["memory"]["supported_layers"], ["L0", "L1", "L2", "L3"])
         self.assertEqual(ingested["memory"]["layers"]["L0"]["population"], "present")
         self.assertEqual(ingested["memory"]["layers"]["L1"]["population"], "present")
         found = core.search(None, "portable local memory", scope="memory")
         self.assertFalse(found["abstain"])
-        self.assertEqual(found["verified"][0]["source"], "local-memory")
+        self.assertEqual(found["verified"][0]["source"], "standalone-memory")
         self.assertEqual(found["verified"][0]["memory"]["layer"], "L1")
         fetched = core.get_result(None, found["verified"][0]["id"])
         self.assertTrue(fetched["found"])
-        self.assertEqual(fetched["source"], "local-memory")
+        self.assertEqual(fetched["source"], "standalone-memory")
         self.assertFalse(subprocess.check_output(["git", "-C", str(self.alpha), "status", "--porcelain"], text=True))
+
+    def test_standalone_runtime_proves_four_layer_lifecycle_without_services(self):
+        """The default install must not need a gateway or a vendor process."""
+        self.write_config({})
+        os.environ["REPOSITORY_MEMORY_AUTODISCOVER"] = "0"
+        session = Path(self.temp.name) / "standalone-session.json"
+        session.write_text(json.dumps({
+            "session_id": "standalone-session",
+            "messages": [{"role": "user", "content": "standalone L0 and L1 evidence"}],
+        }), encoding="utf-8")
+        ingested = core.ingest_session(None, str(session))
+        self.assertTrue(ingested["ok"])
+        self.assertEqual(ingested["source"], "standalone-memory")
+        self.assertEqual(ingested["memory"]["backend"], "standalone-memory")
+        self.assertEqual(ingested["memory"]["supported_layers"], ["L0", "L1", "L2", "L3"])
+        self.assertTrue(ingested["memory"]["layers"]["L0"]["readback"] == "verified")
+        self.assertTrue(ingested["memory"]["layers"]["L1"]["readback"] == "verified")
+
+        candidate_input = Path(self.temp.name) / "standalone-candidate.json"
+        candidate_input.write_text(json.dumps({
+            "id": "standalone-policy",
+            "title": "Standalone policy",
+            "content": "Standalone repository memory keeps citation-first retrieval and explicit promotion.",
+        }), encoding="utf-8")
+        candidate = core.promote(None, str(candidate_input))
+        self.assertEqual(candidate["status"], "candidate")
+        self.assertEqual(candidate["native_l2"][0]["status"], "candidate")
+        promoted = core.promote_l3(candidate["native_l2"][0]["id"])
+        self.assertTrue(promoted["verified"])
+        report = core.doctor(None)
+        self.assertEqual(report["active_adapter"], "standalone-memory")
+        self.assertEqual(report["memory"]["layers"]["L2"]["population"], "present")
+        self.assertEqual(report["memory"]["layers"]["L3"]["readback"], "verified")
+        found = core.search(None, "citation-first explicit promotion", scope="memory")
+        self.assertFalse(found["abstain"])
+        self.assertTrue(any(item["layer"] == "L3" for item in found["verified"]))
 
     def test_capture_turn_creates_one_team_candidate_without_accepting_it(self):
         self.write_config({})

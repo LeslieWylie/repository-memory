@@ -21,15 +21,12 @@ memory results and is not fused with repository scores. Use the returned layer
 and query-source fields to explain provenance. If the memory plane is configured
 but not reachable, report that state; repository scope remains usable.
 
-The native MemoryCore adapter searches L0 conversations and L1 atomic records,
-and reads L2 scenarios and the L3 profile through their layer-specific APIs.
-Explicit session ingestion uses the durable conversation mutation path so the
-records remain visible to subsequent L0/L1 queries; a batch seed command that
-only creates a disposable workspace is not treated as successful persistence.
-When no native backend is configured, the Skill uses a user-level SQLite
-fallback for explicit session ingestion and lexical L0/L1 recall. Its doctor
-output marks L2/L3 unsupported rather than pretending deterministic storage is
-equivalent to summarisation or profile memory.
+The default runtime searches an in-process SQLite store across L0 conversations,
+L1 atomic records, L2 scenarios, and the L3 profile. Explicit session ingestion
+persists L0/L1 and verifies them by read-back. L2 is a candidate until explicit
+review; L3 is written only by explicit promotion and is verified by a second
+read. A vendor MemoryCore endpoint is an optional compatibility backend and is
+never required for the standalone path.
 
 By default, the runtime fetches a remote reference and indexes a disposable snapshot without changing the working tree. Use `--local` only when the current checkout is intentionally the source. An explicitly configured `local_only` source is an offline/local snapshot contract: it is fresh relative to its recorded commit when clean, but never implies that the commit is the latest remote revision. A dirty local source is not fresh and its results must not silently be presented as remote facts.
 
