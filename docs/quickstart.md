@@ -135,7 +135,12 @@ records; it never silently accepts an L2 or writes L3.
 repository-memory mcp
 ```
 
-The process speaks stdio. A host should register the process, then call
-`memory_doctor`, `memory_context`, and `memory_get`. The host namespace may
-prefix these names; use the registered namespace, not a bare unrelated
-`memory_search` tool.
+The process speaks stdio. A host should register the process, then call the
+four public tools `memory_doctor`, `memory_sync`, `memory_search`, and
+`memory_get`. The host namespace may prefix these names; use the registered
+repository-memory namespace, not a bare unrelated `memory_search` tool.
+
+The public MCP is intentionally read-only. Use the CLI for `init`,
+`source add`, `ingest-session`, feedback, review, promotion, and Team Memory
+publishing. CLI and MCP share the same user-level runtime and return the same
+query contract.

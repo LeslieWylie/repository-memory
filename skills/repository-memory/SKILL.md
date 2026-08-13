@@ -1,154 +1,118 @@
 ---
 name: repository-memory
-description: Search durable project and research memory across discovered knowledge sources and repositories with source-backed citations, freshness diagnostics, and explicit candidate-writing boundaries. Use when an agent needs verified project facts, long-lived knowledge, relationships, recent reports, or source-level evidence.
+description: Find source-backed project facts and durable conversation memory with verified citations, freshness status, and explicit write boundaries.
 ---
 
 # Repository Memory
 
-Use this Skill for durable repository knowledge, shared team experience, and
-explicitly imported long-term memory, not transient conversation context. The bundled runtime discovers
-sources at execution time and owns the default local memory/index runtime; do
-not invent paths, providers, models, indexes, or deployment details. The
-bundled runtime is standalone by default and does not require a vendor service.
+Use this Skill when the user asks about project knowledge, research notes,
+reports, repository history, source-level evidence, or explicitly imported
+long-term memory. It is a generic local Skill: discover the repository,
+adapter, runtime, and index at execution time. Do not invent paths, providers,
+models, ports, or service URLs.
 
-Prefer the host's registered stdio MCP. When using the CLI, invoke the bundled
-`scripts/repository-memory` (or `scripts/repository-memory.py`) relative to this Skill's
-installed directory; do not assume a global executable or a particular current
-working directory.
+## Required first-use flow
 
-On hosts that namespace MCP tools, the repository-memory tools are exposed with
-the host's repository namespace (for example, `repository-memory__memory_search`).
-The bare host tool `memory_search` is a different backend. Prefer the
-namespaced tools for shared evidence, but the host guard is advisory and must
-not block ordinary `read`, `grep`, `git`, `exec`, tests, or debugging. If a
-optional compatibility backend is unavailable, report that fact; the default
-standalone runtime must continue to work without that backend.
-
-## First-use setup handshake
-
-This Skill is a usage contract, not proof that a host has installed the Skill
-or registered its MCP. Before claiming that setup is complete:
-
-1. Confirm that the Skill is present and that the host exposes the repository
-   memory MCP. If neither the MCP nor the bundled CLI is available, report
-   `not_installed` and ask the operator for the Skill package/registration;
-   never claim that configuration succeeded.
-2. Run `memory_doctor` (or the bundled CLI's `doctor --json`). Record the
-   actual runtime, sources, index, freshness, L0-L3 layer state, and semantic
-   capability. `status=ready` is not the same as a populated layer.
-3. If no repository source is configured and the operator supplied a Git root,
-   call the CLI `init --path <root>` with that path. Otherwise ask which repository is the
-   intended knowledge source. Do not silently register an arbitrary current
-   directory.
-4. If the selected source is stale or missing an index, call `memory_sync` and
-   re-run `memory_doctor`. Do not use local dirty state as fresh remote evidence.
-5. Verify the MCP capability with `tools/list` when available, then run one
-   positive citation query and one clearly fabricated negative query. Claim
-   `ready` only when the observed responses support it; include any degraded
-   or fallback state in the report.
-
-The repository lane may expose an optional local semantic provider. Treat
-`doctor`'s `repository_semantic.available`, provider, model, indexed commit,
-and `retrieval_mode` as runtime facts; a configured model without a loaded
-model and same-commit index is only `lexical-fallback`. Semantic ranking may
-improve candidate recall inside one repository, but it never replaces exact
-path/citation validation or permits cross-source score fusion.
-
-Read [operations](references/operations.md) for the exact tool/CLI handshake
-and [entity-and-memory-model](references/entity-and-memory-model.md) before
-explaining entity extraction or session-memory writes.
-
-If the host supports a lifecycle extension, read
-[automatic-capture](references/automatic-capture.md). A post-turn hook may
-capture a bounded user/assistant turn into L0 and create an untrusted L2
-candidate, but this is an installation capability rather than a promise made
-by the Skill alone. Plain MCP/CLI use remains read-only unless the user
-explicitly requests a write.
-
-When the lifecycle extension is enabled, it may also perform automatic
-conversation-memory recall before the model turn. Treat the injected block as
-labelled L0/L1/L2/L3 context, not as repository evidence; use the normal
-repository MCP path for source-backed project facts. The extension uses the
-same runtime as the CLI and MCP and must not introduce a second ranking path.
-
-## Operating procedure
-
-1. Run `doctor --json` before the first query or when the environment changes.
-2. If no source is configured, ask for or discover the user's intended knowledge directory, then run `init --path <directory> --json`. Repeat `source add --path <directory> --id <stable-id>` for additional repositories or document roots. This writes only user config and derived cache.
-3. Run `sync --json` when the doctor reports a missing/stale index or the source is not fresh.
-4. For a task that may benefit from prior agent work, use the CLI `memory_context(query)` when the richer team-memory context is explicitly needed. Through MCP, use `memory_search` with `scope=repository`, `scope=memory`, or `scope=all`; the MCP surface intentionally exposes only read/diagnostic tools and does not expose the write or team-context mutation APIs.
-5. Inspect `answerable`, `verified`, `candidates`, `support`, `freshness`, and `diagnostics`; use `get` or `explain` with the result's citation `commit`, `line_start`, and `line_end` when available. Never treat a verified-but-partial document as a complete answer.
-6. Use `answerable`/`results` as the answer surface. `verified` is a document-level retrieval lane used for diagnostics and evaluation; it only proves the citation is real. If `answerable` is empty or `abstain=true`, do not answer the full claim. `support.claim_support=partial|unknown` means the answer must abstain from the unsupported part and may only report a directly supported subclaim after `get`/`explain`.
-
-For a project-fact turn, the auditable call sequence is:
+Use the host's namespaced repository-memory MCP when available. The public MCP
+tools are:
 
 ```text
-repository-memory doctor → repository-memory context/search → repository-memory get
+repository-memory__memory_doctor
+repository-memory__memory_sync
+repository-memory__memory_search
+repository-memory__memory_get
 ```
 
-The host extension records this sequence when it can observe it, but does not
-block coding or debugging tools. A model-written receipt is not evidence that
-the sequence happened; use the host audit record when it is available.
+The exact namespace is host-defined. A bare `memory_search` may belong to a
+different backend; do not silently substitute it.
 
-Do not manually rewrite a natural-language query into a filename or path. The
-runtime performs conservative CJK token expansion, entity-in-filename matching,
-and temporal routing to report/standup layers. If it still returns no verified
-evidence, mark the retrieved claim unknown. Direct workspace inspection may be
-used when it is part of the coding task, but it must not be mislabeled as a
-citation returned by this Skill.
+Before the first query, or after the environment changes:
 
-The repository runtime's current “entity extraction” is structural lexical
-routing, not named-entity recognition and not a persistent relation graph. It
-uses the original query, conservative token forms, source path/file name,
-headings, dates, and generic directory layers. Do not invent aliases,
-relationships, or entity facts that the result does not expose.
+1. Call `memory_doctor` (or the bundled CLI `doctor --json`).
+2. Confirm the actual source, indexed commit, freshness, adapter, retrieval
+   mode, and memory-layer population. `ready` means usable, not populated.
+3. If the source is missing or stale, call `memory_sync`, then run doctor
+   again. Do not claim a stale or dirty checkout is fresh.
+4. For a new installation, run one real positive query and one fabricated
+   negative query before reporting the setup as working.
 
-When using MCP, do not invent or pass a `root` path. Use the server's configured
-repository discovery unless the user explicitly supplies a Git repository root;
-pass only the query and, when needed, a known source id.
+If the MCP and bundled CLI are both absent, report `not_installed`. A config
+file or a model-written receipt is not proof of installation.
 
-`candidates` are leads, not facts. Generated, inferred, pending, stale, dirty, or citation-incomplete repository results require source verification. Team Memory uses its own lifecycle: `active` records are experience/decision context with provenance, while `candidate`, `stale`, and `superseded` records are not facts. `memory_context` keeps the sections separate and never makes a team recollection look like a Git citation.
+## Query flow
 
-Normal use is read-only. Only run the CLI `memory_publish`, `memory_feedback`,
-`memory_supersede`, `feedback`, `promote`, or `memory_ingest` when the user or
-an explicit task-end workflow asks for a write. New Team Memory defaults to
-`candidate`; promotion/replacement is explicit. The local stdio MCP entrypoint
-exposes only `memory_doctor`, `memory_sync`, `memory_search`, and `memory_get`;
-CLI and MCP return the same read/query contract.
-When agents run on different hosts, use the explicit `team-export` and
-`team-import` bundle commands (or `memory_team_sync`) to transfer Team Memory;
-review candidates explicitly with `team-activate`/`memory_team_activate`, and
-do not claim that a local SQLite file is automatically cross-machine shared.
+For ordinary project questions, preserve the user's wording and call:
 
-When the host exposes the audited MCP registration, tool calls are recorded as
-metadata-only request/response events. Treat `audit_verified` evidence from the
-host trace as stronger than a model-written receipt.
+```text
+memory_search(query=<user's original question>, scope="repository")
+```
 
-If the user explicitly asks to import a conversation or session, use the CLI
-`ingest-session` path. Treat its output as a write operation and check the
-reported memory-layer and pipeline status. `memory_ingest` remains an internal
-runtime dispatch for tests/host lifecycle code and is deliberately not exposed
-through the public MCP tool list.
-An installed lifecycle extension may separately capture a completed host turn;
-that capture is still a write and must be reported as L0/L1 read-back verified
-and L2 candidate until a human accepts it. It never writes L3 by itself. The
-default local runtime persists all four layers: explicit ingest or opt-in
-capture creates L0/L1 and an L2 candidate, while L3 requires explicit
-promotion plus read-back. Only report L2/L3 as populated when `doctor` or
-`get` returns an actual record with its status. An optional vendor runtime may
-be enabled separately, but its readiness must not replace the standalone
-runtime's receipts.
+Do not manually turn a natural-language question into a filename. The runtime
+handles conservative lexical, structural, date, and local semantic routing.
+Use `scope="memory"` only for conversation memory, and `scope="all"` when the
+user explicitly wants both. Repository evidence and conversation memory must
+remain separate; never present a memory record as a Git citation.
 
-Read the relevant reference only when needed:
+After search:
 
-- [retrieval](references/retrieval.md) for routing and freshness decisions;
-- [result contract](references/result-contract.md) for `verified`/`candidates` handling;
-- [citation](references/citation.md) for source validation;
-- [write policy](references/write-policy.md) for explicit writes;
-- [operations](references/operations.md) for CLI and MCP invocation.
-- [entity and memory model](references/entity-and-memory-model.md) for the
-  current entity-routing and L0-L3 semantics.
-- [automatic capture](references/automatic-capture.md) for host lifecycle
-  capture, redaction, candidate review, and explicit L3 promotion.
-- [team memory](references/team-memory.md) for shared memory types, lifecycle,
-  context hydration, feedback, and conflict resolution.
+1. Prefer `answerable`/`results`, not merely the presence of `verified`.
+2. For the selected result, call `memory_get` when the claim is important,
+   compound, partial, or time-sensitive.
+3. Answer only from evidence whose citation is valid and whose freshness is
+   acceptable. Report source/repository, commit, path or memory layer, line
+   range or locator, freshness, and evidence status.
+4. If `claim_support` is `partial` or `unknown`, state only the supported
+   subclaim and abstain from the rest.
+5. If no directly supported result exists, say that the evidence is
+   insufficient. Do not fill the gap with a similar document.
+
+`verified` means the runtime checked a citation or a stable memory
+layer/identifier. It does not mean one excerpt proves every part of a
+compound question. `candidates` are leads only: stale, dirty, generated,
+inferred, pending, or citation-incomplete content is not a fact until it is
+validated with `memory_get`/`explain` and the lifecycle rules allow it.
+
+When semantic dependencies are unavailable, report the actual
+`retrieval_mode` (for example `lexical-fallback` or `keyword-only`). Never
+call keyword retrieval semantic or hybrid. The runtime may use a local,
+dependency-free projection, but its availability must come from doctor/search.
+
+## Memory layers and writes
+
+The standalone runtime keeps these layers distinct:
+
+```text
+L0  raw conversation/message       explicit ingest or opt-in capture
+L1  extracted atomic memory         read-back verified before use
+L2  scenario/context                candidate until explicit review
+L3  profile/core memory             explicit accept/promote plus read-back
+```
+
+An API being reachable does not prove that a layer contains useful data. Use
+doctor or get to distinguish capability, readiness, population, status, and
+read-back. Do not claim L2/L3 exists merely because the endpoint supports it.
+
+Normal search and sync are read/index operations. Only run `ingest-session`,
+`feedback`, `promote`, Team Memory publish/activate, or host capture when the
+user or an explicit task-end workflow requests a write. Never silently rewrite
+the canonical repository. New memories remain candidate/pending until the
+documented review or promotion step; ordinary conversation never writes L3.
+
+## Tool boundary
+
+The Skill does not forbid normal development tools. `read`, `grep`, `git`,
+`exec`, tests, and debugging remain valid for coding tasks. For a project-fact
+answer, however, do not use them as an undocumented substitute for the
+repository-memory MCP, and do not describe directly inspected files as MCP
+citations. If the source is not registered, explicitly register it with the
+CLI only after the user supplies or confirms the repository root.
+
+Read the references only when needed:
+
+- `references/operations.md` — CLI commands and MCP handshake;
+- `references/result-contract.md` — `verified`, `answerable`, and candidates;
+- `references/citation.md` — citation validation;
+- `references/entity-and-memory-model.md` — routing and L0–L3 semantics;
+- `references/write-policy.md` — explicit writes and promotion;
+- `references/automatic-capture.md` — optional host lifecycle capture;
+- `references/team-memory.md` — shared decisions and handoffs.

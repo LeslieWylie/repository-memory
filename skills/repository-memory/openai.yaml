@@ -1,4 +1,7 @@
 interface:
   display_name: "Repository Memory"
-  short_description: "Search repository memory with verified citations"
-  default_prompt: "Use Repository Memory to find verified project evidence and return source-backed citations."
+  short_description: "Find cited project facts and durable memory"
+  default_prompt: "Use $repository-memory to check source-backed evidence before answering this project question."
+
+policy:
+  allow_implicit_invocation: true

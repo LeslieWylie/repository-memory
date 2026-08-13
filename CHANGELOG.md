@@ -19,6 +19,11 @@ revision is a separate compatibility identifier; see
 ## [Unreleased]
 
 - Keep unreleased changes here until a tagged release is prepared.
+- Simplify the public Skill instructions and UI metadata around the real
+  doctor -> search -> get workflow, with explicit repository/memory scopes,
+  citation handling, and a non-blocking development-tool boundary.
+- Group GitHub Actions and Python Dependabot updates so routine maintenance
+  opens at most one pull request per ecosystem.
 - Add shared Team Memory with explicit publish, context hydration, feedback,
   supersede lifecycle, and reusable decision/failure/discovery/solution/handoff
   records.
