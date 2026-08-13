@@ -433,7 +433,23 @@ class MemoryCoreClient:
         try:
             response = self._request("GET", "/health")
             data = self._data(response)
+            stores = data.get("stores") if isinstance(data.get("stores"), dict) else None
             result.update({"reachable": True, "status": "ready", "server": {k: data.get(k) for k in ("status", "version", "uptime", "stores") if k in data}})
+            # Do not infer semantic capability from a configured strategy. The
+            # gateway health response is the source of truth: a vector store
+            # can exist while the embedding service is disabled.
+            if stores is not None and "embeddingService" in stores:
+                available = stores.get("embeddingService") is True
+                result["embedding"] = {
+                    "available": available,
+                    "strategy": "hybrid" if available else "keyword-only",
+                    "provider": "runtime" if available else None,
+                    "server_reported": True,
+                }
+                result["server_stores"] = {
+                    "vector_store": stores.get("vectorStore"),
+                    "embedding_service": stores.get("embeddingService"),
+                }
             if probe_layers:
                 probes = {
                     "L0": ("/v3/conversation/query", {"limit": 1}),
@@ -856,14 +872,37 @@ class MemoryCoreClient:
         if match:
             layer, record_id = match.groups()
             endpoint = "/v3/conversation/query" if layer == "L0" else "/v3/atomic/query"
-            data = self._data(self._request("POST", endpoint, self._scoped({"limit": 100})))
-            values = data.get("messages" if layer == "L0" else "items", [])
-            for item in values if isinstance(values, list) else []:
-                if isinstance(item, dict) and str(item.get("id")) == record_id:
-                    return {"id": result_id, "layer": layer, "memory": item, "citation": {"source": "memorycore", "memory_id": record_id, "layer": layer, "valid": True}}
+            collection = "messages" if layer == "L0" else "items"
+            offset = 0
+            while True:
+                data = self._data(self._request("POST", endpoint, self._scoped({"limit": 100, "offset": offset})))
+                values = data.get(collection, [])
+                page = values if isinstance(values, list) else []
+                for item in page:
+                    if isinstance(item, dict) and str(item.get("id")) == record_id:
+                        content = str(item.get("content") or item.get("message_text") or "")
+                        return {
+                            "id": result_id,
+                            "layer": layer,
+                            "memory": item,
+                            "citation": {
+                                "source": "memorycore",
+                                "memory_id": record_id,
+                                "layer": layer,
+                                "evidence": content,
+                                "locator": {"layer": layer, "memory_id": record_id},
+                                "valid": bool(content),
+                            },
+                        }
+                total = data.get("total")
+                if not page or not isinstance(total, int) or offset + len(page) >= total:
+                    break
+                offset += len(page)
             raise MemoryCoreError(f"MemoryCore record not found: {result_id}")
         if result_id == "memorycore:L3:profile":
-            return {"id": result_id, "layer": "L3", "memory": self._data(self._request("POST", "/v3/core/read", self._scoped({}))), "citation": {"source": "memorycore", "memory_id": "profile", "layer": "L3", "valid": True}}
+            memory = self._data(self._request("POST", "/v3/core/read", self._scoped({})))
+            content = str(memory.get("content") or "") if isinstance(memory, dict) else ""
+            return {"id": result_id, "layer": "L3", "memory": memory, "citation": {"source": "memorycore", "memory_id": "profile", "layer": "L3", "evidence": content, "locator": {"path": "core/profile"}, "valid": bool(content)}}
         if result_id.startswith("memorycore:L2:"):
             path = result_id.split(":", 2)[-1]
             return {"id": result_id, "layer": "L2", "memory": self._data(self._request("POST", "/v3/scenario/read", self._scoped({"path": path}))), "citation": {"source": "memorycore", "memory_id": path, "layer": "L2", "path": path, "valid": True}}

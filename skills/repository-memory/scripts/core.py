@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -47,6 +48,7 @@ from fallback import SECRET_CONTENT, SECRET_NAME, _claim_support, query_terms
 from fallback import search as fallback_search
 from local_index import ensure as ensure_local_index
 from local_index import status as local_index_status
+from memmy import MemmyError, configure_memmy, memmy_memory_client
 from mcp_server import serve
 from memorycore import (
     _lifecycle_status as _native_lifecycle_status,
@@ -330,7 +332,7 @@ def normalize_item(item: dict[str, Any], view: SourceView, source_type: str, que
         start, end = locate(view.path, path, excerpt)
     commit = citation.get("commit") or item.get("commit") or item.get("_commit") or metadata.get("commit") or metadata.get("revision") or view.commit
     status = evidence_status(item, citation)
-    memory_backend = citation.get("source") if citation.get("source") in {"memorycore", "local-memory"} else None
+    memory_backend = citation.get("source") if citation.get("source") in {"memorycore", "local-memory", "memmy"} else None
     native = bool(item.get("_native_memory") or memory_backend)
     memory_backend = memory_backend or (item.get("_memory_backend") if native else None) or ("memorycore" if native else None)
     checked = validate_memory(citation, excerpt) if native else validate(view.path, path, start, end, excerpt, commit, view.commit)
@@ -562,14 +564,36 @@ def _memory_items(view: SourceView, adapter: Adapter, query: str, limit: int) ->
         native_items = adapter.memory_search(query, limit)
     except AdapterError as exc:
         return [], {"source": view.spec.id, "adapter": "memorycore", "memory": memory, "repository_skipped": True, "fallback": True, "reason": str(exc)}
-    normalized = [normalize_item(item, view, memory.get("backend") or "memorycore", query) for item in native_items]
-    return normalized[:limit], {"source": view.spec.id, "adapter": memory.get("backend") or "memorycore", "memory": memory, "repository_skipped": True, "native_memory_count": len(native_items), "fallback": bool(memory.get("fallback"))}
+    normalized = [
+        normalize_item(item, view, item.get("_memory_backend") or memory.get("backend") or "memorycore", query)
+        for item in native_items
+    ]
+    providers = sorted({str(item.get("source")) for item in normalized if item.get("source")})
+    semantic = memory.get("embedding") if isinstance(memory.get("embedding"), dict) else {"available": False, "strategy": "keyword-only"}
+    if isinstance(memory.get("providers"), dict):
+        memmy = memory["providers"].get("memmy")
+        if isinstance(memmy, dict) and isinstance(memmy.get("embedding"), dict) and memmy["embedding"].get("available") is True:
+            semantic = memmy["embedding"]
+    return normalized[:limit], {
+        "source": view.spec.id,
+        "adapter": memory.get("backend") or "memorycore",
+        "memory": memory,
+        "repository_skipped": True,
+        "native_memory_count": len(native_items),
+        "providers": providers,
+        "semantic": semantic,
+        "fallback": bool(memory.get("fallback")),
+    }
 
 
 def _package_search(query: str, mode: str, scope: str, views: list[SourceView], groups: dict[str, dict[str, Any]], diagnostics: list[dict[str, Any]], limit: int) -> dict[str, Any]:
     selected = groups[scope] if scope != "all" else {"verified": [], "candidates": [], "results": []}
     memory_ready = any(entry.get("memory", {}).get("status") == "ready" for entry in diagnostics if isinstance(entry.get("memory"), dict))
-    retrieval_mode = "grouped" if scope == "all" else "keyword-only" if scope == "memory" and memory_ready else "lexical"
+    semantic_ready = any(
+        isinstance(entry.get("semantic"), dict) and entry["semantic"].get("available") is True
+        for entry in diagnostics
+    )
+    retrieval_mode = "grouped" if scope == "all" else "hybrid" if scope == "memory" and semantic_ready else "keyword-only" if scope == "memory" and memory_ready else "lexical"
     result_count = sum(len(group.get("verified", [])) for group in groups.values()) if scope == "all" else len(selected["verified"])
     answerable_count = sum(len(group.get("answerable", [])) for group in groups.values()) if scope == "all" else len(selected.get("answerable", []))
     answerable = [] if scope == "all" else selected.get("answerable", [])[:limit]
@@ -599,7 +623,7 @@ def _package_search(query: str, mode: str, scope: str, views: list[SourceView], 
             "candidate_count": candidate_count,
             "claim_abstain": abstain and result_count > 0,
             "retrieval_mode": retrieval_mode,
-            "semantic_available": False if memory_ready else None,
+            "semantic_available": semantic_ready if memory_ready else None,
             "query_terms": query_terms(query),
         },
     }
@@ -766,6 +790,45 @@ def init_source(
 
 def source_list() -> dict[str, Any]:
     return {"schema_version": SCHEMA_VERSION, "sources": configured_sources(), "config": config_summary(), "canonical_repo_changed": False}
+
+
+def memmy_gui(open_window: bool = False) -> dict[str, Any]:
+    """Expose the existing Memmy panel without creating a second GUI."""
+
+    client = memmy_memory_client()
+    health = client.health()
+    endpoint = client.config.endpoint
+    if not endpoint:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "ok": False,
+            "status": "not_configured",
+            "error": "Memmy is not configured; run repository-memory memmy configure",
+            "canonical_repo_changed": False,
+        }
+    url = endpoint.rstrip("/") + "/"
+    opened = False
+    open_error = None
+    if open_window:
+        if sys.platform != "darwin":
+            open_error = "--open is currently supported only on macOS"
+        else:
+            try:
+                subprocess.run(["open", url], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                opened = True
+            except (OSError, subprocess.CalledProcessError) as exc:
+                open_error = str(exc)[:240]
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "ok": health.get("reachable") is True and open_error is None,
+        "backend": "memmy",
+        "url": url,
+        "reachable": health.get("reachable") is True,
+        "health": health,
+        "opened": opened,
+        "error": open_error,
+        "canonical_repo_changed": False,
+    }
 
 
 def ingest_session_payload(root: Path | None, payload: Any, source_id: str | None = None) -> dict[str, Any]:
@@ -1059,14 +1122,14 @@ def _memory_get_result(result_id: str, explain: bool = False) -> dict[str, Any]:
             "errors": [{"source": memory.get("backend") or "memorycore", "adapter": memory.get("backend") or "memorycore", "error": str(exc), "freshness": memory}],
             "reason": "memory result not found or MemoryCore unavailable",
         }
-    backend = "local-memory" if result_id.startswith("autocapture:") else memory.get("backend") or ("memorycore" if adapter.native_memory.configured else "local-memory")
-    raw_layer = value.get("layer") if isinstance(value, dict) else None
+    backend = "memmy" if result_id.startswith("memmy:") else "local-memory" if result_id.startswith("autocapture:") else memory.get("backend") or ("memorycore" if adapter.native_memory.configured else "local-memory")
+    raw_layer = value.get("layer") or value.get("memoryLayer") if isinstance(value, dict) else None
     if not raw_layer:
-        match = re.match(r"^(?:memorycore|local|autocapture):(L[0-3]):", result_id)
+        match = re.match(r"^(?:memorycore|memmy|local|autocapture):(L[0-3]|Skill):", result_id)
         raw_layer = match.group(1) if match else None
     layer = str(raw_layer or "") or None
     payload = value.get("memory") if isinstance(value, dict) and isinstance(value.get("memory"), dict) else (value if isinstance(value, dict) else {})
-    content = str(payload.get("content") or payload.get("text") or payload.get("excerpt") or "")
+    content = str(payload.get("content") or payload.get("body") or payload.get("text") or payload.get("excerpt") or payload.get("summary") or "")
     citation = value.get("citation") if isinstance(value, dict) and isinstance(value.get("citation"), dict) else {}
     memory_id = str(citation.get("memory_id") or payload.get("id") or (result_id.split(":", 2)[-1] if ":" in result_id else result_id))
     memory_path = citation.get("path") or payload.get("path")
@@ -1074,7 +1137,12 @@ def _memory_get_result(result_id: str, explain: bool = False) -> dict[str, Any]:
         memory_path = f"scenario/{memory_id}"
     if not memory_path and layer == "L3":
         memory_path = "core/profile"
-    accepted = bool(citation.get("accepted") is True or payload.get("accepted") is True or _native_lifecycle_status(content, "") == "accepted")
+    accepted = bool(
+        citation.get("accepted") is True
+        or payload.get("accepted") is True
+        or payload.get("status") in {"activated", "active", "accepted"}
+        or _native_lifecycle_status(content, "") == "accepted"
+    )
     generated = bool(citation.get("generated") is True or payload.get("generated") is True or _native_lifecycle_status(content, "") == "generated")
     if layer in {"L2", "L3"}:
         status = "accepted" if accepted else (_native_lifecycle_status(content, "generated" if generated else "pending"))
@@ -1095,7 +1163,7 @@ def _memory_get_result(result_id: str, explain: bool = False) -> dict[str, Any]:
         "source": backend,
         "memory_id": memory_id,
         "layer": layer,
-        "receipt": "native-memorycore-readback" if backend == "memorycore" else "local-memory-readback",
+        "receipt": "native-memorycore-readback" if backend == "memorycore" else "memmy-readback" if backend == "memmy" else "local-memory-readback",
     }
     result = {
         "schema_version": SCHEMA_VERSION,
@@ -1109,6 +1177,16 @@ def _memory_get_result(result_id: str, explain: bool = False) -> dict[str, Any]:
         "status": status,
         "generated": generated,
         "accepted": accepted,
+        "citation": citation or {
+            "source": backend,
+            "memory_id": memory_id,
+            "layer": layer,
+            "evidence": content,
+            "locator": {"memory_id": memory_id},
+            "valid": bool(content),
+            "accepted": accepted,
+            "generated": generated,
+        },
         "provenance": provenance,
         "readback": readback,
         "result": value,
@@ -1133,7 +1211,7 @@ def get_result(
             value["doctor"] = doctor(root)
         return value
     errors = []
-    if result_id.startswith(("memorycore:", "local:", "autocapture:")):
+    if result_id.startswith(("memorycore:", "memmy:", "local:", "autocapture:")):
         return _memory_get_result(result_id, explain)
     try:
         specs = discover_sources(str(root) if root else None)
@@ -1249,9 +1327,26 @@ def doctor(root: Path | None = None, source_id: str | None = None) -> dict[str, 
         memory_adapter = Adapter(None, _memory_view())
         memory_report = memory_adapter.memory_status()
         if memory_adapter.native_memory.configured:
-            memory_report = memory_adapter.native_memory.health(refresh=True, probe_layers=True)
-        memory_configured = bool(memory_report.get("configured"))
-        memory_ready = memory_report.get("status") == "ready"
+            native_report = memory_adapter.native_memory.health(refresh=True, probe_layers=True)
+            memory_report = native_report
+            if memory_adapter.memmy.configured:
+                memmy_report = memory_adapter.memmy.health()
+                memory_report["providers"] = {
+                    "memorycore": {**native_report, "providers": None},
+                    "memmy": memmy_report,
+                }
+        provider_reports = memory_report.get("providers") if isinstance(memory_report.get("providers"), dict) else {}
+        provider_configured = any(
+            isinstance(report, dict) and report.get("configured") is True
+            for report in provider_reports.values()
+        )
+        provider_ready = any(
+            isinstance(report, dict) and report.get("status") == "ready"
+            for report in provider_reports.values()
+        )
+        memory_configured = bool(memory_report.get("configured") or provider_configured)
+        memory_ready = memory_report.get("status") == "ready" or provider_ready
+        native_ready = bool(memory_adapter.native_memory.configured and memory_report.get("status") == "ready")
         team_report = team_memory_store().health()
         routing = _openclaw_routing()
         capabilities = ["init", "source-add", "memory-init"]
@@ -1260,7 +1355,7 @@ def doctor(root: Path | None = None, source_id: str | None = None) -> dict[str, 
         return {
             "schema_version": SCHEMA_VERSION,
             "ok": memory_ready,
-            "active_adapter": "native-memorycore" if memory_report.get("backend") != "local-memory" and memory_configured else "local-memory" if memory_configured else None,
+            "active_adapter": "native-memorycore" if native_ready else "memmy" if isinstance(provider_reports.get("memmy"), dict) and provider_reports["memmy"].get("status") == "ready" else "local-memory" if memory_configured else None,
             "capabilities": sorted(set(capabilities)),
             "memory": memory_report,
             "team_memory": team_report,
@@ -1592,6 +1687,17 @@ def build_parser() -> argparse.ArgumentParser:
     knowledge.add_argument("--limit", type=int, default=5)
     knowledge.add_argument("--deep", action="store_true")
     knowledge.add_argument("--json", action="store_true")
+    memmy = sub.add_parser("memmy")
+    memmy.add_argument("action", choices=("status", "configure", "search"))
+    memmy.add_argument("--endpoint")
+    memmy.add_argument("--profile-id")
+    memmy.add_argument("--user-id")
+    memmy.add_argument("--query")
+    memmy.add_argument("--limit", type=int, default=5)
+    memmy.add_argument("--json", action="store_true")
+    gui = sub.add_parser("gui")
+    gui.add_argument("--open", action="store_true")
+    gui.add_argument("--json", action="store_true")
     common("mcp")
     return parser
 
@@ -1683,7 +1789,7 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
                 return _mcp_dispatch(name, arguments)
             return serve(dispatch)
         gate_failed = False
-        root = None if args.command in {"init", "source", "doctor", "sync", "search", "get", "explain", "feedback", "promote", "publish", "team-activate", "team-export", "team-import", "team-evaluate", "team-compact", "context", "supersede", "ingest-session", "capture-turn", "knowledge"} else resolve_root(root_arg)
+        root = None if args.command in {"init", "source", "doctor", "sync", "search", "get", "explain", "feedback", "promote", "publish", "team-activate", "team-export", "team-import", "team-evaluate", "team-compact", "context", "supersede", "ingest-session", "capture-turn", "knowledge", "memmy", "gui"} else resolve_root(root_arg)
         if args.command in {"init", "source"} and root_arg:
             root = resolve_root(root_arg)
         if args.command == "doctor":
@@ -1796,6 +1902,27 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
                     "freshness": view.freshness,
                     **client.sync_source(view.path, wiki_id, deep=args.deep),
                 }
+        elif args.command == "memmy":
+            client = memmy_memory_client()
+            if args.action == "status":
+                value = {"schema_version": SCHEMA_VERSION, **client.health(), "canonical_repo_changed": False}
+            elif args.action == "configure":
+                if not args.endpoint:
+                    raise RuntimeError("memmy configure requires --endpoint")
+                value = {"schema_version": SCHEMA_VERSION, **configure_memmy(args.endpoint, args.profile_id, args.user_id), "canonical_repo_changed": False}
+            elif args.action == "search":
+                if not args.query:
+                    raise RuntimeError("memmy search requires --query")
+                value = {
+                    "schema_version": SCHEMA_VERSION,
+                    "ok": True,
+                    "provider": "memmy",
+                    "retrieval_mode": client.health().get("embedding", {}).get("strategy", "keyword-only"),
+                    "results": client.search(args.query, args.limit),
+                    "canonical_repo_changed": False,
+                }
+        elif args.command == "gui":
+            value = memmy_gui(args.open)
         elif args.command == "init":
             value = init_source(args.path, args.source_id, args.repository, args.profile, not args.no_sync, args.local_only)
         elif args.command == "source":

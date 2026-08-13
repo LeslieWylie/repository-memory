@@ -21,6 +21,7 @@ from citation import locate, validate
 from evaluate import evaluate_queries
 from fallback import paths, query_terms
 from memorycore import MemoryCoreClient, MemoryCoreConfig, MemoryCoreError
+from memmy import MemmyClient, MemmyConfig
 from mcp_server import SERVER_VERSION
 from snapshot import _snapshot_lock, prepare_view, snapshot_lock_backend
 from team_memory import TeamMemoryStore
@@ -894,6 +895,57 @@ class RepositoryMemoryTest(unittest.TestCase):
             self.assertEqual(state["api_status"], "ready")
             self.assertEqual(state["population"], "empty")
             self.assertEqual(state["readback"], "verified")
+
+    def test_memorycore_health_reports_gateway_embedding_capability(self):
+        config = MemoryCoreConfig(endpoint="http://127.0.0.1:8420", api_key=None, team_id="team", agent_id="agent", user_id="user")
+        client = MemoryCoreClient(config)
+        with patch.object(client, "_request", return_value={"code": 0, "data": {"status": "ok", "stores": {"vectorStore": True, "embeddingService": True}}}):
+            report = client.health(refresh=True)
+        self.assertTrue(report["embedding"]["available"])
+        self.assertEqual(report["embedding"]["strategy"], "hybrid")
+        self.assertTrue(report["server_stores"]["embedding_service"])
+
+    def test_memorycore_get_pages_until_l0_record_is_found(self):
+        config = MemoryCoreConfig(endpoint="http://127.0.0.1:8420", api_key=None, team_id="team", agent_id="agent", user_id="user")
+        client = MemoryCoreClient(config)
+
+        def request(method, path, body=None):
+            self.assertEqual(method, "POST")
+            self.assertEqual(path, "/v3/conversation/query")
+            offset = body.get("offset", 0)
+            if offset == 0:
+                return {"code": 0, "data": {"messages": [{"id": "msg-first", "content": "first"}], "total": 101}}
+            return {"code": 0, "data": {"messages": [{"id": "msg-late", "content": "late evidence"}], "total": 101}}
+
+        with patch.object(client, "_request", side_effect=request):
+            result = client.get("memorycore:L0:msg-late")
+        self.assertEqual(result["memory"]["content"], "late evidence")
+        self.assertEqual(result["citation"]["memory_id"], "msg-late")
+        self.assertTrue(result["citation"]["valid"])
+
+    def test_memmy_client_preserves_local_embedding_and_layer_identity(self):
+        client = MemmyClient(MemmyConfig("http://127.0.0.1:18960", True, "repository-memory", "repository-memory", "user"))
+        with patch.object(client, "_request", return_value={
+            "debug": {"hits": [{"id": "trace-1", "kind": "trace", "memoryLayer": "L1", "status": "activated", "snippet": "local semantic memory", "score": 0.9}]}
+        }):
+            results = client.search("semantic", 5)
+        self.assertEqual(results[0]["id"], "memmy:L1:trace-1")
+        self.assertEqual(results[0]["_memory_backend"], "memmy")
+        self.assertEqual(results[0]["citation"]["source"], "memmy")
+
+    def test_memmy_get_preserves_skill_layer_and_citation(self):
+        client = MemmyClient(MemmyConfig("http://127.0.0.1:18960", True, "repository-memory", "repository-memory", "user"))
+        with patch.object(client, "_request", return_value={
+            "id": "skill-1",
+            "kind": "skill",
+            "memoryLayer": "Skill",
+            "status": "resolving",
+            "body": "a provider skill",
+        }):
+            result = client.get("memmy:Skill:skill-1")
+        self.assertEqual(result["memory_layer"], "Skill")
+        self.assertEqual(result["citation"]["layer"], "Skill")
+        self.assertEqual(result["citation"]["memory_id"], "skill-1")
 
     def test_memorycore_doctor_maps_present_l0_l1_and_empty_l2_l3(self):
         config = MemoryCoreConfig(endpoint="http://127.0.0.1:8420", api_key=None, team_id="team", agent_id="agent", user_id="user")

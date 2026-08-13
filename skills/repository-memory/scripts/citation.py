@@ -101,9 +101,9 @@ def validate_memory(citation: dict[str, Any], excerpt: str | None) -> dict[str, 
     layer = str(citation.get("layer") or "")
     memory_id = str(citation.get("memory_id") or "")
     evidence = str(citation.get("evidence") or excerpt or "").strip()
-    if source not in {"memorycore", "local-memory"}:
+    if source not in {"memorycore", "local-memory", "memmy"}:
         return {"valid": False, "reason": "not a native memory citation"}
-    if layer not in {"L0", "L1", "L2", "L3"} or not memory_id:
+    if layer not in {"L0", "L1", "L2", "L3", "Skill"} or not memory_id:
         return {"valid": False, "reason": "native memory layer or id missing"}
     if not evidence:
         return {"valid": False, "reason": "native memory evidence missing"}

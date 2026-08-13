@@ -215,6 +215,27 @@ and explicit session ingest uses the conservative local fallback with clearly
 reported layer support. `doctor --json` reports the actual runtime root and
 process so a vendored service cannot be confused with an external checkout.
 
+## Optional local Memmy provider
+
+This project can also call an already-installed local Memmy service through a
+small adapter. We reuse its SQLite/FTS5 storage, native local-vector search,
+layer-aware results, idempotent jobs, and existing panel; Memmy remains an
+optional provider and is not copied into or made canonical by this repository.
+
+```bash
+repository-memory memmy status --json
+repository-memory memmy configure --endpoint <memmy-endpoint> --json
+repository-memory search "the user's question" --scope memory --json
+repository-memory gui --json
+```
+
+The runtime reports provider capabilities separately. For example, native
+MemoryCore can remain `keyword-only` while Memmy reports `local-hybrid` from
+its local embedding model. Results are interleaved by provider lane without
+cross-provider score fusion and retain `source`, `layer`, `memory_id`, and
+provider citation metadata. See [memory-providers](docs/memory-providers.md)
+for the integration contract and failure behavior.
+
 ## TencentDB MemoryKnowledge (Wiki / CodeGraph)
 
 MemoryCore and MemoryKnowledge are different services:
