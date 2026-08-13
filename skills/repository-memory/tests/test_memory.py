@@ -1417,6 +1417,11 @@ class RepositoryMemoryTest(unittest.TestCase):
         found = core.search(None, "citation-first explicit promotion", scope="memory")
         self.assertFalse(found["abstain"])
         self.assertTrue(any(item["layer"] == "L3" for item in found["verified"]))
+        self.assertTrue(all(
+            item["readback"]["receipt"] == "standalone-memory-readback"
+            for item in found["verified"]
+            if item.get("source") == "standalone-memory"
+        ))
 
     def test_standalone_runtime_has_local_vectors_and_projects_l2_candidate(self):
         self.write_config({})

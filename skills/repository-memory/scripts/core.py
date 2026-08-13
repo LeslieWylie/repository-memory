@@ -409,7 +409,17 @@ def normalize_item(item: dict[str, Any], view: SourceView, source_type: str, que
             "source": memory_backend if native else view.spec.id,
             "memory_id": memory_id,
             "layer": memory_layer,
-            "receipt": "native-memorycore-readback" if native else "repository-citation-readback",
+            # Keep the receipt tied to the actual backend.  The standalone
+            # store deliberately has no MemoryCore service dependency; using
+            # a native receipt here would make a local SQLite result look like
+            # it came from an external gateway.
+            "receipt": (
+                "standalone-memory-readback"
+                if memory_backend == "standalone-memory"
+                else "native-memorycore-readback"
+                if native
+                else "repository-citation-readback"
+            ),
         },
         "related": item.get("related") or item.get("links") or [],
         "linked_evidence": linked_evidence,
