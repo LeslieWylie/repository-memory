@@ -215,6 +215,34 @@ and explicit session ingest uses the conservative local fallback with clearly
 reported layer support. `doctor --json` reports the actual runtime root and
 process so a vendored service cannot be confused with an external checkout.
 
+## TencentDB MemoryKnowledge (Wiki / CodeGraph)
+
+MemoryCore and MemoryKnowledge are different services:
+
+- MemoryCore stores and recalls L0–L3 conversation memory.
+- MemoryKnowledge builds Wiki pages and CodeGraph indexes from repository
+  content.
+- The repository citation index remains the default fact/evaluation path. A
+  MemoryKnowledge result without a matching Git path, commit, line range and
+  excerpt is returned as a candidate, never silently promoted to verified.
+
+The Knowledge service is optional and can be enabled per installation:
+
+```bash
+repository-memory knowledge configure --json
+repository-memory knowledge install
+repository-memory knowledge status --json
+repository-memory knowledge create --name project-docs --json
+repository-memory knowledge sync --wiki-id <wiki-id> --json
+repository-memory knowledge search --wiki-id <wiki-id> --query "..." --json
+```
+
+`knowledge sync` writes only the derived Wiki index. It filters hidden files,
+secrets, binaries, oversized files and operational output directories; it does
+not commit, push, pull, or rewrite the source repository. If the Knowledge
+service is not configured or reachable, `doctor` reports `not_configured` or
+`unreachable` while repository citation search and MemoryCore continue to work.
+
 ## MCP
 
 The server uses local stdio and advertises the modern MCP discovery/metadata

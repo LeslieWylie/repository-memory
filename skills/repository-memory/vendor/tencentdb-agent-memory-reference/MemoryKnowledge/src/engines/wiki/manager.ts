@@ -106,6 +106,8 @@ export interface SearchOptions {
 export interface WikiSourceManager {
   register(config: WikiSourceConfig): WikiSourceState;
   sync(name: string): WikiSourceState;
+  /** Rebuild the lexical index from processed Wiki pages and raw sources. */
+  reindexRaw(name: string, changed?: string[], deleted?: string[]): Promise<WikiSourceState>;
   get(name: string): WikiSourceState | undefined;
   list(): WikiSourceState[];
   remove(name: string): void;
@@ -631,6 +633,54 @@ export function createWikiSourceManager(dataDir: string): WikiSourceManager {
     return pages;
   }
 
+  /** Project raw canonical documents into the derived lexical index. */
+  function scanRawSources(projectPath: string): WikiPage[] {
+    const rawDir = join(projectPath, "raw", "sources");
+    const extensions = new Set([".md", ".mdx", ".txt", ".rst"]);
+    const pages: WikiPage[] = [];
+    if (!existsSync(rawDir)) return pages;
+
+    function walk(dir: string): void {
+      for (const entry of readdirSync(dir)) {
+        const full = join(dir, entry);
+        let stat;
+        try { stat = statSync(full); } catch { continue; }
+        if (stat.isDirectory()) {
+          if (!entry.startsWith(".")) walk(full);
+          continue;
+        }
+        const dot = entry.lastIndexOf(".");
+        if (dot < 0 || !extensions.has(entry.slice(dot).toLowerCase())) continue;
+        try {
+          const content = readFileSync(full, "utf-8");
+          const rel = relative(rawDir, full).replace(/\\/g, "/");
+          const fm = extractFrontmatter(content);
+          const title = fm.title || basename(entry).replace(/\.[^.]+$/, "").replace(/[-_]+/g, " ");
+          pages.push({
+            id: `raw/sources/${rel}`,
+            title,
+            type: fm.type || "source",
+            path: full,
+            relPath: `raw/sources/${rel}`,
+            content,
+            sources: [],
+            links: [],
+            description: fm.description,
+          });
+        } catch {
+          // One unreadable source must not make the whole derived index fail.
+        }
+      }
+    }
+    walk(rawDir);
+    return pages;
+  }
+
+  function scanSearchDocuments(projectPath: string, includeRaw: boolean): WikiPage[] {
+    const pages = scanWikiDir(projectPath);
+    return includeRaw ? pages.concat(scanRawSources(projectPath)) : pages;
+  }
+
   function scanRecursive(baseDir: string, dir: string, pages: WikiPage[]) {
     for (const entry of readdirSync(dir)) {
       const full = join(dir, entry);
@@ -736,7 +786,7 @@ export function createWikiSourceManager(dataDir: string): WikiSourceManager {
       continue;
     }
     try {
-      const pages = scanWikiDir(state.path);
+      const pages = scanSearchDocuments(state.path, state.includeRaw === true);
       rebuildIndex(name, pages);
       restored++;
       log.info("Restored wiki index", { name, pageCount: pages.length });
@@ -759,6 +809,29 @@ export function createWikiSourceManager(dataDir: string): WikiSourceManager {
       rebuildIndex(config.name, pages);
       state.status = "ready"; state.pageCount = pages.length; state.lastSyncAt = new Date().toISOString();
     } catch (err) { state.status = "error"; state.error = String(err); }
+    persist();
+    return state;
+  }
+
+  async function reindexRaw(name: string, _changed?: string[], _deleted?: string[]): Promise<WikiSourceState> {
+    const state = sources.get(name);
+    if (!state) throw new Error(`Not found: ${name}`);
+    state.status = "scanning";
+    const t0 = Date.now();
+    try {
+      const pages = scanSearchDocuments(state.path, true);
+      rebuildIndex(name, pages);
+      state.includeRaw = true;
+      state.status = "ready";
+      state.pageCount = pages.length;
+      state.lastSyncAt = new Date().toISOString();
+      state.error = undefined;
+      log.info("raw source index rebuilt", { name, pageCount: pages.length, ms: Date.now() - t0 });
+    } catch (err) {
+      state.status = "error";
+      state.error = String(err);
+      log.error("raw source index rebuild failed", { name, path: state.path, error: String(err) });
+    }
     persist();
     return state;
   }
@@ -849,7 +922,7 @@ export function createWikiSourceManager(dataDir: string): WikiSourceManager {
   }
 
   return {
-    register, sync, init, ingest,
+    register, sync, reindexRaw, init, ingest,
     get: (name) => sources.get(name),
     list: () => [...sources.values()],
     remove: (name) => {

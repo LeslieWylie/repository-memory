@@ -163,7 +163,6 @@ def _runtime_report() -> dict[str, Any]:
     memory = config.get("memorycore") if isinstance(config.get("memorycore"), dict) else {}
     configured_root = _first_string(memory.get("root"))
     state_dir = _first_string(memory.get("state_dir"))
-    current_service = str(Path(__file__).with_name("memorycore_service.py").resolve())
     process_lines: list[str] = []
     try:
         result = subprocess.run(
@@ -176,10 +175,29 @@ def _runtime_report() -> dict[str, Any]:
         process_lines = [line.strip() for line in result.stdout.splitlines() if "memorycore_service.py run" in line]
     except (OSError, subprocess.SubprocessError):
         process_lines = []
-    process_current = any(current_service in line for line in process_lines)
+    # The launchd service intentionally runs the installed Skill copy rather
+    # than the caller's checkout.  Comparing the process with ``__file__``
+    # therefore made a healthy installed runtime look inconsistent whenever a
+    # developer invoked the CLI from a Git worktree.  Extract the actual
+    # service script and validate that it is a real repository-memory runtime.
+    service_script: str | None = None
+    service_root: str | None = None
+    for line in process_lines:
+        match = re.search(r"(?:^|\s)(/[^\s]+/memorycore_service\.py)\s+run(?:\s|$)", line)
+        if not match:
+            continue
+        candidate = Path(match.group(1)).resolve()
+        if candidate.is_file():
+            service_script = str(candidate)
+            service_root = str(candidate.parents[1])
+            break
+    process_current = bool(service_script and service_root and configured_root and Path(configured_root).is_dir())
+    configured_state = Path(state_dir).expanduser() if state_dir else None
     return {
         "config_path": str(_config_path()),
         "skill_runtime": str(Path(__file__).resolve().parents[1]),
+        "service_runtime": service_root,
+        "service_script": service_script,
         "memorycore_root": configured_root,
         "data_dir": state_dir,
         "service_label": os.environ.get("REPOSITORY_MEMORY_LAUNCHD_LABEL", "com.repository-memorycore"),
@@ -188,7 +206,7 @@ def _runtime_report() -> dict[str, Any]:
             "current_runtime": process_current,
             "count": len(process_lines),
         },
-        "consistent": bool(configured_root and state_dir and process_current),
+        "consistent": bool(configured_root and configured_state and configured_state.is_dir() and process_current),
     }
 
 

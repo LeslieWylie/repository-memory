@@ -47,6 +47,7 @@ repository-memory evaluate --queries <queries.jsonl> --qrels <qrels.jsonl> [--re
 repository-memory team-evaluate --records <records.jsonl> --queries <queries.jsonl> --qrels <qrels.jsonl> [--gate] --json
 repository-memory team-compact [--keep N] --json
 repository-memory memorycore configure|start|stop|status
+repository-memory knowledge status|configure|install|start|stop|create|sync|search
 repository-memory mcp
 ```
 
@@ -87,6 +88,13 @@ backend's `supported_layers`/`reachable` fields describe capability and
 readiness, not the amount or quality of stored memory.
 
 `sync` updates only remote snapshots and derived indexes. It does not pull, commit, push, or overwrite the working tree. Use `--local` only when local checkout state is intentionally desired. For an intentionally detached or offline snapshot, register the source with `--local-only`; this makes the configured local commit the declared source of truth and reports `commit_type=local_worktree` with `freshness.state=fresh` when the checkout is clean. It does not claim that the snapshot is the latest remote revision. Dirty local-only sources remain `dirty` and are not verified.
+
+The optional TencentDB MemoryKnowledge plane is separate from MemoryCore. Use
+`knowledge status` to check it; use `knowledge create`, `knowledge sync`, and
+`knowledge search` only when a Wiki asset is explicitly configured. Knowledge
+service results remain candidates until the repository runtime validates a Git
+path, commit, line range, and excerpt. A ready MemoryCore endpoint does not
+mean that Wiki or CodeGraph is populated.
 
 `verified` means the document citation is real and traceable; it does not mean
 the excerpt supports every part of a composite question. The answer-safe

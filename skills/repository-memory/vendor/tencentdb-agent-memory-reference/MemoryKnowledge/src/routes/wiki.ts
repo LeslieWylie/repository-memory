@@ -300,6 +300,34 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
     }
   });
 
+  /** Rebuild lexical search from raw/sources without an LLM ingest call. */
+  app.post("/raw/reindex", async (c) => {
+    const body = await c.req.json<Record<string, unknown>>();
+    const serviceId = c.req.header("x-tdai-service-id");
+    if (!isValidIdSegment(serviceId)) return c.json(wrapError(400, "x-tdai-service-id header is required"), 400);
+    const wikiId = body.wiki_id;
+    if (!isValidIdSegment(wikiId)) return c.json(wrapError(400, "wiki_id is required"), 400);
+    const row = wikiService.getById(serviceId, wikiId);
+    if (!row) return c.json(wrapError(404, "wiki not found"), 404);
+    if (row.status === "processing" || row.status === "pending") {
+      return c.json(wrapError(409, "wiki is processing; cannot reindex"), 409);
+    }
+    try {
+      wikiMgr.init({ name: wikiId, path: wikiService.dirFor(serviceId, row.team_id, wikiId) });
+      const state = await wikiMgr.reindexRaw(
+        wikiId,
+        Array.isArray(body.changed) ? body.changed.filter((item): item is string => typeof item === "string") : undefined,
+        Array.isArray(body.deleted) ? body.deleted.filter((item): item is string => typeof item === "string") : undefined,
+      );
+      if (state.status === "error") return c.json(wrapError(500, state.error || "raw source index rebuild failed"), 500);
+      wikiService.markReadyFromIndex(serviceId, wikiId, state.pageCount ?? 0);
+      return c.json(wrapOk({ wiki_id: wikiId, status: state.status, page_count: state.pageCount ?? 0, indexed_raw: true, semantic: { status: "disabled" } }));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return c.json(wrapError(500, message), 500);
+    }
+  });
+
   app.post("/raw/rm", async (c) => {
     const body = await c.req.json<Record<string, unknown>>();
     const ids = extractIdFields(c.req.header("x-tdai-service-id"), body);
@@ -319,7 +347,15 @@ export function createWikiRoutes(deps: WikiRouteDeps): Hono {
       const result = await wikiService.rawRm(ids.service_id, ids.team_id, wikiId, filenames);
       const err = maybeWriteError(result);
       if (err) return err;
-      try { wikiMgr.sync(wikiId); } catch (e) { console.warn(`[wiki] wikiMgr.sync(${wikiId}) failed after raw/rm:`, e); }
+      try {
+        const state = wikiMgr.get(wikiId);
+        if (state?.includeRaw === true) {
+          const indexed = await wikiMgr.reindexRaw(wikiId, [], filenames);
+          if (indexed.status === "ready") wikiService.markReadyFromIndex(ids.service_id, wikiId, indexed.pageCount ?? 0);
+        } else {
+          wikiMgr.sync(wikiId);
+        }
+      } catch (e) { console.warn(`[wiki] wiki index update failed after raw/rm:`, e); }
       return c.json(wrapOk(result));
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

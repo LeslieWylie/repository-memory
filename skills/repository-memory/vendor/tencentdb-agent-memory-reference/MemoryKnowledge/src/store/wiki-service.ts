@@ -12,7 +12,7 @@
  *   lib 层 cascadeDeleteWikiPagesWithRefs 做引用级联。
  */
 
-import { join, resolve, normalize } from "node:path";
+import { join, resolve, normalize, dirname } from "node:path";
 import {
   rmSync,
   mkdirSync,
@@ -262,6 +262,20 @@ export class WikiService {
     return this.store.updateWikiMeta(serviceId, wikiId, patch);
   }
 
+  /** Mark a synchronous raw-source index rebuild as ready without LLM ingest. */
+  markReadyFromIndex(serviceId: string, wikiId: string, pageCount: number): WikiRow | null {
+    const row = this.store.getWikiById(serviceId, wikiId);
+    if (!row) return null;
+    this.store.updateWikiStatus(serviceId, wikiId, {
+      status: "ready",
+      internal_status: null,
+      sync_error: null,
+      page_count: pageCount,
+      last_sync_at: new Date().toISOString(),
+    });
+    return this.store.getWikiById(serviceId, wikiId);
+  }
+
   /**
    * 显式触发 ingest（LLM 加工 raw → page + 建索引）。
    * 立即返回，后台异步执行。memory/team 不匹配返回 not_found；pending/processing 返回 busy。
@@ -498,7 +512,7 @@ export class WikiService {
     const safe = this.resolveRawPath(sourcesDir, filename);
     if (!safe) return "invalid_path";
 
-    mkdirSync(sourcesDir, { recursive: true });
+    mkdirSync(dirname(safe), { recursive: true });
     writeFileSync(safe, content, "utf-8");
     this.registerSources(serviceId, teamId, wikiId, [{ filename, content, size }], userId);
     return { filename, size };
@@ -549,7 +563,11 @@ export class WikiService {
       plans.push({ filename, safePath: safe, content, size, preExistingContent: pre });
     }
 
-    mkdirSync(sourcesDir, { recursive: true });
+    // raw filenames may contain directory components (for example
+    // ``reports/weekly.md``); create their parent directories before writing.
+    // The route validates the path, but the store must still materialize the
+    // nested directory.  Without this, valid multi-file syncs fail with ENOENT.
+    for (const p of plans) mkdirSync(dirname(p.safePath), { recursive: true });
     const written: Plan[] = [];
     try {
       for (const p of plans) {

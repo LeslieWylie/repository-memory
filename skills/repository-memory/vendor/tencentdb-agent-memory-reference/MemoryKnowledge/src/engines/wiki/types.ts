@@ -92,6 +92,8 @@ export interface WikiSourceState {
   error?: string;
   pageCount?: number;
   lastSyncAt?: string;
+  /** True when raw canonical sources are included in the derived FTS index. */
+  includeRaw?: boolean;
 }
 
 export const GENERATION_WIKI_TYPES = [

@@ -53,6 +53,7 @@ from memorycore import (
     _with_lifecycle_markers as _with_native_lifecycle,
     native_memory_client,
 )
+from knowledge import KnowledgeClient
 from snapshot import prepare_view
 from team_memory import team_memory_store
 from vendor_components import report as vendor_components_report
@@ -1264,7 +1265,7 @@ def doctor(root: Path | None = None, source_id: str | None = None) -> dict[str, 
             "memory": memory_report,
             "team_memory": team_report,
             "repository": {"status": "not_configured", "source_count": 0},
-            "knowledge_service": {"configured": False, "required": False, "status": "optional"},
+            "knowledge_service": {"required": False, **KnowledgeClient().health()},
             "semantic": memory_report.get("embedding", {"available": False, "strategy": "keyword-only"}),
             "routing": routing,
             "agents": routing.get("agents", {"configured": [], "covered": []}),
@@ -1346,7 +1347,7 @@ def doctor(root: Path | None = None, source_id: str | None = None) -> dict[str, 
     healthy = all(report.get("healthy", True) for report in reports)
     routing = _openclaw_routing()
     active_values = unique_values(active)
-    return {"schema_version": SCHEMA_VERSION, "ok": healthy, "status": "ready" if healthy else "degraded", "active_adapter": active_values[0] if len(active_values) == 1 else active_values, "capabilities": capabilities, "memory": memory[0] if len(memory) == 1 else memory, "team_memory": team_memory_store().health(), "repository": {"status": "ready" if reports else "not_configured", "source_count": len(reports)}, "knowledge_service": {"configured": False, "required": False, "status": "optional"}, "semantic": semantic[0] if len(semantic) == 1 else ({"available": False, "strategy": "keyword-only"} if native_ready else semantic), "routing": routing, "agents": routing.get("agents", {"configured": [], "covered": []}), "sources": reports, "config": config_summary(), "upstream_components": vendor_components_report(), "actions": actions}
+    return {"schema_version": SCHEMA_VERSION, "ok": healthy, "status": "ready" if healthy else "degraded", "active_adapter": active_values[0] if len(active_values) == 1 else active_values, "capabilities": capabilities, "memory": memory[0] if len(memory) == 1 else memory, "team_memory": team_memory_store().health(), "repository": {"status": "ready" if reports else "not_configured", "source_count": len(reports)}, "knowledge_service": {"required": False, **KnowledgeClient().health()}, "semantic": semantic[0] if len(semantic) == 1 else ({"available": False, "strategy": "keyword-only"} if native_ready else semantic), "routing": routing, "agents": routing.get("agents", {"configured": [], "covered": []}), "sources": reports, "config": config_summary(), "upstream_components": vendor_components_report(), "actions": actions}
 
 
 def feedback(root: Path | None, result_id: str, note: str, rating: str | None = None, feedback_id: str | None = None) -> dict[str, Any]:
@@ -1573,6 +1574,24 @@ def build_parser() -> argparse.ArgumentParser:
     memorycore.add_argument("--candidate")
     memorycore.add_argument("--accept", action="store_true")
     memorycore.add_argument("--json", action="store_true")
+    knowledge = sub.add_parser("knowledge")
+    knowledge.add_argument("action", choices=("status", "configure", "install", "start", "stop", "create", "sync", "search"))
+    knowledge.add_argument("--root", default=argparse.SUPPRESS)
+    knowledge.add_argument("--source")
+    knowledge.add_argument("--wiki-id")
+    knowledge.add_argument("--endpoint")
+    knowledge.add_argument("--port", type=int)
+    knowledge.add_argument("--state-dir")
+    knowledge.add_argument("--service-id")
+    knowledge.add_argument("--team-id")
+    knowledge.add_argument("--user-id")
+    knowledge.add_argument("--agent-id")
+    knowledge.add_argument("--node-modules")
+    knowledge.add_argument("--name")
+    knowledge.add_argument("--query")
+    knowledge.add_argument("--limit", type=int, default=5)
+    knowledge.add_argument("--deep", action="store_true")
+    knowledge.add_argument("--json", action="store_true")
     common("mcp")
     return parser
 
@@ -1664,7 +1683,7 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
                 return _mcp_dispatch(name, arguments)
             return serve(dispatch)
         gate_failed = False
-        root = None if args.command in {"init", "source", "doctor", "sync", "search", "get", "explain", "feedback", "promote", "publish", "team-activate", "team-export", "team-import", "team-evaluate", "team-compact", "context", "supersede", "ingest-session", "capture-turn"} else resolve_root(root_arg)
+        root = None if args.command in {"init", "source", "doctor", "sync", "search", "get", "explain", "feedback", "promote", "publish", "team-activate", "team-export", "team-import", "team-evaluate", "team-compact", "context", "supersede", "ingest-session", "capture-turn", "knowledge"} else resolve_root(root_arg)
         if args.command in {"init", "source"} and root_arg:
             root = resolve_root(root_arg)
         if args.command == "doctor":
@@ -1726,6 +1745,57 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
             except json.JSONDecodeError:
                 payload = [json.loads(line) for line in raw.splitlines() if line.strip()]
             value = capture_turn(root if root_arg else None, payload, getattr(args, "source", None))
+        elif args.command == "knowledge":
+            from knowledge import KnowledgeClient
+
+            client = KnowledgeClient()
+            if args.action in {"configure", "install", "start", "stop"}:
+                from knowledge_service import main as knowledge_service_main
+
+                service_args = [args.action]
+                if args.action == "configure":
+                    for name in ("root", "endpoint", "port", "state_dir", "service_id", "team_id", "user_id", "agent_id", "wiki_id", "node_modules"):
+                        value = getattr(args, name, None)
+                        if value is not None:
+                            service_args.extend([f"--{name.replace('_', '-')}", str(value)])
+                return knowledge_service_main(service_args)
+            if args.action == "status":
+                value = {"schema_version": SCHEMA_VERSION, **client.health(), "wiki_id": client.wiki_id, "code_graph_id": client.code_graph_id}
+            elif args.action == "create":
+                if not args.name:
+                    raise RuntimeError("knowledge create requires --name")
+                value = {"schema_version": SCHEMA_VERSION, "ok": True, "operation": "create-wiki", "result": client.create_wiki(args.name), "canonical_repo_changed": False}
+            elif args.action == "search":
+                if not args.query:
+                    raise RuntimeError("knowledge search requires --query")
+                wiki_id = args.wiki_id or client.wiki_id
+                if not wiki_id:
+                    raise RuntimeError("knowledge search requires --wiki-id or a configured knowledge.wiki_id")
+                raw = client.search(wiki_id, args.query, max(1, min(args.limit, 100)))
+                # MemoryKnowledge pages do not inherently carry the Git
+                # commit/line contract.  Keep them as candidates until a
+                # caller validates the returned path against repository view.
+                value = {"schema_version": SCHEMA_VERSION, "ok": True, "source": "tencentdb-memoryknowledge", "wiki_id": wiki_id, "verified": [], "candidates": raw.get("results", raw.get("items", [])), "abstain": not bool(raw.get("results", raw.get("items", []))), "retrieval_mode": "keyword-only", "citation_policy": "unverified-until-repository-readback", "canonical_repo_changed": False}
+            elif args.action == "sync":
+                if root is None and not args.source:
+                    root = resolve_root(root_arg)
+                wiki_id = args.wiki_id or client.wiki_id
+                if not wiki_id:
+                    raise RuntimeError("knowledge sync requires --wiki-id or a configured knowledge.wiki_id")
+                specs = discover_sources(str(root) if root is not None else None, args.source)
+                if len(specs) != 1:
+                    raise RuntimeError("knowledge sync requires one source; pass --source <id>")
+                view = prepare_view(specs[0], local=False)
+                value = {
+                    "schema_version": SCHEMA_VERSION,
+                    "operation": "knowledge-sync",
+                    "source": specs[0].id,
+                    "repository": specs[0].repository,
+                    "commit": view.commit,
+                    "commit_type": view.commit_type,
+                    "freshness": view.freshness,
+                    **client.sync_source(view.path, wiki_id, deep=args.deep),
+                }
         elif args.command == "init":
             value = init_source(args.path, args.source_id, args.repository, args.profile, not args.no_sync, args.local_only)
         elif args.command == "source":
