@@ -1,12 +1,27 @@
 # Memory providers
 
-`repository-memory` keeps the provider boundary explicit. TencentDB
-MemoryCore is the durable four-layer conversation memory plane; Memmy is an
-optional local search and operations plane. Neither provider replaces the
-Git-backed repository citation index, and scores are never fused across
-providers.
+`repository-memory` is an independent local product. Its built-in SQLite
+runtime owns the durable four-layer conversation memory plane and its local
+vector projection. TencentDB MemoryCore and Memmy are optional compatibility
+references only; neither is required to run the default CLI/MCP. Scores are
+never fused across external provider lanes.
 
-## TencentDB MemoryCore
+## Built-in standalone runtime
+
+The default runtime implements the same useful lifecycle locally:
+
+| Layer | What it stores | How it becomes trusted |
+| --- | --- | --- |
+| L0 | Raw conversation/messages | durable write and read-back |
+| L1 | Atomic records projected from conversation | deterministic write and read-back |
+| L2 | Scenario candidate generated from a session | explicit review/accept |
+| L3 | Stable profile/core memory | explicit promotion and read-back |
+
+The built-in vector projection is `builtin-char-ngram-v1`. It requires no model
+download and is reported as `local-hybrid`; it must not be described as a
+neural embedding model.
+
+## Optional TencentDB compatibility backend
 
 MemoryCore separates memory by lifecycle:
 

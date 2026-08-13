@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "repository-memory"
-version = "0.4.0"
+version = "0.5.0"
 description = "Standalone citation-first repository memory Skill, CLI, MCP server, and local L0-L3 runtime"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -43,6 +43,7 @@ py-modules = [
   "knowledge",
   "knowledge_service",
   "local_index",
+  "local_embedding",
   "local_memory",
   "memmy",
   "standalone_memory",

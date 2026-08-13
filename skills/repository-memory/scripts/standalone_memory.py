@@ -2,9 +2,10 @@
 """Self-contained, provider-free L0-L3 memory runtime.
 
 This is the default memory implementation for repository-memory.  It is an
-in-process SQLite store with FTS5 when available; it does not require a
-gateway, Node, an embedding service, or credentials.  The optional vendor
-clients remain available only through an explicit external-mode opt-in.
+in-process SQLite store with FTS5 and a dependency-free local vector index; it
+does not require a gateway, Node, an embedding service, or credentials.  The
+optional vendor clients remain available only through an explicit external-mode
+opt-in.
 
 The lifecycle intentionally mirrors the useful part of the vendor model:
 
@@ -27,6 +28,15 @@ from pathlib import Path
 from typing import Any
 
 from discovery import data_root
+from local_embedding import (
+    EMBEDDING_DIMENSION,
+    EMBEDDING_MODEL,
+    EMBEDDING_PROVIDER,
+    cosine,
+    pack,
+    unpack,
+    vectorize,
+)
 from local_memory import SECRET_CONTENT, STOP_WORDS, _payload, _stable_id
 from models import MEMORY_LAYERS, memory_layer_state
 
@@ -105,6 +115,10 @@ class StandaloneMemoryClient:
             ("status", "TEXT NOT NULL DEFAULT 'verified'"),
             ("generated", "INTEGER NOT NULL DEFAULT 0"),
             ("accepted", "INTEGER NOT NULL DEFAULT 1"),
+            ("embedding", "BLOB"),
+            ("embedding_provider", "TEXT"),
+            ("embedding_model", "TEXT"),
+            ("embedding_dim", "INTEGER"),
         ):
             if name not in existing:
                 connection.execute(f"ALTER TABLE records ADD COLUMN {name} {definition}")
@@ -115,11 +129,27 @@ class StandaloneMemoryClient:
         except sqlite3.OperationalError:
             pass
         connection.commit()
+        self._backfill_embeddings(connection)
         try:
             self.path.chmod(0o600)
         except OSError:
             pass
         return connection
+
+    @staticmethod
+    def _backfill_embeddings(connection: sqlite3.Connection) -> None:
+        rows = connection.execute(
+            "SELECT id, content FROM records WHERE embedding IS NULL OR embedding_model != ?",
+            (EMBEDDING_MODEL,),
+        ).fetchall()
+        for row in rows:
+            vector = vectorize(str(row[1]))
+            connection.execute(
+                "UPDATE records SET embedding=?, embedding_provider=?, embedding_model=?, embedding_dim=? WHERE id=?",
+                (pack(vector), EMBEDDING_PROVIDER, EMBEDDING_MODEL, EMBEDDING_DIMENSION, str(row[0])),
+            )
+        if rows:
+            connection.commit()
 
     @staticmethod
     def _fts(connection: sqlite3.Connection) -> bool:
@@ -136,11 +166,31 @@ class StandaloneMemoryClient:
             for row in connection.execute("SELECT layer, COUNT(*) FROM records GROUP BY layer").fetchall()
         }
 
+    @staticmethod
+    def _lifecycle_counts(connection: sqlite3.Connection, layer: str) -> dict[str, int]:
+        rows = connection.execute(
+            "SELECT status, COUNT(*) FROM records WHERE layer=? GROUP BY status",
+            (layer,),
+        ).fetchall()
+        values = {str(row[0]): int(row[1]) for row in rows}
+        return {
+            "candidate_count": values.get("candidate", 0) + values.get("pending", 0),
+            "accepted_count": values.get("accepted", 0),
+        }
+
     def health(self, refresh: bool = False, probe_layers: bool = False) -> dict[str, Any]:
         connection = self._connect()
         try:
             counts = self._counts(connection)
             fts = self._fts(connection)
+            vector_count = int(connection.execute(
+                "SELECT COUNT(*) FROM records WHERE embedding_model=? AND embedding_dim=?",
+                (EMBEDDING_MODEL, EMBEDDING_DIMENSION),
+            ).fetchone()[0])
+            lifecycle_counts = {
+                layer: self._lifecycle_counts(connection, layer)
+                for layer in MEMORY_LAYERS
+            }
         finally:
             connection.close()
         layers = {}
@@ -154,8 +204,10 @@ class StandaloneMemoryClient:
                 persistent=True,
                 record_count=count,
                 backend="standalone-memory",
+                **lifecycle_counts[layer],
             )
         return {
+            "ok": True,
             "backend": self.backend,
             "mode": "in-process",
             "external_dependency": False,
@@ -166,7 +218,15 @@ class StandaloneMemoryClient:
             "path": str(self.path),
             "record_count": sum(counts.values()),
             "index": "fts5" if fts else "sqlite-scan",
-            "embedding": {"available": False, "strategy": "keyword-only"},
+            "embedding": {
+                "available": True,
+                "strategy": "local-hybrid",
+                "provider": EMBEDDING_PROVIDER,
+                "model": EMBEDDING_MODEL,
+                "dimension": EMBEDDING_DIMENSION,
+                "indexed_records": vector_count,
+                "native_neural_model": False,
+            },
             "llm": {"configured": False, "provider": None, "model": None},
             "runtime": {"process": "in-process", "service_required": False, "data_dir": str(self.path.parent)},
             "layers": layers,
@@ -187,17 +247,97 @@ class StandaloneMemoryClient:
             if isinstance(item, dict) and str(item.get("role") or "").strip() and str(item.get("content") or "").strip()
         ]
 
+    @staticmethod
+    def _candidate_content(session_id: str, messages: list[dict[str, str]]) -> str:
+        """Build a reviewable L2 scenario without claiming it is accepted."""
+
+        selected = []
+        for message in messages:
+            content = " ".join(message["content"].split()).strip()
+            if not content or SECRET_CONTENT.search(content):
+                continue
+            selected.append(f"- {message['role']}: {content[:500]}")
+        selected = selected[-8:]
+        return "\n".join([
+            "status: candidate",
+            "layer: L2",
+            "generated: true",
+            f"session_id: {session_id}",
+            "",
+            "# Scenario candidate",
+            "",
+            *selected,
+        ]).strip() + "\n"
+
+    def _project_candidate(self, connection: sqlite3.Connection, session_id: str, messages: list[dict[str, str]]) -> str | None:
+        if not messages:
+            return None
+        path = f"session/{session_id}"
+        existing = connection.execute(
+            "SELECT id FROM records WHERE layer='L2' AND session_id=?",
+            (path,),
+        ).fetchone()
+        if existing:
+            return str(existing[0])
+        record_id = f"local:L2:{hashlib.sha256(path.encode()).hexdigest()[:24]}"
+        self._upsert(
+            connection,
+            record_id=record_id,
+            layer="L2",
+            session_id=path,
+            message_index=-1,
+            role="system",
+            content=self._candidate_content(session_id, messages),
+            metadata={"path": path, "session_id": session_id, "pipeline": "standalone-session-projection"},
+            status="candidate",
+            generated=True,
+            accepted=False,
+        )
+        return record_id
+
+    def project_candidates(self) -> dict[str, Any]:
+        """Project existing L0 conversations into reviewable L2 candidates."""
+
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                "SELECT * FROM records WHERE layer='L0' ORDER BY session_id, message_index",
+            ).fetchall()
+            grouped: dict[str, list[dict[str, str]]] = {}
+            for row in rows:
+                grouped.setdefault(str(row["session_id"]), []).append({
+                    "role": str(row["role"]),
+                    "content": str(row["content"]),
+                    "timestamp": str(row["timestamp"] or ""),
+                })
+            ids = [self._project_candidate(connection, session_id, messages) for session_id, messages in grouped.items()]
+            connection.commit()
+        finally:
+            connection.close()
+        return {
+            "ok": True,
+            "backend": self.backend,
+            "projected": len([item for item in ids if item]),
+            "candidate_ids": [item for item in ids if item],
+            "status": "candidate",
+            "accepted": False,
+            "canonical_repo_changed": False,
+        }
+
     def _upsert(self, connection: sqlite3.Connection, *, record_id: str, layer: str, session_id: str, message_index: int, role: str, content: str, timestamp: str = "", metadata: dict[str, Any] | None = None, status: str = "verified", generated: bool = False, accepted: bool = True) -> None:
         now = time.time()
         metadata_value = json.dumps(metadata or {}, ensure_ascii=False, sort_keys=True)
+        embedding = pack(vectorize(content))
         connection.execute(
             """INSERT INTO records
-            (id, layer, session_id, message_index, role, content, timestamp, metadata, created_at, updated_at, status, generated, accepted)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, layer, session_id, message_index, role, content, timestamp, metadata, created_at, updated_at, status, generated, accepted, embedding, embedding_provider, embedding_model, embedding_dim)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET content=excluded.content, timestamp=excluded.timestamp,
               metadata=excluded.metadata, updated_at=excluded.updated_at, status=excluded.status,
-              generated=excluded.generated, accepted=excluded.accepted""",
-            (record_id, layer, session_id, message_index, role, content, timestamp, metadata_value, now, now, status, int(generated), int(accepted)),
+              generated=excluded.generated, accepted=excluded.accepted, embedding=excluded.embedding,
+              embedding_provider=excluded.embedding_provider, embedding_model=excluded.embedding_model,
+              embedding_dim=excluded.embedding_dim""",
+            (record_id, layer, session_id, message_index, role, content, timestamp, metadata_value, now, now, status, int(generated), int(accepted), embedding, EMBEDDING_PROVIDER, EMBEDDING_MODEL, EMBEDDING_DIMENSION),
         )
         if self._fts(connection):
             connection.execute("DELETE FROM records_fts WHERE id = ?", (record_id,))
@@ -209,7 +349,7 @@ class StandaloneMemoryClient:
         if not sessions:
             raise ValueError("session input contains no sessions")
         connection = self._connect()
-        written_l0 = written_l1 = skipped_sensitive = session_count = 0
+        written_l0 = written_l1 = skipped_sensitive = session_count = l2_candidates = 0
         try:
             for position, session in enumerate(sessions):
                 if not isinstance(session, dict):
@@ -230,6 +370,8 @@ class StandaloneMemoryClient:
                     self._upsert(connection, record_id=_stable_id("L1", session_id, index, role, content), layer="L1", session_id=session_id, message_index=index, role=role, content=content, timestamp=message["timestamp"], metadata=metadata)
                     written_l0 += 1
                     written_l1 += 1
+                if messages:
+                    l2_candidates += 1 if self._project_candidate(connection, session_id, messages) else 0
             connection.commit()
         finally:
             connection.close()
@@ -243,7 +385,8 @@ class StandaloneMemoryClient:
             "l1_recorded": written_l1,
             "l0_verified": written_l0 > 0,
             "l1_status": "verified" if written_l1 else "unknown",
-            "l2_status": "pending_explicit_review",
+            "l2_status": "candidate" if l2_candidates else "pending_explicit_review",
+            "l2_candidates": l2_candidates,
             "l3_status": "explicit_promotion_only",
             "skipped_sensitive_messages": skipped_sensitive,
             "verified": written_l0 > 0,
@@ -251,33 +394,36 @@ class StandaloneMemoryClient:
         }
 
     def _rows(self, query: str, limit: int) -> list[sqlite3.Row]:
-        terms = list(dict.fromkeys(_terms(query)))
-        if not terms:
-            return []
         connection = self._connect()
         try:
-            if self._fts(connection):
-                match = " OR ".join('"' + term.replace('"', "") + '"' for term in terms)
-                return connection.execute("SELECT r.* FROM records r JOIN records_fts f ON f.id=r.id WHERE records_fts MATCH ?", (match,)).fetchall()
-            return connection.execute("SELECT * FROM records").fetchall()
+            # Semantic search needs the full candidate set; SQLite FTS is still
+            # used as a cheap lexical signal during ranking.
+            return connection.execute(
+                "SELECT * FROM records ORDER BY updated_at DESC LIMIT ?",
+                (max(1000, int(limit) * 200),),
+            ).fetchall()
         finally:
             connection.close()
 
     def search(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
         terms = list(dict.fromkeys(_terms(query)))
+        query_vector = vectorize(query)
         ranked = []
         for row in self._rows(query, limit):
             content = str(row["content"])
             matched = [term for term in terms if term in content.casefold()]
-            if not matched:
+            semantic_score = cosine(query_vector, unpack(row["embedding"]))
+            if not matched and semantic_score < 0.12:
                 continue
             layer = str(row["layer"])
             bonus = {"L3": 0.45, "L2": 0.35, "L1": 0.2, "L0": 0.0}.get(layer, 0.0)
-            ranked.append((len(matched) + bonus, str(row["id"]), row, matched))
+            lexical_score = min(0.65, len(matched) * 0.16)
+            score = semantic_score + lexical_score + bonus
+            ranked.append((score, str(row["id"]), row, matched, semantic_score))
         ranked.sort(key=lambda item: (-item[0], item[1]))
-        return [self._result(row, matched) for _score, _id, row, matched in ranked[: max(1, int(limit))]]
+        return [self._result(row, matched, semantic_score) for _score, _id, row, matched, semantic_score in ranked[: max(1, int(limit))]]
 
-    def _result(self, row: sqlite3.Row, matched: list[str]) -> dict[str, Any]:
+    def _result(self, row: sqlite3.Row, matched: list[str], semantic_score: float = 0.0) -> dict[str, Any]:
         record_id = str(row["id"])
         layer = str(row["layer"])
         content = str(row["content"])
@@ -295,7 +441,9 @@ class StandaloneMemoryClient:
             "status": status,
             "generated": generated,
             "accepted": accepted,
-            "score": len(matched),
+            "score": round(semantic_score + min(0.65, len(matched) * 0.16), 6),
+            "semantic_score": round(semantic_score, 6),
+            "retrieval_mode": "local-hybrid",
             "updated_at": row["updated_at"],
             "_native_memory": True,
             "_memory_backend": self.backend,

@@ -41,7 +41,7 @@ flowchart LR
     B --> C[doctor and scope router]
     C --> D[Repository snapshot and structured index]
     D --> E[Verified citation: commit, path, lines]
-    C --> F[Optional MemoryCore]
+    C --> F[Built-in standalone memory]
     F --> G[L0 raw conversation]
     F --> H[L1 atomic memory]
     F --> I[L2 scenario candidate or accepted]
@@ -139,11 +139,12 @@ narrow the answer. Check `support.claim_support` and use `get` or `explain`
 with the returned commit and line range before making a claim marked
 `partial` or `unknown`.
 
-The runtime does not require embeddings. When no semantic provider is
-configured, doctor and search say `retrieval_mode=keyword-only` and
-`semantic_available=false`; this is a supported fallback, not a hidden
-semantic claim. `scope=all` returns repository and MemoryCore lanes in separate
-groups. No black-box cross-backend RRF is used.
+The standalone runtime has a dependency-free local vector projection enabled
+by default. Doctor reports `provider=builtin`,
+`model=builtin-char-ngram-v1`, and `retrieval_mode=local-hybrid`; this is a
+real local vector index, not a claim that a neural MiniLM model is installed.
+`scope=all` returns repository and standalone-memory lanes in separate groups.
+No black-box cross-backend RRF is used.
 
 ## Shared Team Memory
 
@@ -228,12 +229,11 @@ repository-memory search "the user's question" --scope memory --json
 repository-memory gui --json
 ```
 
-The runtime reports provider capabilities separately. For example, native
-MemoryCore can remain `keyword-only` while Memmy reports `local-hybrid` from
-its local embedding model. Results are interleaved by provider lane without
-cross-provider score fusion and retain `source`, `layer`, `memory_id`, and
-provider citation metadata. See [memory-providers](docs/memory-providers.md)
-for the integration contract and failure behavior.
+The runtime reports compatibility providers separately. The built-in
+standalone vector lane remains the default; an already-installed Memmy service
+is not required and is never used to make the standalone doctor green. See
+[memory-providers](docs/memory-providers.md) for the optional compatibility
+contract.
 
 ## TencentDB MemoryKnowledge (Wiki / CodeGraph)
 
@@ -277,8 +277,8 @@ memory_search
 memory_get
 ```
 
-Use the CLI for `init`, `source add`, `ingest-session`, `feedback`, Team Memory
-publish/activate, and `memory promote-l3`. The MCP and CLI share the same
+Use the CLI for `init`, `source add`, `ingest-session`, `memory project`,
+`feedback`, Team Memory publish/activate, and `memory promote-l3`. The MCP and CLI share the same
 runtime and return the same read/query contract; the server is not bound to a
 port.
 

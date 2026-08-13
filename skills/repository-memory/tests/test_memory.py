@@ -110,7 +110,7 @@ class RepositoryMemoryTest(unittest.TestCase):
     def test_runtime_version_comes_from_skill_version_file(self):
         self.assertEqual(SERVER_VERSION, VERSION)
         self.assertEqual(VERSION, (SCRIPTS.parent / "VERSION").read_text(encoding="utf-8").strip())
-        self.assertEqual(VERSION, "0.4.0")
+        self.assertEqual(VERSION, "0.5.0")
 
     def test_multisource_search_has_verified_and_candidates(self):
         result = core.search(None, "Atlas evidence", limit=5)
@@ -1391,6 +1391,33 @@ class RepositoryMemoryTest(unittest.TestCase):
         found = core.search(None, "citation-first explicit promotion", scope="memory")
         self.assertFalse(found["abstain"])
         self.assertTrue(any(item["layer"] == "L3" for item in found["verified"]))
+
+    def test_standalone_runtime_has_local_vectors_and_projects_l2_candidate(self):
+        self.write_config({})
+        os.environ["REPOSITORY_MEMORY_AUTODISCOVER"] = "0"
+        session = Path(self.temp.name) / "vector-session.json"
+        session.write_text(json.dumps({
+            "session_id": "vector-session",
+            "messages": [
+                {"role": "user", "content": "The local retrieval policy keeps durable evidence."},
+                {"role": "assistant", "content": "We will preserve that policy for future sessions."},
+            ],
+        }), encoding="utf-8")
+        ingested = core.ingest_session(None, str(session))
+        self.assertEqual(ingested["memory"]["embedding"]["strategy"], "local-hybrid")
+        self.assertTrue(ingested["memory"]["embedding"]["available"])
+        self.assertEqual(ingested["memory"]["layers"]["L2"]["population"], "present")
+        self.assertEqual(ingested["result"]["l2_candidates"], 1)
+
+        found = core.search(None, "durable retrieval evidence", scope="memory")
+        self.assertFalse(found["abstain"])
+        self.assertEqual(found["retrieval_mode"], "local-hybrid")
+        self.assertTrue(found["verified"])
+        self.assertTrue(any(item["layer"] == "L2" for item in found["candidates"]))
+
+        projected = core.project_memory_candidates()
+        self.assertEqual(projected["status"], "candidate")
+        self.assertGreaterEqual(projected["projected"], 1)
 
     def test_capture_turn_creates_one_team_candidate_without_accepting_it(self):
         self.write_config({})

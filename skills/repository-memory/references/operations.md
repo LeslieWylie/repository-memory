@@ -120,6 +120,11 @@ L2 remains a candidate until explicit review and L3 requires explicit
 promotion/read-back. An optional vendor backend may report asynchronous L1, but
 that external mode is never needed for a fresh install.
 
+`memory project` is an explicit local maintenance operation that projects
+already stored L0 conversations into reviewable L2 candidates. It is
+idempotent and never accepts those candidates or writes L3. Use
+`memory promote-l3 --candidate <id> --accept` only after reviewing one.
+
 `capture-turn` is not an ordinary query command. A host lifecycle extension may
 invoke it after a successful turn with bounded user/assistant messages. It
 redacts and de-duplicates the payload, verifies L0, observes L1, and writes only
@@ -128,16 +133,18 @@ review operation; it reads the candidate, writes L3, reads L3 back, and archives
 the candidate outside the pending search tree. It requires `--accept` and is
 not exposed as a normal MCP tool.
 
-An adapter is selected dynamically. Its minimum JSON protocol is `doctor --json`, `sync --json`, `search --query ... --json`, and `get --id ... --json`; optional capabilities are reported by `doctor`. The Skill does not assume a vendor, provider, model, URL, or semantic index.
+The built-in standalone runtime is the default execution path. Its public
+protocol is `doctor --json`, `sync --json`, `search --query ... --json`, and
+`get --id ... --json`; optional compatibility backends are only selected from
+explicit user configuration. The Skill does not require a vendor, provider,
+model, URL, or external semantic service.
 
-When the selected adapter reports a conversation memory plane, `doctor` exposes
-its supported layers, configured state, live reachability, credential source,
-and whether retrieval is keyword-only. Search preserves the returned memory
-layer/type and query source in each result. Native MemoryCore citations use a
-stable memory id, layer, and returned evidence instead of pretending that a
-conversation record is a Git file. A layer label is metadata, not proof:
-citation validation still controls whether the result is `verified` or remains
-a candidate.
+The standalone doctor exposes supported layers, local persistence, vector
+provider/model/dimension, and lifecycle counts. Search preserves the memory
+layer/type and query source in each result. A stable memory id, layer, and
+returned evidence are used instead of pretending that a conversation record is
+a Git file. A layer label is metadata, not proof: lifecycle status still
+controls whether the result is `verified` or remains a candidate.
 
 For MCP calls, omit `root` by default. The server process owns the configured
 root and source discovery; only pass an explicit root when the user has named a

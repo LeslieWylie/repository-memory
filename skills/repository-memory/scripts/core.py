@@ -593,7 +593,20 @@ def _package_search(query: str, mode: str, scope: str, views: list[SourceView], 
         isinstance(entry.get("semantic"), dict) and entry["semantic"].get("available") is True
         for entry in diagnostics
     )
-    retrieval_mode = "grouped" if scope == "all" else "hybrid" if scope == "memory" and semantic_ready else "keyword-only" if scope == "memory" and memory_ready else "lexical"
+    semantic_strategies = [
+        str(entry["semantic"].get("strategy"))
+        for entry in diagnostics
+        if isinstance(entry.get("semantic"), dict) and entry["semantic"].get("available") is True
+    ]
+    retrieval_mode = (
+        "grouped"
+        if scope == "all"
+        else semantic_strategies[0]
+        if scope == "memory" and semantic_strategies
+        else "keyword-only"
+        if scope == "memory" and memory_ready
+        else "lexical"
+    )
     result_count = sum(len(group.get("verified", [])) for group in groups.values()) if scope == "all" else len(selected["verified"])
     answerable_count = sum(len(group.get("answerable", [])) for group in groups.values()) if scope == "all" else len(selected.get("answerable", []))
     answerable = [] if scope == "all" else selected.get("answerable", [])[:limit]
@@ -864,6 +877,16 @@ def ingest_session_payload(root: Path | None, payload: Any, source_id: str | Non
         return ingest_session(root, str(path), source_id)
     finally:
         path.unlink(missing_ok=True)
+
+
+def project_memory_candidates() -> dict[str, Any]:
+    """Create reviewable L2 candidates from the standalone L0 conversation store."""
+
+    native = native_memory_client()
+    projector = getattr(native, "project_candidates", None)
+    if not callable(projector):
+        raise RuntimeError("memory project requires the built-in standalone runtime")
+    return projector()
 
 
 def _capture_ledger_path() -> Path:
@@ -1696,8 +1719,8 @@ def build_parser() -> argparse.ArgumentParser:
     memorycore.add_argument("--candidate")
     memorycore.add_argument("--accept", action="store_true")
     memorycore.add_argument("--json", action="store_true")
-    memory = sub.add_parser("memory", help="Inspect or explicitly promote the standalone local memory runtime")
-    memory.add_argument("action", choices=["status", "promote-l3"])
+    memory = sub.add_parser("memory", help="Inspect and explicitly operate the standalone local memory runtime")
+    memory.add_argument("action", choices=["status", "project", "promote-l3"])
     memory.add_argument("--candidate")
     memory.add_argument("--accept", action="store_true")
     memory.add_argument("--json", action="store_true")
@@ -1982,6 +2005,8 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
             client = native_memory_client()
             if args.action == "status":
                 value = {"schema_version": SCHEMA_VERSION, **client.health(refresh=True, probe_layers=True), "external_mode": getattr(client, "backend", "") != "standalone-memory", "canonical_repo_changed": False}
+            elif args.action == "project":
+                value = {"schema_version": SCHEMA_VERSION, **project_memory_candidates()}
             else:
                 value = promote_l3(args.candidate or "")
         elif args.command == "memorycore":

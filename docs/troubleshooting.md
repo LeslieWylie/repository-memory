@@ -26,10 +26,11 @@ intended.
 
 ## `semantic_available: false`
 
-This is normal. The runtime remains usable with structured and lexical routing.
-It must be described as `lexical`, not as semantic or hybrid. Configure a
-provider in user config only if the environment can support it; the public Skill
-does not hard-code one.
+The default standalone runtime should report the built-in local vector lane as
+`embedding.available=true` and `strategy=local-hybrid`. If it reports false,
+the process is using an explicitly selected compatibility backend or an older
+installed package. Reinstall the current project and rerun `doctor`; do not
+claim semantic retrieval from a keyword-only compatibility response.
 
 ## MemoryCore is unreachable
 

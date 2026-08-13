@@ -27,7 +27,7 @@ the source files stay untouched.
 The install is self-contained. Do not start a vendor MemoryCore, Memmy, Wiki,
 or embedding service. The first `doctor` creates the user-level SQLite state
 and reports `memory.backend=standalone-memory`, `external_dependency=false`,
-and `embedding.strategy=keyword-only`.
+and `embedding.strategy=local-hybrid` with the built-in vector projection.
 
 ## 2. Inspect readiness
 
@@ -121,12 +121,13 @@ Source IDs are local stable handles. They do not need to match a remote name.
 repository-memory search "What did we decide about retries?" \
   --scope memory --json
 repository-memory ingest-session --input examples/session.json --json
+repository-memory memory project --json
 ```
 
 Ingestion is a write. It must be requested explicitly. It reports the actual
-L0/L1 read-back status. The standalone runtime also supports L2 candidates and
-explicitly accepted L2/L3 records; it never silently creates an accepted L2 or
-L3 record.
+L0/L1 read-back status. `memory project` turns existing sessions into reviewable
+L2 candidates. The standalone runtime also supports explicitly accepted L2/L3
+records; it never silently accepts an L2 or writes L3.
 
 ## 8. MCP smoke test
 

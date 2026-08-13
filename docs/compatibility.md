@@ -4,7 +4,7 @@ There are two different version numbers in this project:
 
 | Surface | Current value | Meaning |
 | --- | --- | --- |
-| Repository Memory release | `0.4.0` | The Python project, standalone SQLite L0-L3 runtime, citation-first index, installer, MCP server, OpenClaw plugin, and optional vendored compatibility components. |
+| Repository Memory release | `0.5.0` | The Python project, standalone SQLite/vector L0-L3 runtime, citation-first index, installer, MCP server, OpenClaw plugin, and optional vendored compatibility components. |
 | MCP protocol | `2026-07-28` | The wire-level protocol revision negotiated with a host. |
 
 The release version is stored in

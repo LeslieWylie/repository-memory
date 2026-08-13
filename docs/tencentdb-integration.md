@@ -69,5 +69,8 @@ component roles, and the explicit fact that dirty upstream worktree changes
 were excluded. The same field is emitted after installation because `vendor/`
 is part of the Skill package.
 
-`retrieval_mode=keyword-only` remains honest when no embedding provider is
-configured. The copied modules do not turn lexical search into semantic search.
+The default runtime does not depend on the copied modules or an embedding
+service. It uses the built-in `builtin-char-ngram-v1` local vector projection
+and reports `retrieval_mode=local-hybrid`. The copied TencentDB modules remain
+reference material and explicit compatibility code; they do not control the
+standalone runtime.
