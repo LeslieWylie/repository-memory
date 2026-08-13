@@ -47,6 +47,13 @@ or registered its MCP. Before claiming that setup is complete:
    `ready` only when the observed responses support it; include any degraded
    or fallback state in the report.
 
+The repository lane may expose an optional local semantic provider. Treat
+`doctor`'s `repository_semantic.available`, provider, model, indexed commit,
+and `retrieval_mode` as runtime facts; a configured model without a loaded
+model and same-commit index is only `lexical-fallback`. Semantic ranking may
+improve candidate recall inside one repository, but it never replaces exact
+path/citation validation or permits cross-source score fusion.
+
 Read [operations](references/operations.md) for the exact tool/CLI handshake
 and [entity-and-memory-model](references/entity-and-memory-model.md) before
 explaining entity extraction or session-memory writes.

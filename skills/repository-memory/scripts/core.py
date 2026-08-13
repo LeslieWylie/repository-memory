@@ -57,6 +57,11 @@ from memorycore import (
 )
 from knowledge import KnowledgeClient
 from snapshot import prepare_view
+from semantic_repository import ensure as ensure_semantic_index
+from semantic_repository import status as semantic_index_status
+from semantic_repository import configure as configure_semantic
+from semantic_repository import model_status as semantic_model_status
+from semantic_repository import summary as semantic_summary
 from team_memory import team_memory_store
 from vendor_components import report as vendor_components_report
 
@@ -283,8 +288,9 @@ def _empty(query: str, mode: str, source_views: list[SourceView], reason: str, *
         "results": [] if scope == "all" else groups[scope]["results"],
         "groups": groups if scope == "all" else None,
         "abstain": True,
+        "retrieval_mode": "abstain",
         "freshness": {view.spec.id: _freshness(view) for view in source_views},
-        "diagnostics": {"scope": scope, "adapter": backend, "result_count": 0, "reason": reason},
+        "diagnostics": {"scope": scope, "adapter": backend, "result_count": 0, "retrieval_mode": "abstain", "reason": reason},
     }
 
 
@@ -479,11 +485,14 @@ def _answerable_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _fallback_items(view: SourceView, query: str, limit: int, deep: bool, *, stale: bool = False) -> list[dict[str, Any]]:
     try:
-        view.metadata["local_index"] = ensure_local_index(view, deep)
+        local_index = ensure_local_index(view, deep)
+        view.metadata["local_index"] = local_index
+        view.metadata["semantic_index"] = ensure_semantic_index(view, local_index, deep, allow_download=False)
     except (OSError, RuntimeError, TypeError, ValueError):
         # The index is disposable acceleration state; citation-first file
         # scanning remains the safe fallback if cache creation fails.
         view.metadata.pop("local_index", None)
+        view.metadata.pop("semantic_index", None)
     raw_items = fallback_search(view, query, limit, deep)
     normalized = []
     for item in raw_items:
@@ -540,18 +549,18 @@ def _repository_items(view: SourceView, adapter: Adapter, query: str, limit: int
 
     if not adapter.available:
         items = _fallback_items(view, query, limit, deep, stale=_fallback_is_stale(view, local))
-        return items, {"source": view.spec.id, "adapter": REPOSITORY_BACKEND, "backend": REPOSITORY_BACKEND, "fallback": False, "optional_external_adapter": "unavailable", "memory_skipped": True, "reason": "using the configured local structured repository index"}
+        return items, {"source": view.spec.id, "adapter": REPOSITORY_BACKEND, "backend": REPOSITORY_BACKEND, "fallback": False, "optional_external_adapter": "unavailable", "memory_skipped": True, "semantic": semantic_summary(view.metadata.get("semantic_index")), "reason": "using the configured local structured repository index"}
     _, sync_error = _sync_if_needed(adapter, view, deep=deep)
     if sync_error:
         items = _fallback_items(view, query, limit, deep, stale=_fallback_is_stale(view, local))
-        return items, {"source": view.spec.id, "adapter": REPOSITORY_BACKEND, "backend": REPOSITORY_BACKEND, "fallback": False, "optional_external_adapter": adapter.name, "memory_skipped": True, "reason": sync_error}
+        return items, {"source": view.spec.id, "adapter": REPOSITORY_BACKEND, "backend": REPOSITORY_BACKEND, "fallback": False, "optional_external_adapter": adapter.name, "memory_skipped": True, "semantic": semantic_summary(view.metadata.get("semantic_index")), "reason": sync_error}
     try:
         payload = adapter.search(query, limit, deep)
     except AdapterError as exc:
         items = _fallback_items(view, query, limit, deep, stale=_fallback_is_stale(view, local))
-        return items, {"source": view.spec.id, "adapter": REPOSITORY_BACKEND, "backend": REPOSITORY_BACKEND, "fallback": False, "optional_external_adapter": adapter.name, "memory_skipped": True, "reason": str(exc)}
+        return items, {"source": view.spec.id, "adapter": REPOSITORY_BACKEND, "backend": REPOSITORY_BACKEND, "fallback": False, "optional_external_adapter": adapter.name, "memory_skipped": True, "semantic": semantic_summary(view.metadata.get("semantic_index")), "reason": str(exc)}
     normalized = [normalize_item(item, view, source, query) for item, source in _raw_results(payload)]
-    return normalized[:limit], {"source": view.spec.id, "adapter": adapter.name, "protocol": adapter.protocol, "fallback": False, "memory_skipped": True}
+    return normalized[:limit], {"source": view.spec.id, "adapter": adapter.name, "protocol": adapter.protocol, "fallback": False, "memory_skipped": True, "semantic": semantic_summary(view.metadata.get("semantic_index"))}
 
 
 def _memory_items(view: SourceView, adapter: Adapter, query: str, limit: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -602,7 +611,7 @@ def _package_search(query: str, mode: str, scope: str, views: list[SourceView], 
         "grouped"
         if scope == "all"
         else semantic_strategies[0]
-        if scope == "memory" and semantic_strategies
+        if semantic_strategies
         else "keyword-only"
         if scope == "memory" and memory_ready
         else "lexical"
@@ -636,7 +645,7 @@ def _package_search(query: str, mode: str, scope: str, views: list[SourceView], 
             "candidate_count": candidate_count,
             "claim_abstain": abstain and result_count > 0,
             "retrieval_mode": retrieval_mode,
-            "semantic_available": semantic_ready if memory_ready else None,
+            "semantic_available": semantic_ready,
             "query_terms": query_terms(query),
         },
     }
@@ -704,7 +713,12 @@ def sync_index(root: Path | None, deep: bool = False, source_id: str | None = No
         adapter = discover_adapter(view)
         try:
             local_index = ensure_local_index(view, deep)
-            index_info = {"path": str(local_index_status(view, deep).get("path")), "indexed_commit": local_index.get("commit"), "document_count": len(local_index.get("documents", [])), "deep": deep}
+            # A normal sync may build the configured derived index, but it
+            # must never turn into a model download.  The only operation that
+            # may download an optional provider is the explicit
+            # ``semantic configure --download`` command.
+            semantic = ensure_semantic_index(view, local_index, deep, allow_download=False)
+            index_info = {"path": str(local_index_status(view, deep).get("path")), "indexed_commit": local_index.get("commit"), "document_count": len(local_index.get("documents", [])), "deep": deep, "semantic": semantic_summary(semantic)}
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             index_info = {"available": False, "error": str(exc)}
         if adapter.protocol == "legacy-legacy-memory" and adapter.memory_status().get("status") == "ready":
@@ -722,7 +736,7 @@ def sync_index(root: Path | None, deep: bool = False, source_id: str | None = No
             })
             continue
         if not adapter.available:
-            results.append({"source": spec.id, "adapter": REPOSITORY_BACKEND, "backend": REPOSITORY_BACKEND, "synced": True, "fallback_ready": True, "repository_index": "local_structured", "reason": "using the configured local structured repository index", "index": index_info, "memory": adapter.memory_status(), "freshness": view.freshness})
+            results.append({"source": spec.id, "adapter": REPOSITORY_BACKEND, "backend": REPOSITORY_BACKEND, "synced": True, "fallback_ready": True, "repository_index": "local_structured", "reason": "using the configured local structured repository index", "index": index_info, "semantic": index_info.get("semantic"), "memory": adapter.memory_status(), "freshness": view.freshness})
             continue
         try:
             status = adapter.doctor()
@@ -731,9 +745,9 @@ def sync_index(root: Path | None, deep: bool = False, source_id: str | None = No
             if not registered and adapter.protocol == "legacy-legacy-memory":
                 adapter.add()
             synced = adapter.sync(deep=deep)
-            results.append({"source": spec.id, "adapter": adapter.name, "synced": True, "repository_index": "local_structured", "index": index_info, "freshness": view.freshness, "result": synced})
+            results.append({"source": spec.id, "adapter": adapter.name, "synced": True, "repository_index": "local_structured", "index": index_info, "semantic": index_info.get("semantic"), "freshness": view.freshness, "result": synced})
         except AdapterError as exc:
-            results.append({"source": spec.id, "adapter": adapter.name, "synced": False, "adapter_sync": False, "repository_index": "local_structured", "index": index_info, "fallback_ready": True, "optional_backend": True, "memory": adapter.memory_status(), "freshness": view.freshness, "error": str(exc)})
+            results.append({"source": spec.id, "adapter": adapter.name, "synced": False, "adapter_sync": False, "repository_index": "local_structured", "index": index_info, "semantic": index_info.get("semantic"), "fallback_ready": True, "optional_backend": True, "memory": adapter.memory_status(), "freshness": view.freshness, "error": str(exc)})
     return {"schema_version": SCHEMA_VERSION, "sources": results, "canonical_repo_changed": False, "deep": deep, "local": local}
 
 
@@ -1437,11 +1451,12 @@ def doctor(root: Path | None = None, source_id: str | None = None) -> dict[str, 
         # is derived-cache work and never modifies the canonical checkout.
         try:
             ensure_local_index(view)
+            repository_semantic = semantic_index_status(view)
         except (OSError, RuntimeError, TypeError, ValueError):
-            pass
+            repository_semantic = {"configured": False, "available": False, "strategy": "lexical", "error": "repository semantic index probe failed"}
         snapshot_path = cache_root() / "snapshots" / fingerprint(spec)
         snapshot = {"path": str(snapshot_path), "exists": (snapshot_path / ".git").exists(), "commit": git(snapshot_path, "rev-parse", "HEAD") if (snapshot_path / ".git").exists() else None}
-        report.update({"source": spec.id, "repository": spec.repository, "local_only": spec.local_only, "state": state, "index": local_index_status(view), "snapshot_cache": {**snapshot, **view.metadata}, "freshness": view.freshness})
+        report.update({"source": spec.id, "repository": spec.repository, "local_only": spec.local_only, "state": state, "index": {**local_index_status(view), "semantic": repository_semantic}, "repository_semantic": repository_semantic, "snapshot_cache": {**snapshot, **view.metadata}, "freshness": view.freshness})
         reports.append(report)
     active = [report.get("name") for report in reports if report.get("available")]
     capabilities = sorted({capability for report in reports for capability in report.get("capabilities", [])})
@@ -1753,6 +1768,12 @@ def build_parser() -> argparse.ArgumentParser:
     gui = sub.add_parser("gui")
     gui.add_argument("--open", action="store_true")
     gui.add_argument("--json", action="store_true")
+    semantic = sub.add_parser("semantic", help="Configure the optional local Hugging Face repository encoder")
+    semantic.add_argument("action", choices=("status", "configure"))
+    semantic.add_argument("--model", default="Alibaba-NLP/gte-multilingual-base")
+    semantic.add_argument("--download", action="store_true", help="Allow the explicit configure operation to download model files")
+    semantic.add_argument("--disable", action="store_true")
+    semantic.add_argument("--json", action="store_true")
     common("mcp")
     return parser
 
@@ -1844,7 +1865,7 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
                 return _mcp_dispatch(name, arguments)
             return serve(dispatch)
         gate_failed = False
-        root = None if args.command in {"init", "source", "doctor", "sync", "search", "get", "explain", "feedback", "promote", "publish", "team-activate", "team-export", "team-import", "team-evaluate", "team-compact", "context", "supersede", "ingest-session", "capture-turn", "knowledge", "memmy", "gui", "memory", "memorycore"} else resolve_root(root_arg)
+        root = None if args.command in {"init", "source", "doctor", "sync", "search", "get", "explain", "feedback", "promote", "publish", "team-activate", "team-export", "team-import", "team-evaluate", "team-compact", "context", "supersede", "ingest-session", "capture-turn", "knowledge", "memmy", "gui", "semantic", "memory", "memorycore"} else resolve_root(root_arg)
         if args.command in {"init", "source"} and root_arg:
             root = resolve_root(root_arg)
         if args.command == "doctor":
@@ -1978,6 +1999,11 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
                 }
         elif args.command == "gui":
             value = memmy_gui(args.open)
+        elif args.command == "semantic":
+            if args.action == "status":
+                value = semantic_model_status()
+            else:
+                value = configure_semantic(model=args.model, enabled=not args.disable, allow_download=args.download)
         elif args.command == "init":
             value = init_source(args.path, args.source_id, args.repository, args.profile, not args.no_sync, args.local_only)
         elif args.command == "source":

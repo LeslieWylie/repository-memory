@@ -146,6 +146,33 @@ real local vector index, not a claim that a neural MiniLM model is installed.
 `scope=all` returns repository and standalone-memory lanes in separate groups.
 No black-box cross-backend RRF is used.
 
+### Optional local neural retrieval
+
+The default projection is intentionally small and offline, but it is not a
+semantic language model. Hosts that need paraphrase and multilingual technical
+term recall can explicitly configure a Hugging Face SentenceTransformers
+model:
+
+```bash
+repository-memory semantic status --json
+repository-memory semantic configure \
+  --model <hugging-face-model-id> --download --json
+repository-memory sync --all --json
+```
+
+The model is downloaded only by the explicit `semantic configure --download`
+operation. A normal `sync` may build an index from an already-cached model but
+never grants itself network/download permission. The repository vector cache is
+derived user data keyed by source commit and model;
+the Git source, line citation, exact/path routing, and negative-query policy
+remain authoritative. If dependencies or model files are missing, doctor and
+search report `lexical-fallback` rather than claiming hybrid retrieval.
+
+The MCP installer records the verified Python runtime that loaded the model.
+This matters on hosts with multiple Python installations: a model installed in
+one interpreter is not silently assumed to be available to another MCP
+process.
+
 ## Shared Team Memory
 
 The explicit Team Memory tools are:

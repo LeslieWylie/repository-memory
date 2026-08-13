@@ -65,6 +65,7 @@ def audit_qrels(root: Path, queries: list[dict[str, Any]], qrels: list[dict[str,
     unknown: list[str] = []
     invalid: list[dict[str, str]] = []
     invalid_relevance: list[dict[str, Any]] = []
+    unsupported_relevance: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     for item in qrels:
         query_id = str(item.get("query_id") or "")
@@ -80,6 +81,8 @@ def audit_qrels(root: Path, queries: list[dict[str, Any]], qrels: list[dict[str,
             relevance = 0
         if relevance < 0:
             invalid_relevance.append({"query_id": query_id, "document_id": document_id, "relevance": relevance})
+        if relevance not in {1, 2}:
+            unsupported_relevance.append({"query_id": query_id, "document_id": document_id, "relevance": relevance})
         key = (query_id, document_id)
         if key in seen:
             duplicate_qrels.append({"query_id": query_id, "document_id": document_id})
@@ -114,7 +117,7 @@ def audit_qrels(root: Path, queries: list[dict[str, Any]], qrels: list[dict[str,
     )
     counts = [sum(value > 0 for value in grouped.get(query_id, {}).values()) for item in queries if not item.get("expected_abstain") for query_id in [str(item.get("id") or "")]]
     return {
-        "ok": not (duplicate_queries or invalid_query_ids or duplicate_qrels or unknown or invalid or invalid_relevance or missing or negatives_with_gold),
+        "ok": not (duplicate_queries or invalid_query_ids or duplicate_qrels or unknown or invalid or invalid_relevance or unsupported_relevance or missing or negatives_with_gold),
         "query_count": len(queries),
         "qrel_count": len(qrels),
         "duplicate_query_ids": duplicate_queries,
@@ -123,6 +126,7 @@ def audit_qrels(root: Path, queries: list[dict[str, Any]], qrels: list[dict[str,
         "unknown_query_ids": sorted(set(unknown)),
         "invalid_document_ids_or_paths": invalid,
         "invalid_relevance": invalid_relevance,
+        "unsupported_relevance": unsupported_relevance,
         "missing_positive_gold": missing,
         "negative_queries_with_gold": negatives_with_gold,
         "positive_gold_count_min": min(counts) if counts else 0,
@@ -218,6 +222,7 @@ def evaluate_queries(root: Path, queries_path: Path, qrels_path: Path, *, limit:
         for query in queries:
             query_id = str(query.get("id") or "")
             relevant = {doc_id for doc_id, relevance in grouped.get(query_id, {}).items() if relevance > 0}
+            primary_relevant = {doc_id for doc_id, relevance in grouped.get(query_id, {}).items() if relevance >= 2}
             source_id = str(query.get("source_scope") or root.name)
             if revision:
                 os.environ["REPOSITORY_MEMORY_SOURCE_ID"] = source_id
@@ -228,6 +233,7 @@ def evaluate_queries(root: Path, queries_path: Path, qrels_path: Path, *, limit:
             hits, candidates, abstain, selected_scope = _select(result, scope, relevant)
             ids = [str(item.get("id") or "") for item in hits[:limit]]
             rank = next((number for number, item_id in enumerate(ids, 1) if item_id in relevant), None)
+            primary_rank = next((number for number, item_id in enumerate(ids, 1) if item_id in primary_relevant), None)
             expected_abstain = bool(query.get("expected_abstain"))
             p1 = bool(not expected_abstain and ids and ids[0] in relevant)
             recall = len(set(ids) & relevant) / len(relevant) if relevant else (1.0 if expected_abstain and abstain and not hits else 0.0)
@@ -237,10 +243,13 @@ def evaluate_queries(root: Path, queries_path: Path, qrels_path: Path, *, limit:
                 "query": query.get("query"),
                 "expected_abstain": expected_abstain,
                 "gold_ids": sorted(relevant),
+                "primary_gold_ids": sorted(primary_relevant),
                 "top1_id": ids[0] if ids else None,
                 "top5_ids": ids,
                 "precision_at_1": int(p1) if not expected_abstain else None,
+                "primary_precision_at_1": int(bool(not expected_abstain and ids and ids[0] in primary_relevant)) if not expected_abstain else None,
                 "mrr_at_5": 1 / rank if rank and not expected_abstain else None,
+                "primary_mrr_at_5": 1 / primary_rank if primary_rank and not expected_abstain else None,
                 "recall_at_5": recall if not expected_abstain else None,
                 "abstain": abstain,
                 "abstain_correct": bool(abstain and not hits) if expected_abstain else None,
@@ -271,6 +280,7 @@ def evaluate_queries(root: Path, queries_path: Path, qrels_path: Path, *, limit:
     candidates = sum(row["candidate_count"] for row in rows)
     citations = sum(row["citation_valid_count"] for row in rows)
     p1_hits = sum(int(row["precision_at_1"] or 0) for row in positive)
+    primary_p1_hits = sum(int(row["primary_precision_at_1"] or 0) for row in positive)
     relevant_retrieved_at_5 = sum(len(set(row["top5_ids"]) & set(row["gold_ids"])) for row in positive)
     relevant_total = sum(len(row["gold_ids"]) for row in positive)
 
@@ -279,7 +289,9 @@ def evaluate_queries(root: Path, queries_path: Path, qrels_path: Path, *, limit:
         return {
             "total": len(rows_for_intent),
             "precision_at_1": sum(row["precision_at_1"] or 0 for row in positives) / len(positives) if positives else 0.0,
+            "primary_precision_at_1": sum(row["primary_precision_at_1"] or 0 for row in positives) / len(positives) if positives else 0.0,
             "mrr_at_5": sum(row["mrr_at_5"] or 0 for row in positives) / len(positives) if positives else 0.0,
+            "primary_mrr_at_5": sum(row["primary_mrr_at_5"] or 0 for row in positives) / len(positives) if positives else 0.0,
             "recall_at_5": sum(row["recall_at_5"] or 0 for row in positives) / len(positives) if positives else 0.0,
             "p50_latency_ms": statistics.median([row["latency_ms"] for row in rows_for_intent]) if rows_for_intent else 0.0,
             "p95_latency_ms": _percentile([row["latency_ms"] for row in rows_for_intent], 0.95),
@@ -304,6 +316,9 @@ def evaluate_queries(root: Path, queries_path: Path, qrels_path: Path, *, limit:
         "precision_at_1": sum(row["precision_at_1"] or 0 for row in positive) / len(positive) if positive else 0.0,
         "precision_at_1_hits": p1_hits,
         "precision_at_1_total": len(positive),
+        "primary_precision_at_1": sum(row["primary_precision_at_1"] or 0 for row in positive) / len(positive) if positive else 0.0,
+        "primary_precision_at_1_hits": primary_p1_hits,
+        "primary_precision_at_1_total": len(positive),
         "strict_precision_at_1": sum(row["precision_at_1"] or 0 for row in strict) / len(strict) if strict else 0.0,
         "focused_precision_at_1": sum(row["precision_at_1"] or 0 for row in focused) / len(focused) if focused else 0.0,
         "mrr_at_5": sum(row["mrr_at_5"] or 0 for row in positive) / len(positive) if positive else 0.0,

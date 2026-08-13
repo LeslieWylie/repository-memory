@@ -21,6 +21,11 @@ test = [
   "pytest>=8,<9",
   "pytest-cov>=6,<8",
 ]
+semantic = [
+  "sentence-transformers>=3,<6",
+  "torch>=2.2",
+  "transformers>=4.40",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["skills/repository-memory/tests"]
@@ -53,6 +58,7 @@ py-modules = [
   "models",
   "repository_memory",
   "snapshot",
+  "semantic_repository",
   "team_memory",
   "team_memory_eval",
   "vendor_components",

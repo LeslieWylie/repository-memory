@@ -138,15 +138,32 @@ def _audit_log() -> Path:
     return _data_home() / "repository-memory" / "audit.jsonl"
 
 
+def _runtime_python() -> str:
+    """Use the user-selected runtime so optional providers reach MCP too."""
+
+    configured = os.environ.get("REPOSITORY_MEMORY_RUNTIME_PYTHON")
+    if not configured:
+        config = _home() / ".config" / "repository-memory" / "config.json"
+        try:
+            value = _read_json(config)
+            runtime = value.get("runtime") if isinstance(value.get("runtime"), dict) else {}
+            configured = str(runtime.get("python") or "")
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            configured = ""
+    candidate = Path(configured).expanduser() if configured else None
+    return str(candidate) if candidate and candidate.is_file() and os.access(candidate, os.X_OK) else sys.executable
+
+
 def _mcp_command(canonical: Path) -> tuple[str, list[str]]:
     """Return one transparent audited MCP command for every host."""
 
-    return sys.executable, [
+    runtime_python = _runtime_python()
+    return runtime_python, [
         str(canonical / "scripts" / "audit_proxy.py"),
         "--log",
         str(_audit_log()),
         "--",
-        sys.executable,
+        runtime_python,
         str(canonical / "scripts" / "repository-memory.py"),
         "mcp",
     ]
@@ -364,10 +381,11 @@ def _install_cli(canonical: Path) -> Path:
     destination = _home() / ".local" / "bin" / ("repository-memory.cmd" if os.name == "nt" else "repository-memory")
     destination.parent.mkdir(parents=True, exist_ok=True)
     script = canonical / "scripts" / "repository-memory.py"
+    runtime_python = _runtime_python()
     if os.name == "nt":
-        wrapper = f'@echo off\n"{sys.executable}" "{script}" %*\n'
+        wrapper = f'@echo off\n"{runtime_python}" "{script}" %*\n'
     else:
-        wrapper = f"#!/bin/sh\nexec {json.dumps(sys.executable)} {json.dumps(str(script))} \"$@\"\n"
+        wrapper = f"#!/bin/sh\nexec {json.dumps(runtime_python)} {json.dumps(str(script))} \"$@\"\n"
     temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
     temporary.write_text(wrapper, encoding="utf-8")
     os.chmod(temporary, 0o755)
@@ -377,7 +395,7 @@ def _install_cli(canonical: Path) -> Path:
 
 def _configure_source(canonical: Path, source_root: Path, local_only: bool = False) -> dict[str, Any]:
     command = [
-        sys.executable,
+        _runtime_python(),
         str(canonical / "scripts" / "repository-memory.py"),
         "init",
         "--path",
@@ -396,7 +414,7 @@ def _configure_source(canonical: Path, source_root: Path, local_only: bool = Fal
 
 def _verify(canonical: Path, require_repository: bool) -> dict[str, Any]:
     doctor_ok, doctor_output = _run([
-        sys.executable,
+        _runtime_python(),
         str(canonical / "scripts" / "repository-memory.py"),
         "doctor",
         "--json",

@@ -44,6 +44,8 @@ repository-memory team-import --input <bundle.json> --json
 repository-memory team-activate --id <team-memory-id> [--reviewer <agent>] --json
 repository-memory memory promote-l3 --candidate <autocapture:L2:id> --accept --json
 repository-memory evaluate --queries <queries.jsonl> --qrels <qrels.jsonl> [--revision <commit>] [--scope repository|memory|all] --json
+repository-memory semantic status --json
+repository-memory semantic configure --model <hugging-face-model-id> [--download] --json
 repository-memory team-evaluate --records <records.jsonl> --queries <queries.jsonl> --qrels <qrels.jsonl> [--gate] --json
 repository-memory team-compact [--keep N] --json
 repository-memory memorycore configure|start|stop|status

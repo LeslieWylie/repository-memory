@@ -30,9 +30,9 @@ from typing import Any
 from discovery import data_root
 from local_embedding import (
     EMBEDDING_DIMENSION,
-    EMBEDDING_MODEL,
-    EMBEDDING_PROVIDER,
+    active_embedding_spec,
     cosine,
+    embedding_status,
     pack,
     unpack,
     vectorize,
@@ -138,15 +138,18 @@ class StandaloneMemoryClient:
 
     @staticmethod
     def _backfill_embeddings(connection: sqlite3.Connection) -> None:
+        spec = active_embedding_spec()
         rows = connection.execute(
-            "SELECT id, content FROM records WHERE embedding IS NULL OR embedding_model != ?",
-            (EMBEDDING_MODEL,),
+            """SELECT id, content FROM records
+               WHERE embedding IS NULL OR embedding_provider != ?
+                  OR embedding_model != ? OR embedding_dim != ?""",
+            (spec["provider"], spec["model"], spec["dimension"]),
         ).fetchall()
         for row in rows:
             vector = vectorize(str(row[1]))
             connection.execute(
                 "UPDATE records SET embedding=?, embedding_provider=?, embedding_model=?, embedding_dim=? WHERE id=?",
-                (pack(vector), EMBEDDING_PROVIDER, EMBEDDING_MODEL, EMBEDDING_DIMENSION, str(row[0])),
+                (pack(vector), spec["provider"], spec["model"], len(vector), str(row[0])),
             )
         if rows:
             connection.commit()
@@ -179,13 +182,15 @@ class StandaloneMemoryClient:
         }
 
     def health(self, refresh: bool = False, probe_layers: bool = False) -> dict[str, Any]:
+        spec = active_embedding_spec()
+        configured_embedding = embedding_status(probe=True)
         connection = self._connect()
         try:
             counts = self._counts(connection)
             fts = self._fts(connection)
             vector_count = int(connection.execute(
                 "SELECT COUNT(*) FROM records WHERE embedding_model=? AND embedding_dim=?",
-                (EMBEDDING_MODEL, EMBEDDING_DIMENSION),
+                (spec["model"], spec["dimension"]),
             ).fetchone()[0])
             lifecycle_counts = {
                 layer: self._lifecycle_counts(connection, layer)
@@ -219,13 +224,12 @@ class StandaloneMemoryClient:
             "record_count": sum(counts.values()),
             "index": "fts5" if fts else "sqlite-scan",
             "embedding": {
-                "available": True,
-                "strategy": "local-hybrid",
-                "provider": EMBEDDING_PROVIDER,
-                "model": EMBEDDING_MODEL,
-                "dimension": EMBEDDING_DIMENSION,
+                **spec,
                 "indexed_records": vector_count,
-                "native_neural_model": False,
+                "configured_provider": configured_embedding.get("provider"),
+                "configured_model": configured_embedding.get("model"),
+                "configured_available": configured_embedding.get("available"),
+                "configuration_error": configured_embedding.get("error"),
             },
             "llm": {"configured": False, "provider": None, "model": None},
             "runtime": {"process": "in-process", "service_required": False, "data_dir": str(self.path.parent)},
@@ -327,7 +331,9 @@ class StandaloneMemoryClient:
     def _upsert(self, connection: sqlite3.Connection, *, record_id: str, layer: str, session_id: str, message_index: int, role: str, content: str, timestamp: str = "", metadata: dict[str, Any] | None = None, status: str = "verified", generated: bool = False, accepted: bool = True) -> None:
         now = time.time()
         metadata_value = json.dumps(metadata or {}, ensure_ascii=False, sort_keys=True)
-        embedding = pack(vectorize(content))
+        spec = active_embedding_spec()
+        vector = vectorize(content)
+        embedding = pack(vector)
         connection.execute(
             """INSERT INTO records
             (id, layer, session_id, message_index, role, content, timestamp, metadata, created_at, updated_at, status, generated, accepted, embedding, embedding_provider, embedding_model, embedding_dim)
@@ -337,7 +343,7 @@ class StandaloneMemoryClient:
               generated=excluded.generated, accepted=excluded.accepted, embedding=excluded.embedding,
               embedding_provider=excluded.embedding_provider, embedding_model=excluded.embedding_model,
               embedding_dim=excluded.embedding_dim""",
-            (record_id, layer, session_id, message_index, role, content, timestamp, metadata_value, now, now, status, int(generated), int(accepted), embedding, EMBEDDING_PROVIDER, EMBEDDING_MODEL, EMBEDDING_DIMENSION),
+            (record_id, layer, session_id, message_index, role, content, timestamp, metadata_value, now, now, status, int(generated), int(accepted), embedding, spec["provider"], spec["model"], len(vector)),
         )
         if self._fts(connection):
             connection.execute("DELETE FROM records_fts WHERE id = ?", (record_id,))
@@ -412,7 +418,7 @@ class StandaloneMemoryClient:
         for row in self._rows(query, limit):
             content = str(row["content"])
             matched = [term for term in terms if term in content.casefold()]
-            semantic_score = cosine(query_vector, unpack(row["embedding"]))
+            semantic_score = cosine(query_vector, unpack(row["embedding"], int(row["embedding_dim"] or EMBEDDING_DIMENSION)))
             if not matched and semantic_score < 0.12:
                 continue
             layer = str(row["layer"])

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from citation import locate
+from local_embedding import cosine, vectorize
 
 from models import SourceView
 
@@ -338,6 +339,26 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
             continue
         loaded_documents.append((relative, text))
     documents = loaded_documents
+    semantic_scores: dict[str, float] = {}
+    semantic_candidates: set[str] = set()
+    semantic_index = source.metadata.get("semantic_index") if isinstance(source.metadata, dict) else None
+    if isinstance(semantic_index, dict) and semantic_index.get("available") is True:
+        semantic_paths = semantic_index.get("paths") if isinstance(semantic_index.get("paths"), list) else []
+        semantic_vectors = semantic_index.get("vectors") if isinstance(semantic_index.get("vectors"), list) else []
+        query_vector = vectorize(query)
+        for relative, vector in zip(semantic_paths, semantic_vectors):
+            if not isinstance(vector, list):
+                continue
+            score = cosine(query_vector, vector)
+            semantic_scores[str(relative)] = score
+        ranked_semantic = sorted(semantic_scores.items(), key=lambda item: (-item[1], item[0]))
+        # The semantic lane widens recall only inside this repository/source.
+        # Lexical/path evidence still controls exact queries and citation
+        # validation happens after ranking.
+        semantic_candidates = {
+            relative for relative, score in ranked_semantic[:64]
+            if score >= 0.20
+        }
     available_layers = {Path(relative).parts[0] for relative, _text in documents if Path(relative).parts}
     preferred_layers = _preferred_layers(query, available_layers)
     # Use corpus-local inverse document frequency as a generic specificity
@@ -448,7 +469,8 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
             continue
         temporal_candidate = latest and bool(preferred_layers) and layer in preferred_layers
         layer_only_candidate = bool(preferred_layers) and not specific_terms and layer in preferred_layers
-        if matched < minimum_matches and not temporal_candidate and not layer_only_candidate:
+        semantic_candidate = relative in semantic_candidates
+        if matched < minimum_matches and not temporal_candidate and not layer_only_candidate and not semantic_candidate:
             continue
         excerpt_terms = list(dict.fromkeys(
             term for term in [*raw_terms, *terms]
@@ -477,6 +499,12 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
         # instead of discarding the document from ranking metrics.
         evidence_status = "secondary"
         support = _claim_support(terms, excerpt, start or excerpt_start, end or excerpt_end)
+        semantic_score = semantic_scores.get(relative, 0.0)
+        # Keep P@1 deterministic for exact/entity queries: the builtin
+        # projection is a recall lane, not a replacement for a real lexical
+        # foothold.  It may rescue a paraphrase with no term match, but it
+        # must not reorder a document that already matched the query.
+        semantic_bonus = int(max(0.0, semantic_score) * 1800) if matched == 0 else 0
         layer_bonus = 0
         if preferred_layers and layer in preferred_layers:
             layer_bonus += 72
@@ -547,6 +575,8 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
             "line_end": end,
             "excerpt": excerpt,
             "support": support,
+            "semantic_score": round(semantic_score, 6),
+            "retrieval_mode": "local-hybrid" if semantic_index and semantic_index.get("available") else "lexical",
             "evidence_status": evidence_status,
             "generated": False,
             "accepted": None,
@@ -559,6 +589,7 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
                 + int(coverage_ratio * 1800)
                 + full_coverage_bonus
                 + content_bonus
+                + semantic_bonus
                 + path_anchor_bonus
                 + sum(500 for term in raw_terms if "-" in term and term in haystack)
                 + sum(180 for phrase in phrase_terms if phrase in haystack)

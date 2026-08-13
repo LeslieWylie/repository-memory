@@ -128,6 +128,7 @@ class RepositoryMemoryTest(unittest.TestCase):
     def test_negative_and_local_structured_backend_are_conservative(self):
         negative = core.search(None, "fictional benchmark ZZZQWE")
         self.assertTrue(negative["abstain"])
+        self.assertEqual(negative["retrieval_mode"], "abstain")
         self.assertEqual(negative["verified"], [])
         translated_negative = core.search(None, "ZZZQWE project recent progress")
         self.assertTrue(translated_negative["abstain"])
@@ -145,6 +146,31 @@ class RepositoryMemoryTest(unittest.TestCase):
         dirty_result = core.search(None, "Atlas evidence", local=True)
         self.assertTrue(dirty_result["abstain"])
         self.assertTrue(all(".env" not in item["path"] for item in dirty_result["candidates"]))
+
+    def test_builtin_repository_projection_is_active_by_default(self):
+        self.write_config({"sources": [{"id": "alpha", "root": str(self.alpha)}]})
+
+        result = core.search(None, "Atlas evidence", local=True)
+
+        self.assertEqual(result["retrieval_mode"], "local-hybrid")
+        self.assertTrue(result["diagnostics"]["semantic_available"])
+        self.assertEqual(result["diagnostics"]["adapters"][0]["semantic"]["provider"], "builtin")
+        self.assertEqual(result["diagnostics"]["adapters"][0]["semantic"]["strategy"], "local-hybrid")
+        self.assertFalse(result["diagnostics"]["adapters"][0]["semantic"]["native_neural_model"])
+
+    def test_normal_sync_never_grants_model_download_permission(self):
+        self.write_config({"sources": [{"id": "alpha", "root": str(self.alpha)}]})
+        captured = {}
+
+        def fake_semantic(view, local_index, deep=False, *, allow_download=False):
+            captured["allow_download"] = allow_download
+            return {"configured": True, "available": True, "provider": "builtin", "model": "builtin-char-ngram-v1", "dimension": 384, "indexed": True, "strategy": "local-hybrid"}
+
+        with patch("core.ensure_semantic_index", side_effect=fake_semantic):
+            synced = core.sync_index(None, local=True)
+
+        self.assertFalse(captured["allow_download"])
+        self.assertTrue(synced["sources"][0]["synced"])
 
     def test_local_only_source_is_fresh_without_remote_fetch(self):
         self.write_config({
