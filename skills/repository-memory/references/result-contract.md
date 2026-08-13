@@ -22,11 +22,13 @@ Repository results expose a stable id, source/repository, commit, commit type,
 path, line range, excerpt, evidence status, generated status, freshness, and
 citation metadata. Every result may also expose `support` with
 `matched_terms`, `unmatched_terms`, `coverage`, `claim_support`, and
-`supporting_spans`. Native or local memory results replace the Git locator with
-a layer, stable memory id, locator/evidence, and backend freshness; they must
-not fabricate a repository path or commit. A `local-memory` result is a
-deterministic L0/L1 fallback, not evidence that L2/L3 summarisation or profile
-memory exists.
+`supporting_spans`. Standalone or native-compatible memory results replace the
+Git locator with a layer, stable memory id, locator/evidence, and backend
+freshness; they must not fabricate a repository path or commit. The default
+`standalone-memory` backend can represent L0-L3, but an L2 candidate is not an
+accepted fact and L3 is only valid after explicit promotion plus read-back. A
+legacy `local-memory` result may still be limited to L0/L1; its actual backend
+and layer status must be reported rather than inferred.
 
 Results recalled from a conversation-memory adapter may also expose `memory`
 metadata with `layer` (for example `L0` through `L3`), `type`, `query_source`,

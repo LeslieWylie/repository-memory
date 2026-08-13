@@ -54,8 +54,9 @@ Memmy's local embedding lane is kept separate from TencentDB's native
 embedding setting. This means a live result can truthfully report:
 
 ```text
-MemoryCore: keyword-only
-Memmy: local-hybrid
+standalone-memory: local-hybrid (built-in local vector projection)
+optional MemoryCore compatibility: keyword-only or provider-reported
+optional Memmy compatibility: local-hybrid when its local model is available
 repository: citation-first lexical/structured
 ```
 

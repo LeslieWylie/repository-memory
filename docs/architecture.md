@@ -75,8 +75,8 @@ can be `verified` while a compound question still has
 ```text
 explicit ingest or opt-in capture
   -> L0 raw conversation [write + read-back]
-  -> L1 atomic extraction [pending until observed]
-  -> L2 scenario [candidate/pending]
+  -> L1 atomic projection [write + read-back]
+  -> L2 scenario [candidate]
   -> human review and explicit accept
   -> L3 profile/core [write + read-back]
 ```

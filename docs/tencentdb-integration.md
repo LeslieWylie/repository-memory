@@ -17,19 +17,17 @@ databases, `node_modules`, and credentials were not copied.
 | Upstream capability | Repository Memory use |
 | --- | --- |
 | L0 conversation recorder | bounded, redacted `capture-turn` payloads with idempotent write/read-back |
-| L1 atomic extraction | native v3 observation; `pending` stays pending until records are observed |
+| L1 atomic extraction | compatibility observation; `pending` stays pending until records are observed |
 | L2 scene extractor/navigation | native scenario listing/read and accepted-vs-candidate lifecycle |
 | L3 persona/profile | explicit promotion and `core/read` verification only |
 | OpenClaw recall hook | `before_prompt_build` invokes the shared CLI with `scope=memory` |
 | OpenClaw capture hook | `agent_end` invokes the shared CLI with `capture-turn` |
 | MemoryKnowledge Wiki/code modules | optional user-level Wiki/CodeGraph service; repository-memory keeps citation-first local indexing and does not black-box fuse scores |
 
-The TypeScript snapshot is also the default source for the local native service
-after installation. It is kept separate from the Python CLI/MCP process: the
-Python runtime remains the public boundary, while the launchd-managed service
-runs the copied MemoryCore source with user-level dependencies and state. A
-user-configured compatible checkout can still override the bundled source, but
-doctor must report that override explicitly.
+The TypeScript snapshot is reference material and optional compatibility code,
+not the default runtime. The Python CLI/MCP process is self-contained and uses
+the built-in standalone backend; a user-configured compatible checkout can
+still be enabled separately, but doctor must report that override explicitly.
 
 ## MemoryKnowledge boundary
 

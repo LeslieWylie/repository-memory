@@ -30,31 +30,34 @@ records. For relationship questions, verify each side and the relation in
 separate evidence windows. Never invent aliases or graph edges from a short
 token overlap.
 
-## Four MemoryCore layers
+## Four standalone memory layers
 
-When a native memory adapter is configured, the layer names describe distinct
-surfaces:
+The default in-process runtime owns four distinct SQLite-backed surfaces. The
+layer names are compatible with the MemoryCore vocabulary, but the standalone
+implementation does not require a vendor service:
 
 | Layer | Meaning | Current adapter behavior |
 | --- | --- | --- |
-| L0 | Raw conversation/message memory | Durable write through the conversation API; searchable with its native locator. |
-| L1 | Atomic memory extracted from conversation | Searchable through the atomic API; after a write, extraction is normally asynchronous and must be observed as `pending`, `verified`, or `unknown`. |
-| L2 | Scenario/generated long-lived context | Read through the scenario API. `generated`, `accepted`, and `pending` are status signals, not proof of truth. The current adapter does not synchronously create an L2 record during ingest. |
-| L3 | Profile/core memory | Read through the core/profile API. A ready endpoint does not mean a new session was promoted into the profile. |
+| L0 | Raw conversation/message memory | Durable SQLite write and read-back verification. |
+| L1 | Atomic memory extracted from conversation | Deterministic atomic projection with write and read-back verification. |
+| L2 | Scenario/generated long-lived context | Automatically projected as an unaccepted candidate; explicit review changes it to `accepted`. |
+| L3 | Profile/core memory | Written only by explicit promotion and verified by a second read. |
 
-The native ingest transition is therefore:
+The standalone ingest transition is therefore:
 
 ```text
 explicit session input
   -> durable L0 write
   -> verify L0 ids
-  -> report L1 pending/unknown
-  -> later search/doctor/read observes L1, L2, or L3 if the backend actually produced them
+  -> durable L1 write and read-back
+  -> project an unaccepted L2 candidate
+  -> explicit review/promotion writes L3 and verifies it
 ```
 
-The local fallback, used when no native backend is reachable, is deliberately
-smaller: it can persist and search local L0/L1 records, while L2/L3 are
-reported unsupported. Do not call this fallback a four-layer memory system.
+An optional native compatibility backend may expose asynchronous or unsupported
+states, but that does not change the standalone contract. The default local
+runtime reports the actual record counts and statuses; endpoint readiness alone
+never counts as populated memory.
 
 ## Agent rules
 
@@ -62,11 +65,11 @@ reported unsupported. Do not call this fallback a four-layer memory system.
   memory-ingest operation.
 - `memory_ingest` is a write and requires an explicit user request. It accepts
   a session/conversation payload, not an inferred fact from ordinary chat.
-- After ingest, report the actual `l0_verified` and `l1_status`. Do not claim
-  L1 is complete because the write request returned successfully.
-- Report L2/L3 only when a subsequent API response returns the record and its
-  status. `supported_layers` and `reachable=true` are readiness facts, not
-  data-quality or population facts.
+- After ingest, report the actual `l0_verified`, `l1_verified`, and L2
+  candidate receipt. Do not call an L2 candidate an accepted fact.
+- Report L2/L3 only when `doctor` or a subsequent `get` response returns the
+  record and its status. `supported_layers` and `reachable=true` are readiness
+  facts, not data-quality or population facts.
 - A raw L0 result means “the conversation contained this”; without linked
   repository evidence it must not be presented as a Git-backed project fact.
 - Delete synthetic test conversations after an explicit isolated test when the

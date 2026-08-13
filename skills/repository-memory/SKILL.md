@@ -7,9 +7,9 @@ description: Search durable project and research memory across discovered knowle
 
 Use this Skill for durable repository knowledge, shared team experience, and
 explicitly imported long-term memory, not transient conversation context. The bundled runtime discovers
-sources and the local runtime at execution time; do not invent paths,
-providers, models, indexes, or deployment details. The bundled runtime is
-standalone by default and does not require a vendor service.
+sources at execution time and owns the default local memory/index runtime; do
+not invent paths, providers, models, indexes, or deployment details. The
+bundled runtime is standalone by default and does not require a vendor service.
 
 Prefer the host's registered stdio MCP. When using the CLI, invoke the bundled
 `scripts/repository-memory` (or `scripts/repository-memory.py`) relative to this Skill's
@@ -21,8 +21,8 @@ the host's repository namespace (for example, `repository-memory__memory_search`
 The bare host tool `memory_search` is a different backend. Prefer the
 namespaced tools for shared evidence, but the host guard is advisory and must
 not block ordinary `read`, `grep`, `git`, `exec`, tests, or debugging. If a
-memory backend is unavailable, report that fact and distinguish any direct
-workspace inspection from retrieved memory evidence.
+optional compatibility backend is unavailable, report that fact; the default
+standalone runtime must continue to work without that backend.
 
 ## First-use setup handshake
 
@@ -123,14 +123,14 @@ reported memory-layer and pipeline status. `memory_ingest` remains an internal
 runtime dispatch for tests/host lifecycle code and is deliberately not exposed
 through the public MCP tool list.
 An installed lifecycle extension may separately capture a completed host turn;
-that capture is still a write and must be reported as L0 verified, L1
-pending/verified, and L2 candidate until a human accepts it. It never writes
-L3 by itself. The default local runtime persists all four layers: L0/L1 are
-created by explicit ingest or opt-in capture, L2 is a reviewable candidate, and
-L3 requires explicit promotion plus read-back. Only report L2/L3 as populated
-when `doctor` or `get` returns an actual record with its status. An optional
-vendor runtime may be enabled separately, but its readiness must not replace
-the standalone runtime's receipts.
+that capture is still a write and must be reported as L0/L1 read-back verified
+and L2 candidate until a human accepts it. It never writes L3 by itself. The
+default local runtime persists all four layers: explicit ingest or opt-in
+capture creates L0/L1 and an L2 candidate, while L3 requires explicit
+promotion plus read-back. Only report L2/L3 as populated when `doctor` or
+`get` returns an actual record with its status. An optional vendor runtime may
+be enabled separately, but its readiness must not replace the standalone
+runtime's receipts.
 
 Read the relevant reference only when needed:
 
