@@ -63,7 +63,7 @@ repository: citation-first lexical/structured
 `memmy status --json` also reports the configured summary/evolution model and
 the last sanitized provider error. A configured model is not treated as a
 successful generation: the current local probe can therefore show
-`mlamp/gpt-5.6-luna` configured while still reporting a gateway quota error.
+`<provider>/<model>` configured while still reporting a gateway quota error.
 Local embedding/search remains independently usable in that state, but it is
 not evidence that new L2/L3 memories were generated.
 
