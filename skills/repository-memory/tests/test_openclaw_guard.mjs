@@ -186,9 +186,42 @@ assert.match(auditMode, /tool_audited/);
 
 // The TencentDB-compatible lifecycle path must use the shared runtime and
 // inject only answerable memory records, never candidates.
-const recallRuntime = join(auditDir, "fake-repository-memory");
-await writeFile(recallRuntime, "#!/bin/sh\nprintf '%s' '{\"groups\":{\"memory\":{\"verified\":[{\"id\":\"memorycore:L3:profile\",\"status\":\"accepted\"}],\"answerable\":[{\"id\":\"memorycore:L3:profile\",\"memory_layer\":\"L3\",\"status\":\"accepted\",\"content\":\"accepted profile context\",\"citation\":{\"valid\":true}}],\"candidates\":[{\"status\":\"candidate\",\"content\":\"do not inject\"}]}}}'\n", { encoding: "utf8" });
-await chmod(recallRuntime, 0o700);
+//
+// This fixture has to be a real spawnable "runtime", not a stub, because it
+// exercises runRecall()'s actual spawn() call. A POSIX kernel dispatches a
+// `#!/bin/sh` shebang directly at exec() time — no shell involved, so a
+// script file with the exec bit set is enough. Windows has no shebang
+// dispatch at all, so the fixture there is a `.cmd` shim that hands off to
+// node; the JSON payload lives in a sibling .mjs file so nothing has to
+// survive batch-file quoting.
+const RECALL_PAYLOAD = JSON.stringify({
+  groups: {
+    memory: {
+      verified: [{ id: "memorycore:L3:profile", status: "accepted" }],
+      answerable: [{
+        id: "memorycore:L3:profile",
+        memory_layer: "L3",
+        status: "accepted",
+        content: "accepted profile context",
+        citation: { valid: true },
+      }],
+      candidates: [{ status: "candidate", content: "do not inject" }],
+    },
+  },
+});
+
+let recallRuntime;
+if (process.platform === "win32") {
+  const payloadScript = join(auditDir, "fake-repository-memory.mjs");
+  await writeFile(payloadScript, `process.stdout.write(${JSON.stringify(RECALL_PAYLOAD)});\n`, { encoding: "utf8" });
+  recallRuntime = join(auditDir, "fake-repository-memory.cmd");
+  await writeFile(recallRuntime, "@node \"%~dp0fake-repository-memory.mjs\"\n", { encoding: "utf8" });
+} else {
+  recallRuntime = join(auditDir, "fake-repository-memory");
+  await writeFile(recallRuntime, `#!/bin/sh\nprintf '%s' '${RECALL_PAYLOAD}'\n`, { encoding: "utf8" });
+  await chmod(recallRuntime, 0o700);
+}
+
 const recallHooks = new Map();
 const recallApi = {
   pluginConfig: { enabled: true, agentIds: ["yaole"], runtime: recallRuntime, auditPath: join(auditDir, "recall.jsonl") },
