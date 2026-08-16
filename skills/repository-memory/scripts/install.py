@@ -25,8 +25,24 @@ from version import VERSION
 SKILL_NAME = "repository-memory"
 MCP_NAME = "repository-memory"
 OPENCLAW_PLUGIN_ID = "repository-memory-autocapture"
-LEGACY_SKILL_NAMES = {"rlvr-memory"}
-LEGACY_OPENCLAW_PLUGIN_IDS = {"rlvr-memory-autocapture"}
+
+
+def _legacy_names(variable: str) -> set[str]:
+    """Identifiers this skill used to be installed under, if any.
+
+    A previous name exists only inside the deployment that used it, so it is
+    deployment state rather than part of the repository — the same rule the
+    launchd LABEL constant already follows.  The default is empty, which is the
+    correct answer for every fresh install: nothing to migrate away from.  A
+    deployment upgrading from an older name sets, for example,
+    ``REPOSITORY_MEMORY_LEGACY_SKILL_NAMES=old-name,older-name``.
+    """
+    raw = os.environ.get(variable, "")
+    return {value.strip() for value in raw.split(",") if value.strip()}
+
+
+LEGACY_SKILL_NAMES = _legacy_names("REPOSITORY_MEMORY_LEGACY_SKILL_NAMES")
+LEGACY_OPENCLAW_PLUGIN_IDS = _legacy_names("REPOSITORY_MEMORY_LEGACY_OPENCLAW_PLUGIN_IDS")
 LEGACY_OPENCLAW_TOOL_NAMES = {
     "repository-memory__memory_init",
     "repository-memory__memory_ingest",

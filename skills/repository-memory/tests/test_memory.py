@@ -200,21 +200,21 @@ class RepositoryMemoryTest(unittest.TestCase):
     def test_natural_cjk_temporal_question_retrieves_named_standup(self):
         standup = self.alpha / "standup"
         standup.mkdir()
-        (standup / "武垚乐.md").write_text(
-            "# 武垚乐\n\n## 2026-08-07\n\n推进 repository-memory MCP 接入和日志分析流水线。\n",
+        (standup / "李小明.md").write_text(
+            "# 李小明\n\n## 2026-08-07\n\n推进 repository-memory MCP 接入和日志分析流水线。\n",
             encoding="utf-8",
         )
         subprocess.run(["git", "-C", str(self.alpha), "add", "."], check=True)
         subprocess.run(["git", "-C", str(self.alpha), "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "standup"], check=True)
         self.write_config({"sources": [{"id": "alpha", "root": str(self.alpha)}]})
 
-        result = core.search(None, "武垚乐最近在干啥", local=True)
+        result = core.search(None, "李小明最近在干啥", local=True)
 
         self.assertFalse(result["abstain"])
         self.assertEqual(result["mode"], "temporal")
-        self.assertEqual(result["verified"][0]["path"], "standup/武垚乐.md")
+        self.assertEqual(result["verified"][0]["path"], "standup/李小明.md")
         self.assertEqual(result["verified"][0]["citation"]["valid"], True)
-        self.assertIn("武垚乐", result["diagnostics"]["query_terms"])
+        self.assertIn("李小明", result["diagnostics"]["query_terms"])
         self.assertFalse(result["freshness"]["alpha"]["dirty"])
 
     def test_cjk_temporal_scaffolding_does_not_become_query_terms(self):
@@ -1185,11 +1185,11 @@ class RepositoryMemoryTest(unittest.TestCase):
         openclaw_config.write_text(json.dumps({
             "agents": {
                 "list": [
-                    {"id": "alpha", "workspace": str(workspaces[0]), "skills": ["rlvr-memory"], "tools": {"alsoAllow": []}},
+                    {"id": "alpha", "workspace": str(workspaces[0]), "skills": ["legacy-memory"], "tools": {"alsoAllow": []}},
                     {"id": "beta", "workspace": str(workspaces[1])},
                 ]
             },
-            "plugins": {"entries": {"rlvr-memory-autocapture": {"enabled": True, "config": {"guardEnabled": True}}}},
+            "plugins": {"entries": {"legacy-memory-autocapture": {"enabled": True, "config": {"guardEnabled": True}}}},
         }), encoding="utf-8")
         environment = os.environ.copy()
         environment.update({
@@ -1199,6 +1199,13 @@ class RepositoryMemoryTest(unittest.TestCase):
             "XDG_CACHE_HOME": str(machine / "cache"),
             "CODEX_HOME": str(machine / ".codex"),
             "CLAUDE_CONFIG_DIR": str(machine / ".claude"),
+            # The names a deployment is upgrading *from* are supplied by that
+            # deployment, so the installer reads them from the environment and
+            # defaults to none.  Setting them here is what a site upgrading an
+            # older install does, and it is what makes the two assertions below
+            # exercise the migration path rather than an empty set.
+            "REPOSITORY_MEMORY_LEGACY_SKILL_NAMES": "legacy-memory",
+            "REPOSITORY_MEMORY_LEGACY_OPENCLAW_PLUGIN_IDS": "legacy-memory-autocapture",
         })
         environment.pop("REPOSITORY_MEMORY_CONFIG", None)
         missing_selection = subprocess.run([
@@ -1248,11 +1255,11 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(plugin["config"]["enforcement"], "audit")
         self.assertEqual(plugin["config"]["agentIds"], ["alpha"])
         self.assertTrue(plugin["hooks"]["allowConversationAccess"])
-        self.assertFalse(configured["plugins"]["entries"]["rlvr-memory-autocapture"]["enabled"])
+        self.assertFalse(configured["plugins"]["entries"]["legacy-memory-autocapture"]["enabled"])
         alpha = next(agent for agent in configured["agents"]["list"] if agent["id"] == "alpha")
         beta = next(agent for agent in configured["agents"]["list"] if agent["id"] == "beta")
         self.assertIn("repository-memory", alpha["skills"])
-        self.assertNotIn("rlvr-memory", alpha["skills"])
+        self.assertNotIn("legacy-memory", alpha["skills"])
         self.assertIn("repository-memory__memory_search", alpha["tools"]["alsoAllow"])
         self.assertNotIn("repository-memory__memory_context", alpha["tools"]["alsoAllow"])
         self.assertNotIn("repository-memory__memory_publish", alpha["tools"]["alsoAllow"])

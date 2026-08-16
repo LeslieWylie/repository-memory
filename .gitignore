@@ -18,3 +18,7 @@ build/
 audit.jsonl
 *.audit.jsonl
 *.bak.repository-memory-*
+
+# Instance-specific strings for tools/scan-tree.sh. Never committed: a list of
+# the exact identifiers you are hiding publishes every one of them.
+tools/banned.local.json

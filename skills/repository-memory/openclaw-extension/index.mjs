@@ -152,7 +152,7 @@ function isDestructiveCommand(command) {
 function isSafeRecoveryCommand(command) {
   if (!command || /[;&|`$<>]/.test(command)) return false;
   if (/\b(?:rm|rmdir|mkfs|shutdown|reboot|git\s+(?:reset|clean|checkout\s+--|rebase|push)|kill\s+-9)\b/i.test(command)) return false;
-  return /\b(?:repository-memory|rlvr-memory|memorycore)\b[\s\S]*\b(?:doctor|status|probe|health|restart|start|stop|reload|version|mcp)\b/i.test(command)
+  return /\b(?:repository-memory|memorycore)\b[\s\S]*\b(?:doctor|status|probe|health|restart|start|stop|reload|version|mcp)\b/i.test(command)
     || /\bopenclaw\s+(?:mcp\s+probe|doctor|plugins\s+inspect)\b/i.test(command)
     || /\blaunchctl\s+(?:print|list|kickstart)\b/i.test(command)
     || /\b(?:ps|lsof)\b/i.test(command);

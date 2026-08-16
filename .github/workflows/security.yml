@@ -12,6 +12,18 @@ permissions:
   contents: read
 
 jobs:
+  # CodeQL finds vulnerabilities; dependency review finds bad dependencies.
+  # Neither looks for a contributor's real name or an internal codename sitting
+  # in a test fixture, which is what actually shipped on this default branch.
+  no-identifiers-in-tree:
+    name: No identifiers in tracked files
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Scan the tree, and prove the scanner works first
+        run: bash tools/scan-tree.sh
+
   codeql:
     name: CodeQL / ${{ matrix.language }}
     runs-on: ubuntu-latest

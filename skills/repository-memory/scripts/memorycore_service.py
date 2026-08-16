@@ -34,7 +34,10 @@ from memorycore import (
 # operational identifier, not part of the Skill/agent contract; deployments
 # may override it without changing the repository.
 LABEL = os.environ.get("REPOSITORY_MEMORY_LAUNCHD_LABEL", "com.repository-memorycore")
-LEGACY_LABELS = tuple(value for value in os.environ.get("REPOSITORY_MEMORY_LEGACY_LABELS", "com.mlamp.rlvr-memorycore").split(",") if value.strip())
+# Labels a previous deployment registered the service under.  Like LABEL above,
+# this is deployment state, not repository content: only the machine that ran
+# the older service knows its label.  Empty default, comma-separated override.
+LEGACY_LABELS = tuple(value for value in os.environ.get("REPOSITORY_MEMORY_LEGACY_LABELS", "").split(",") if value.strip())
 RUNTIME_PATCH = Path(__file__).resolve().parent / "vendor-patches" / "tencentdb-memorycore-local-timer-instance.patch"
 
 

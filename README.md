@@ -333,6 +333,31 @@ evaluation sets, credentials, model names, internal hostnames, or user data.
 Use `init`/`source add` to attach the repositories that are appropriate
 for your own environment.
 
+That boundary is enforced, not just asserted. `tools/scan-tree.sh` scans every
+tracked file for credential blobs, credentials embedded in URLs, private
+hostnames, and non-placeholder email addresses, and runs on every push. It
+proves itself before reporting: each rule must match a planted sample, and
+permitted placeholders must stay exempt, or the script fails instead of
+reporting a clean tree. There is no exemption for `tests/` — test fixtures are
+where an identifier is least likely to be noticed and most likely to survive.
+
+Strings that cannot be expressed as a shape — a specific person's name, a
+codename — go in `tools/banned.local.json`, which is gitignored and optional.
+It is deliberately not committed: a checked-in list of the exact strings you are
+hiding publishes every one of them to anyone who opens the file.
+
+If you are upgrading an installation that used an earlier name for this skill,
+the names to migrate away from are supplied by that deployment rather than
+hardcoded here, since only the machine that ran the older install knows them:
+
+| Variable | Effect |
+| --- | --- |
+| `REPOSITORY_MEMORY_LEGACY_SKILL_NAMES` | Comma-separated skill names to deregister from agents during install. |
+| `REPOSITORY_MEMORY_LEGACY_OPENCLAW_PLUGIN_IDS` | Comma-separated OpenClaw plugin ids to disable during install. |
+| `REPOSITORY_MEMORY_LEGACY_LABELS` | Comma-separated launchd labels of a previously installed service to remove. |
+
+All three default to empty, which is correct for a fresh install.
+
 See [docs/quickstart.md](docs/quickstart.md),
 [docs/architecture.md](docs/architecture.md), and
 [docs/troubleshooting.md](docs/troubleshooting.md).

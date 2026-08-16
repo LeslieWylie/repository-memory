@@ -67,8 +67,8 @@ def query_terms(query: str) -> list[str]:
     r"""Expand a query into conservative lexical terms.
 
     ``re`` treats a contiguous CJK sentence as one ``\w`` token.  That made
-    a natural question such as ``武垚乐最近在干啥`` impossible to match against
-    ``standup/武垚乐.md``.  We retain normal ASCII/path tokens and add short
+    a natural question such as ``李小明最近在干啥`` impossible to match against
+    ``standup/李小明.md``.  We retain normal ASCII/path tokens and add short
     CJK fragments, while excluding temporal/question fragments.  This is a
     tokenizer, not a synonym model: it never invents domain vocabulary.
     """
