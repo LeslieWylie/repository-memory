@@ -188,12 +188,17 @@ assert.match(auditMode, /tool_audited/);
 // inject only answerable memory records, never candidates.
 //
 // This fixture has to be a real spawnable "runtime", not a stub, because it
-// exercises runRecall()'s actual spawn() call. A POSIX kernel dispatches a
-// `#!/bin/sh` shebang directly at exec() time — no shell involved, so a
-// script file with the exec bit set is enough. Windows has no shebang
-// dispatch at all, so the fixture there is a `.cmd` shim that hands off to
-// node; the JSON payload lives in a sibling .mjs file so nothing has to
-// survive batch-file quoting.
+// exercises runRecall()'s actual spawn() call, which passes a fixed argv
+// (["search", prompt, "--scope", ...]) and no shell option. A POSIX kernel
+// dispatches a `#!/bin/sh` shebang directly at exec() time -- no shell
+// involved, so a script file with the exec bit set is enough there. Windows
+// has no shebang dispatch, and (since the CVE-2024-27980 fix) spawn() without
+// shell:true refuses to CreateProcess a .cmd/.bat file at all (EINVAL) -- so
+// on Windows the fixture points runtime at the real node.exe (a genuine PE
+// binary, spawnable with no shell) and forces it to print the payload and
+// exit via a --require preload module injected through NODE_OPTIONS; preload
+// modules run before entry-point resolution, so node.exe never gets as far
+// as trying (and failing) to resolve the fixed "search" argv as a script.
 const RECALL_PAYLOAD = JSON.stringify({
   groups: {
     memory: {
@@ -211,11 +216,17 @@ const RECALL_PAYLOAD = JSON.stringify({
 });
 
 let recallRuntime;
+let restoreNodeOptions;
 if (process.platform === "win32") {
-  const payloadScript = join(auditDir, "fake-repository-memory.mjs");
-  await writeFile(payloadScript, `process.stdout.write(${JSON.stringify(RECALL_PAYLOAD)});\n`, { encoding: "utf8" });
-  recallRuntime = join(auditDir, "fake-repository-memory.cmd");
-  await writeFile(recallRuntime, "@node \"%~dp0fake-repository-memory.mjs\"\n", { encoding: "utf8" });
+  const shimPath = join(auditDir, "fake-repository-memory-shim.cjs").split("\\").join("/");
+  await writeFile(shimPath, `process.stdout.write(${JSON.stringify(RECALL_PAYLOAD)});\nprocess.exit(0);\n`, { encoding: "utf8" });
+  recallRuntime = process.execPath;
+  const previousNodeOptions = process.env.NODE_OPTIONS;
+  process.env.NODE_OPTIONS = `${previousNodeOptions ? `${previousNodeOptions} ` : ""}--require ${shimPath}`;
+  restoreNodeOptions = () => {
+    if (previousNodeOptions === undefined) delete process.env.NODE_OPTIONS;
+    else process.env.NODE_OPTIONS = previousNodeOptions;
+  };
 } else {
   recallRuntime = join(auditDir, "fake-repository-memory");
   await writeFile(recallRuntime, `#!/bin/sh\nprintf '%s' '${RECALL_PAYLOAD}'\n`, { encoding: "utf8" });
@@ -230,6 +241,7 @@ const recallApi = {
 };
 plugin.register(recallApi);
 const recall = await recallHooks.get("before_prompt_build")({ prompt: "记住这个上下文" }, { agentId: "yaole", sessionKey: "recall-1" });
+restoreNodeOptions?.();
 assert.match(recall.prependContext, /accepted profile context/);
 assert.doesNotMatch(recall.prependContext, /do not inject/);
 
