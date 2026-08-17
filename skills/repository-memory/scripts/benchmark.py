@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import site
 import sys
 from pathlib import Path
@@ -13,6 +14,21 @@ from evaluate import evaluate_queries
 
 
 SUPPORTED_SUITES = {"public", "agentmemories", "locomo", "longmemeval", "rlvr"}
+
+
+def _local_public_root() -> Path | None:
+    """Find the checked-out public core when the command is run at its root."""
+
+    current = Path.cwd().resolve()
+    for candidate in (current, *current.parents):
+        if (candidate / "README.md").is_file() and (candidate / "skills" / "repository-memory").is_dir():
+            return candidate
+    configured = os.environ.get("REPOSITORY_MEMORY_ROOT")
+    if configured:
+        candidate = Path(configured).expanduser().resolve()
+        if (candidate / "README.md").is_file():
+            return candidate
+    return None
 
 
 def _paths(suite: str, data: Path | None, queries: Path | None, qrels: Path | None) -> tuple[Path, Path, Path | None]:
@@ -49,8 +65,10 @@ def run_benchmark(*, suite: str, root: Path | None, data: Path | None = None, qu
         raise ValueError(f"unsupported benchmark suite: {suite}")
     query_path, qrel_path, manifest_root = _paths(suite, data, queries, qrels)
     evaluated_root = root or manifest_root
+    if evaluated_root is None and suite == "public":
+        evaluated_root = _local_public_root()
     if evaluated_root is None:
-        return {"schema_version": 1, "ok": False, "suite": suite, "status": "missing_root", "error": "pass --root or provide root in the benchmark manifest", "canonical_repo_changed": False}
+        return {"schema_version": 1, "ok": False, "suite": suite, "status": "missing_root", "error": "run from the public repository root, pass --root, or provide root in the benchmark manifest", "canonical_repo_changed": False}
     if not query_path.is_file() or not qrel_path.is_file():
         return {"schema_version": 1, "ok": False, "suite": suite, "status": "unsupported_data_format", "error": "expected queries.jsonl and qrels.jsonl; no external data was downloaded", "queries": str(query_path), "qrels": str(qrel_path), "canonical_repo_changed": False}
     report = evaluate_queries(evaluated_root.resolve(), query_path.resolve(), qrel_path.resolve(), limit=limit, revision=revision)

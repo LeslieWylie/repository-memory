@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.1
+
+- make `repository-memory benchmark --suite public --json` discover the
+  checked-out public repository root automatically;
+- keep explicit `--root` and manifest-root behavior unchanged.
+
 ## 0.7.0
 
 - add a dependency-free synchronous Agent Memory Leaderboard Add/Search
