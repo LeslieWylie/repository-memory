@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.12
+
+- Increase the OpenClaw native plugin's default runtime timeout to 60 seconds.
+  Cold `doctor` calls on multi-source repositories can take longer than the
+  previous 15-second default while checking remote snapshots; this avoids a
+  false unavailable result without changing the shared CLI runtime.
+
+- Keep native tools and the stdio MCP on the same runtime and retain the
+  advisory, non-blocking lifecycle hooks.
+
 ## 0.7.7
 
 - Port the useful MemOS Local lifecycle mechanics into the independent

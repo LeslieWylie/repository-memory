@@ -5,7 +5,11 @@ import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 
 const PLUGIN_ID = "repository-memory-autocapture";
-const DEFAULT_TIMEOUT_MS = 15000;
+// A cold doctor on a multi-source repository may fetch/check two snapshots
+// before returning.  Fifteen seconds made the native OpenClaw tools report a
+// false timeout even though the shared CLI runtime was healthy.  Keep the
+// bound explicit and configurable, with a conservative 60s default.
+const DEFAULT_TIMEOUT_MS = 60000;
 const STATE_TTL_MS = 30 * 60 * 1000;
 const completionKeys = new Set();
 const runStates = new Map();
