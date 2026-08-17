@@ -77,6 +77,9 @@ a Git citation. The public MCP surface remains deliberately read-only and uses
 `memory_search` with an explicit `scope` when native memory is needed.
 `memory_timeline` is also available for ordered L0/L1 trace inspection; it is
 diagnostic provenance, not repository evidence and cannot promote L2/L3.
+`memory_observe` exposes the same durable trace with an explicit observe
+operation. `memory_reflect` returns a generated, candidate-labelled digest over
+local memory; it is not an accepted fact and must be checked before reuse.
 
 ## Install
 
@@ -215,8 +218,9 @@ memory_supersede   # explicit correction and lifecycle transition
 memory_team_activate # explicit candidate review -> active
 ```
 
-The read-only MCP tools also include `memory_timeline` for the ordered trace
-view described above.
+The read-only MCP tools also include `memory_timeline`, `memory_observe`, and
+`memory_reflect` for the ordered trace and candidate-labelled reflection views
+described above.
 
 Candidate review is explicit. `repository-memory supervise` uses a
 user-configured JSON argv command when one is available; without it the result
@@ -374,6 +378,8 @@ memory_sync
 memory_search
 memory_get
 memory_timeline
+memory_observe
+memory_reflect
 ```
 
 Use the CLI for `init`, `source add`, `ingest-session`, `memory project`,

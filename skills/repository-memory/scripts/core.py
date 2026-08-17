@@ -1397,6 +1397,43 @@ def _memory_timeline(session_id: str | None = None, limit: int = 50) -> dict[str
     return {"schema_version": SCHEMA_VERSION, **value, "freshness": memory, "canonical_repo_changed": False}
 
 
+def _memory_observe(session_id: str | None = None, limit: int = 50) -> dict[str, Any]:
+    """Expose an observe-only trace operation for local memory hosts."""
+
+    view = _memory_view()
+    adapter = Adapter(None, view)
+    client = adapter.native_memory
+    observer = getattr(client, "observe", None)
+    if callable(observer):
+        value = observer(session_id=session_id or None, limit=limit)
+        return {"schema_version": SCHEMA_VERSION, **value, "freshness": adapter.memory_status(), "canonical_repo_changed": False}
+    return _memory_timeline(session_id, limit)
+
+
+def _memory_reflect(query: str = "", limit: int = 8, session_id: str | None = None) -> dict[str, Any]:
+    """Return a generated, candidate-labelled reflection over local memory."""
+
+    view = _memory_view()
+    adapter = Adapter(None, view)
+    client = adapter.native_memory
+    reflector = getattr(client, "reflect", None)
+    if not callable(reflector):
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "ok": False,
+            "operation": "reflect",
+            "status": "unsupported",
+            "generated": False,
+            "accepted": False,
+            "observations": [],
+            "reason": "active memory backend does not expose read-only reflection",
+            "freshness": adapter.memory_status(),
+            "canonical_repo_changed": False,
+        }
+    value = reflector(query=query, limit=limit, session_id=session_id or None)
+    return {"schema_version": SCHEMA_VERSION, **value, "freshness": adapter.memory_status(), "canonical_repo_changed": False}
+
+
 def get_result(
     root: Path | None,
     result_id: str,
@@ -1861,6 +1898,9 @@ def build_parser() -> argparse.ArgumentParser:
     context_parser = common("context"); context_parser.add_argument("query"); context_parser.add_argument("--limit", type=int, default=5); context_parser.add_argument("--repo"); context_parser.add_argument("--issue"); context_parser.add_argument("--branch"); context_parser.add_argument("--agent"); context_parser.add_argument("--local", action="store_true"); context_parser.add_argument("--json", action="store_true")
     supersede_parser = common("supersede"); supersede_parser.add_argument("--id", required=True); supersede_parser.add_argument("--input", required=True); supersede_parser.add_argument("--json", action="store_true")
     timeline_parser = common("memory-timeline"); timeline_parser.add_argument("--session-id"); timeline_parser.add_argument("--limit", type=int, default=50); timeline_parser.add_argument("--json", action="store_true")
+    observe_parser = common("memory-observe"); observe_parser.add_argument("--session-id"); observe_parser.add_argument("--limit", type=int, default=50); observe_parser.add_argument("--json", action="store_true")
+    reflect_parser = common("memory-reflect"); reflect_parser.add_argument("--query", default=""); reflect_parser.add_argument("--session-id"); reflect_parser.add_argument("--limit", type=int, default=8); reflect_parser.add_argument("--json", action="store_true")
+    retain_parser = common("memory-retain"); retain_parser.add_argument("--input", required=True); retain_parser.add_argument("--json", action="store_true")
     ingest_parser = common("ingest-session"); ingest_parser.add_argument("--input", required=True); ingest_parser.add_argument("--json", action="store_true")
     capture_parser = common("capture-turn"); capture_parser.add_argument("--input", required=True); capture_parser.add_argument("--json", action="store_true")
     init_parser = sub.add_parser("init"); init_parser.add_argument("--path", required=True); init_parser.add_argument("--id", dest="source_id"); init_parser.add_argument("--repository"); init_parser.add_argument("--profile"); init_parser.add_argument("--local-only", action="store_true"); init_parser.add_argument("--no-sync", action="store_true"); init_parser.add_argument("--json", action="store_true")
@@ -1956,6 +1996,10 @@ def _mcp_dispatch(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         )
     if name == "memory_timeline":
         return _memory_timeline(str(arguments.get("session_id") or "") or None, int(arguments.get("limit") or 50))
+    if name == "memory_observe":
+        return _memory_observe(str(arguments.get("session_id") or "") or None, int(arguments.get("limit") or 50))
+    if name == "memory_reflect":
+        return _memory_reflect(str(arguments.get("query") or ""), int(arguments.get("limit") or 8), str(arguments.get("session_id") or "") or None)
     if name == "memory_context":
         return memory_context(root, str(arguments.get("query") or ""), limit=int(arguments.get("limit") or 5), source_id=source, repo=str(arguments.get("repo") or "") or None, issue=str(arguments.get("issue") or "") or None, branch=str(arguments.get("branch") or "") or None, agent=str(arguments.get("agent") or "") or None, local=bool(arguments.get("local")))
     if name == "memory_team_sync":
@@ -2026,7 +2070,7 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
                 return _mcp_dispatch(name, arguments)
             return serve(dispatch)
         gate_failed = False
-        root = None if args.command in {"init", "source", "doctor", "sync", "search", "get", "explain", "feedback", "promote", "publish", "team-activate", "team-export", "team-import", "team-evaluate", "team-compact", "supervise", "benchmark", "context", "supersede", "memory-timeline", "ingest-session", "capture-turn", "knowledge", "memmy", "gui", "semantic", "memory", "memorycore"} else resolve_root(root_arg)
+        root = None if args.command in {"init", "source", "doctor", "sync", "search", "get", "explain", "feedback", "promote", "publish", "team-activate", "team-export", "team-import", "team-evaluate", "team-compact", "supervise", "benchmark", "context", "supersede", "memory-timeline", "memory-observe", "memory-reflect", "memory-retain", "ingest-session", "capture-turn", "knowledge", "memmy", "gui", "semantic", "memory", "memorycore"} else resolve_root(root_arg)
         if args.command in {"init", "source"} and root_arg:
             root = resolve_root(root_arg)
         if args.command == "doctor":
@@ -2106,6 +2150,12 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
             value = supersede_memory(args.id, args.input)
         elif args.command == "memory-timeline":
             value = _memory_timeline(args.session_id, args.limit)
+        elif args.command == "memory-observe":
+            value = _memory_observe(args.session_id, args.limit)
+        elif args.command == "memory-reflect":
+            value = _memory_reflect(args.query, args.limit, args.session_id)
+        elif args.command == "memory-retain":
+            value = ingest_session(root if root_arg else None, args.input, getattr(args, "source", None))
         elif args.command == "ingest-session":
             value = ingest_session(root if root_arg else None, args.input, getattr(args, "source", None))
         elif args.command == "capture-turn":

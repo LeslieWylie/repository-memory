@@ -5,13 +5,15 @@ OpenClaw `before_prompt_build` and `agent_end` lifecycle events invoke the
 installed shared `repository-memory` runtime. The first hook performs bounded
 `scope=memory` recall; the second invokes `capture-turn` asynchronously.
 
-When the host exposes `api.registerTool`, the extension also registers four
+When the host exposes `api.registerTool`, the extension also registers six
 native read-only OpenClaw tools:
 
 - `repository_memory_doctor`
 - `repository_memory_search`
 - `repository_memory_get`
 - `repository_memory_timeline`
+- `repository_memory_observe`
+- `repository_memory_reflect`
 
 They delegate to the same CLI runtime as MCP, so the plugin does not create a
 second ranking or storage implementation. The extension also observes
@@ -45,6 +47,11 @@ The write contract is deliberately conservative:
 3. the native L1 extraction is observed as `verified` or `pending`;
 4. durable-looking turns create an L2 `candidate` scenario with provenance;
 5. L3 is never written by the hook. Promotion remains an explicit operation.
+
+`repository_memory_observe` is a raw, ordered provenance view.  The
+`repository_memory_reflect` tool is a bounded, generated digest over local
+memory and is always labelled `candidate`; it is a convenience for the
+Hindsight-style retain/recall/reflect workflow, not a new fact authority.
 
 The extension does not replace an existing OpenClaw memory slot and does not
 expose a write MCP tool to the model. Configure `agentIds` when only selected

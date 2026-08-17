@@ -136,7 +136,7 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(value["document_count"], len(value["documents"]))
         self.assertGreaterEqual(value["text_bytes"], 0)
         self.assertGreater(value["index_bytes"], 0)
-        self.assertEqual(VERSION, "0.7.12")
+        self.assertEqual(VERSION, "0.7.13")
 
     def test_multisource_search_has_verified_and_candidates(self):
         result = core.search(None, "Atlas evidence", limit=5)
@@ -708,7 +708,7 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(responses[0]["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "repository-memory")
         self.assertEqual(responses[0]["result"]["resultType"], "complete")
         self.assertEqual(responses[1]["result"]["resultType"], "complete")
-        self.assertEqual({tool["name"] for tool in responses[1]["result"]["tools"]}, {"memory_doctor", "memory_sync", "memory_search", "memory_get", "memory_timeline"})
+        self.assertEqual({tool["name"] for tool in responses[1]["result"]["tools"]}, {"memory_doctor", "memory_sync", "memory_search", "memory_get", "memory_timeline", "memory_observe", "memory_reflect"})
         payload = responses[2]["result"]["structuredContent"]
         self.assertEqual(responses[2]["result"]["resultType"], "complete")
         self.assertIn("verified", payload)
@@ -1334,6 +1334,8 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertIn("repository_memory_doctor", alpha["tools"]["alsoAllow"])
         self.assertIn("repository_memory_get", alpha["tools"]["alsoAllow"])
         self.assertIn("repository_memory_timeline", alpha["tools"]["alsoAllow"])
+        self.assertIn("repository_memory_observe", alpha["tools"]["alsoAllow"])
+        self.assertIn("repository_memory_reflect", alpha["tools"]["alsoAllow"])
         self.assertNotIn("repository-memory__memory_context", alpha["tools"]["alsoAllow"])
         self.assertNotIn("repository-memory__memory_publish", alpha["tools"]["alsoAllow"])
         self.assertNotIn("repository-memory", beta.get("skills", []))
@@ -1469,6 +1471,58 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertTrue(timeline["ok"])
         self.assertGreaterEqual(timeline["count"], 2)
         self.assertEqual({event["layer"] for event in timeline["events"]}, {"L0", "L1"})
+
+        observed = core._mcp_dispatch("memory_observe", {"session_id": "local-session"})
+        self.assertTrue(observed["ok"])
+        self.assertEqual(observed["operation"], "observe")
+        reflection = core._mcp_dispatch("memory_reflect", {"query": "portable local memory", "limit": 3})
+        self.assertTrue(reflection["ok"])
+        self.assertEqual(reflection["operation"], "reflect")
+        self.assertEqual(reflection["status"], "candidate")
+        self.assertTrue(reflection["generated"])
+        self.assertFalse(reflection["accepted"])
+
+    def test_standalone_memory_links_are_explicit_and_mmr_is_explainable(self):
+        self.write_config({})
+        os.environ["REPOSITORY_MEMORY_AUTODISCOVER"] = "0"
+        from standalone_memory import standalone_memory_client
+
+        client = standalone_memory_client()
+        connection = client._connect()
+        try:
+            client._upsert(
+                connection,
+                record_id="local:L1:source-a",
+                layer="L1",
+                session_id="episode-a",
+                message_index=0,
+                role="assistant",
+                content="explicit source evidence for a durable policy",
+                metadata={},
+            )
+            client._upsert(
+                connection,
+                record_id="local:L2:policy-a",
+                layer="L2",
+                session_id="policy/a",
+                message_index=-1,
+                role="system",
+                content="durable policy derived from explicit source evidence",
+                metadata={"source_record_ids": ["local:L1:source-a"]},
+                status="accepted",
+                generated=False,
+                accepted=True,
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        hits = client.search("durable policy", limit=3)
+        self.assertTrue(hits)
+        self.assertTrue(all(item["ranking"]["mmr"] for item in hits))
+        policy = next(item for item in hits if item["id"] == "local:L2:policy-a")
+        self.assertEqual(policy["related"][0]["id"], "local:L1:source-a")
+        fetched = client.get("local:L2:policy-a")
+        self.assertEqual(fetched["memory"]["related"][0]["relation"], "supports")
 
     def test_standalone_runtime_proves_four_layer_lifecycle_without_services(self):
         """The default install must not need a gateway or a vendor process."""

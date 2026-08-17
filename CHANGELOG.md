@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.13
+
+- Add explicit read-only `observe` and candidate-labelled `reflect` operations
+  to the standalone runtime, CLI, MCP, and native OpenClaw tools.
+- Add deterministic local-memory recency decay and MMR diversity selection;
+  relevance remains dominant and the ranking features are returned for audit.
+- Add an explicit-memory `memory_links` table for one-hop provenance and
+  relationship citations. It is derived from IDs already present in metadata,
+  never inferred from vector similarity or a graph service.
+- Extend the installer and selected-agent allowlists for the two native tools.
+
 ## 0.7.12
 
 - Increase the OpenClaw native plugin's default runtime timeout to 60 seconds.

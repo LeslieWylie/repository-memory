@@ -95,6 +95,14 @@ _LATEST_QUERY = re.compile(
     re.IGNORECASE,
 )
 
+# These are intentionally conservative defaults.  They are exposed in the
+# result diagnostics rather than hidden behind a provider-specific reranker.
+# The goal is to keep relevant evidence first while suppressing repeated
+# copies of the same turn, which is the useful part of MMR for a local store.
+_MMR_RELEVANCE_WEIGHT = 0.82
+_MMR_DIVERSITY_WEIGHT = 0.18
+_RECENCY_HALF_LIFE_DAYS = 14.0
+
 
 def _terms(query: str) -> list[str]:
     return [
@@ -197,6 +205,18 @@ class StandaloneMemoryClient:
                 delta REAL NOT NULL
             )"""
         )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS memory_links (
+                source_id TEXT NOT NULL,
+                target_id TEXT NOT NULL,
+                relation TEXT NOT NULL,
+                metadata TEXT NOT NULL DEFAULT '{}',
+                created_at REAL NOT NULL,
+                PRIMARY KEY(source_id, target_id, relation)
+            )"""
+        )
+        connection.execute("CREATE INDEX IF NOT EXISTS memory_links_source_idx ON memory_links(source_id)")
+        connection.execute("CREATE INDEX IF NOT EXISTS memory_links_target_idx ON memory_links(target_id)")
         try:
             connection.execute("CREATE VIRTUAL TABLE IF NOT EXISTS records_fts USING fts5(id UNINDEXED, content)")
         except sqlite3.OperationalError:
@@ -515,6 +535,99 @@ class StandaloneMemoryClient:
         if self._fts(connection):
             connection.execute("DELETE FROM records_fts WHERE id = ?", (record_id,))
             connection.execute("INSERT INTO records_fts (id, content) VALUES (?, ?)", (record_id, content))
+        self._sync_links(connection, record_id, metadata or {})
+
+    @staticmethod
+    def _sync_links(connection: sqlite3.Connection, record_id: str, metadata: dict[str, Any]) -> None:
+        """Persist only explicit provenance/relationship edges.
+
+        This is the lightweight Cognee-style graph seam: links are derived from
+        IDs already present in metadata, never guessed from embedding
+        similarity.  Replaying an ingest is therefore idempotent and every
+        edge remains explainable through its source and target records.
+        """
+
+        relation_sets = (
+            ("source_record_ids", "supports", "source"),
+            ("related_ids", "related", "related"),
+        )
+        for field, relation, direction in relation_sets:
+            values = metadata.get(field)
+            if not isinstance(values, list):
+                continue
+            for value in values:
+                other = str(value or "").strip()
+                if not other or other == record_id:
+                    continue
+                source_id, target_id = (other, record_id) if direction == "source" else (record_id, other)
+                connection.execute(
+                    "INSERT OR IGNORE INTO memory_links(source_id,target_id,relation,metadata,created_at) VALUES(?,?,?,?,?)",
+                    (source_id, target_id, relation, json.dumps({"field": field}, sort_keys=True), time.time()),
+                )
+
+    @staticmethod
+    def _related(connection: sqlite3.Connection, record_id: str, limit: int = 8) -> list[dict[str, Any]]:
+        rows = connection.execute(
+            """SELECT l.relation, CASE WHEN l.source_id=? THEN l.target_id ELSE l.source_id END AS related_id,
+                      r.layer, r.content, r.session_id
+               FROM memory_links l
+               LEFT JOIN records r ON r.id = CASE WHEN l.source_id=? THEN l.target_id ELSE l.source_id END
+               WHERE (l.source_id=? OR l.target_id=?)
+               ORDER BY l.created_at DESC
+               LIMIT ?""",
+            (record_id, record_id, record_id, record_id, max(1, min(int(limit), 20))),
+        ).fetchall()
+        return [
+            {
+                "id": str(row["related_id"]),
+                "relation": str(row["relation"]),
+                "layer": str(row["layer"] or "unknown"),
+                "excerpt": str(row["content"] or "")[:512],
+                "session_id": str(row["session_id"] or ""),
+                "citation_valid": bool(row["content"]),
+            }
+            for row in rows
+        ]
+
+    @staticmethod
+    def _recency_score(row: sqlite3.Row, *, now: float, latest_requested: bool) -> float:
+        epoch = epoch_from_timestamp(row["timestamp"]) or float(row["updated_at"] or now)
+        age_days = max(0.0, (now - epoch) / 86400.0)
+        decay = 0.5 ** (age_days / _RECENCY_HALF_LIFE_DAYS)
+        # Normal queries get only a small freshness tie-break; explicit latest
+        # queries get the full signal while relevance remains dominant.
+        return decay * (0.32 if latest_requested else 0.08)
+
+    @staticmethod
+    def _mmr_select(candidates: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+        """Select relevant but non-duplicate memories with deterministic MMR."""
+
+        remaining = list(candidates)
+        selected: list[dict[str, Any]] = []
+        while remaining and len(selected) < max(1, int(limit)):
+            best_index = 0
+            best_value = float("-inf")
+            for index, candidate in enumerate(remaining):
+                relevance = float(candidate.get("_relevance", 0.0))
+                redundancy = 0.0
+                vector = candidate.get("_vector")
+                if selected and vector is not None:
+                    redundancy = max(
+                        cosine(vector, chosen.get("_vector"))
+                        for chosen in selected
+                        if chosen.get("_vector") is not None
+                    )
+                value = _MMR_RELEVANCE_WEIGHT * relevance - _MMR_DIVERSITY_WEIGHT * redundancy
+                marker = str(candidate.get("id") or "")
+                best_marker = str(remaining[best_index].get("id") or "")
+                if value > best_value or (value == best_value and marker < best_marker):
+                    best_index, best_value = index, value
+            selected.append(remaining.pop(best_index))
+        for item in selected:
+            item["relevance"] = item.get("_relevance", 0.0)
+            item.pop("_vector", None)
+            item.pop("_relevance", None)
+        return selected
 
     def ingest(self, input_path: Path) -> dict[str, Any]:
         payload = _payload(input_path)
@@ -717,6 +830,8 @@ class StandaloneMemoryClient:
     def search(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
         terms = list(dict.fromkeys(_terms(query)))
         query_vector = vectorize(query)
+        latest_requested = bool(_LATEST_QUERY.search(query))
+        now = time.time()
         ranked = []
         for row in self._rows(query, limit):
             content = str(row["content"])
@@ -727,12 +842,44 @@ class StandaloneMemoryClient:
             layer = str(row["layer"])
             bonus = {"L3": 0.45, "L2": 0.35, "L1": 0.2, "L0": 0.0}.get(layer, 0.0)
             lexical_score = min(0.65, len(matched) * 0.16)
-            score = semantic_score + lexical_score + bonus
-            ranked.append((score, str(row["id"]), row, matched, semantic_score))
-        ranked.sort(key=lambda item: (-item[0], item[1]))
-        return [self._result(row, matched, semantic_score) for _score, _id, row, matched, semantic_score in ranked[: max(1, int(limit))]]
+            recency_score = self._recency_score(row, now=now, latest_requested=latest_requested)
+            feedback_score = max(-0.2, min(0.2, float(row["priority"] or 0.0) * 0.12))
+            relevance = semantic_score + lexical_score + bonus + recency_score + feedback_score
+            ranked.append({
+                "id": str(row["id"]),
+                "row": row,
+                "matched": matched,
+                "semantic_score": semantic_score,
+                "recency_score": recency_score,
+                "_relevance": relevance,
+                "_vector": unpack(row["embedding"], int(row["embedding_dim"] or EMBEDDING_DIMENSION)),
+            })
+        ranked.sort(key=lambda item: (-float(item["_relevance"]), str(item["id"])))
+        selected = self._mmr_select(ranked[: max(20, int(limit) * 8)], limit)
+        results = []
+        connection = self._connect()
+        try:
+            for item in selected:
+                row = item["row"]
+                result = self._result(
+                    row,
+                    item["matched"],
+                    item["semantic_score"],
+                    recency_score=item["recency_score"],
+                    related=self._related(connection, str(row["id"])),
+                )
+                result["ranking"] = {
+                    "relevance": round(float(item.get("relevance", 0.0)), 6),
+                    "recency": round(float(item.get("recency_score", 0.0)), 6),
+                    "mmr": True,
+                    "latest_query": latest_requested,
+                }
+                results.append(result)
+        finally:
+            connection.close()
+        return results
 
-    def _result(self, row: sqlite3.Row, matched: list[str], semantic_score: float = 0.0) -> dict[str, Any]:
+    def _result(self, row: sqlite3.Row, matched: list[str], semantic_score: float = 0.0, *, recency_score: float = 0.0, related: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         record_id = str(row["id"])
         layer = str(row["layer"])
         content = str(row["content"])
@@ -762,7 +909,9 @@ class StandaloneMemoryClient:
             "accepted": accepted,
             "score": round(semantic_score + min(0.65, len(matched) * 0.16), 6),
             "semantic_score": round(semantic_score, 6),
+            "recency_score": round(recency_score, 6),
             "retrieval_mode": "local-hybrid",
+            "related": related if related is not None else [],
             "updated_at": row["updated_at"],
             "_native_memory": True,
             "_memory_backend": self.backend,
@@ -783,6 +932,7 @@ class StandaloneMemoryClient:
         connection = self._connect()
         try:
             row = connection.execute("SELECT * FROM records WHERE id = ?", (result_id,)).fetchone()
+            related = self._related(connection, result_id) if row is not None else []
         finally:
             connection.close()
         if row is None:
@@ -797,9 +947,51 @@ class StandaloneMemoryClient:
             "ref_kind": {"L0": "conversation", "L1": "trace", "L2": "policy", "L3": "world_model"}.get(layer, "memory"),
             "ref_id": result_id,
             "status": str(row["status"]),
-            "memory": {"session_id": row["session_id"], "message_index": row["message_index"], "role": row["role"], "content": content, "timestamp": row["timestamp"], "metadata": row["metadata"], "status": str(row["status"]), "accepted": accepted},
+            "memory": {"session_id": row["session_id"], "message_index": row["message_index"], "role": row["role"], "content": content, "timestamp": row["timestamp"], "metadata": row["metadata"], "status": str(row["status"]), "accepted": accepted, "related": related},
             "citation": {"source": self.backend, "memory_id": result_id, "layer": layer, "evidence": content, "locator": {"layer": layer, "memory_id": result_id}, "valid": True, "generated": bool(row["generated"]), "accepted": accepted},
             "readback": {"verified": True, "status": "verified", "backend": self.backend, "id": result_id},
+        }
+
+    def observe(self, session_id: str | None = None, limit: int = 50) -> dict[str, Any]:
+        """Read the durable trace without ranking or generating conclusions."""
+
+        return {"operation": "observe", **self.timeline(session_id=session_id, limit=limit)}
+
+    def reflect(self, query: str = "", limit: int = 8, session_id: str | None = None) -> dict[str, Any]:
+        """Produce a bounded, explicitly generated reflection over memory.
+
+        This is intentionally read-only and candidate-labelled.  It gives
+        hosts a Hindsight-style reflect operation without pretending that a
+        rule-based digest is an accepted L2/L3 fact or requiring an LLM.
+        """
+
+        records = self.search(query, limit=max(1, min(int(limit), 20))) if query else []
+        if session_id:
+            records = [item for item in records if str((item.get("citation") or {}).get("provenance", {}).get("session_id") or "") == session_id]
+        observations = [
+            {
+                "id": item.get("id"),
+                "layer": item.get("memory_layer"),
+                "observation": str(item.get("content") or "")[:512],
+                "evidence_status": item.get("status"),
+                "citation": item.get("citation"),
+            }
+            for item in records
+        ]
+        return {
+            "schema_version": 1,
+            "ok": True,
+            "operation": "reflect",
+            "backend": self.backend,
+            "query": query,
+            "status": "candidate" if observations else "empty",
+            "generated": True,
+            "accepted": False,
+            "observations": observations,
+            "evidence_count": len(observations),
+            "limitations": ["rule-based digest", "must not be promoted without review"],
+            "readback": {"verified": True, "backend": self.backend, "source_ids": [item.get("id") for item in observations]},
+            "canonical_repo_changed": False,
         }
 
     def observe_l1(self, session_id: str, limit: int = 100, not_before: str | None = None) -> dict[str, Any]:

@@ -22,6 +22,8 @@ repository-memory__memory_sync
 repository-memory__memory_search
 repository-memory__memory_get
 repository-memory__memory_timeline
+repository-memory__memory_observe
+repository-memory__memory_reflect
 ```
 
 The exact namespace is host-defined. A bare `memory_search` may belong to a
@@ -70,6 +72,11 @@ After search:
 Use `memory_timeline` only when the user asks how a conversation memory was
 formed or when diagnosing L0/L1 capture. It is provenance for the memory lane,
 not a Git citation and not a reason to promote L2/L3.
+
+Use `memory_observe` for an ordered, raw local-memory trace. Use
+`memory_reflect` only when a bounded derived summary is useful; its output is
+always generated/candidate-labelled and must not be treated as an accepted
+fact without inspecting its evidence and lifecycle status.
 
 `verified` means the runtime checked a citation or a stable memory
 layer/identifier. It does not mean one excerpt proves every part of a

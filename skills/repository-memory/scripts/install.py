@@ -59,6 +59,8 @@ MCP_TOOLS = [
     "memory_search",
     "memory_get",
     "memory_timeline",
+    "memory_observe",
+    "memory_reflect",
 ]
 OPENCLAW_TOOLS = [f"{MCP_NAME}__{name}" for name in MCP_TOOLS]
 # MemOS-style native OpenClaw tools are registered by the plugin itself.  They
@@ -70,6 +72,8 @@ NATIVE_OPENCLAW_TOOLS = [
     "repository_memory_search",
     "repository_memory_get",
     "repository_memory_timeline",
+    "repository_memory_observe",
+    "repository_memory_reflect",
 ]
 
 

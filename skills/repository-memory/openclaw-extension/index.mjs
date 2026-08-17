@@ -500,6 +500,15 @@ const TIMELINE_PARAMETERS = {
   },
   additionalProperties: false,
 };
+const REFLECT_PARAMETERS = {
+  type: "object",
+  properties: {
+    query: { type: "string", description: "Optional memory query; keep the user's wording." },
+    session_id: { type: "string" },
+    limit: { type: "integer", minimum: 1, maximum: 20, default: 8 },
+  },
+  additionalProperties: false,
+};
 
 function registerNativeTools(api, cfg) {
   if (cfg.nativeTools === false || typeof api.registerTool !== "function") return;
@@ -542,6 +551,18 @@ function registerNativeTools(api, cfg) {
     "Read ordered L0/L1 capture provenance for a session. This is memory provenance, not a Git citation. Read-only.",
     TIMELINE_PARAMETERS,
     (input) => ["memory-timeline", "--session-id", String(input.session_id || ""), "--limit", String(Math.max(1, Math.min(500, Number(input.limit) || 50))), "--json"],
+  );
+  register(
+    "repository_memory_observe",
+    "Observe durable local memory provenance without ranking or generating a conclusion. Read-only.",
+    TIMELINE_PARAMETERS,
+    (input) => ["memory-observe", "--session-id", String(input.session_id || ""), "--limit", String(Math.max(1, Math.min(500, Number(input.limit) || 50))), "--json"],
+  );
+  register(
+    "repository_memory_reflect",
+    "Generate a bounded candidate-labelled reflection over local memory. It is not an accepted fact and must be checked before reuse.",
+    REFLECT_PARAMETERS,
+    (input) => ["memory-reflect", "--query", String(input.query || ""), "--session-id", String(input.session_id || ""), "--limit", String(Math.max(1, Math.min(20, Number(input.limit) || 8))), "--json"],
   );
 }
 
@@ -787,14 +808,14 @@ export default {
       api.on("before_tool_call", async (event, ctx) => {
         if (!isAllowedAgent(cfg, ctx)) return;
         const toolName = optional(event?.toolName) || "unknown";
-        if (repoTool(cfg, toolName, "memory_doctor") || repoTool(cfg, toolName, "memory_search") || repoTool(cfg, toolName, "memory_get") || repoTool(cfg, toolName, "memory_timeline")) {
+        if (repoTool(cfg, toolName, "memory_doctor") || repoTool(cfg, toolName, "memory_search") || repoTool(cfg, toolName, "memory_get") || repoTool(cfg, toolName, "memory_timeline") || repoTool(cfg, toolName, "memory_observe") || repoTool(cfg, toolName, "memory_reflect")) {
           await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "tool_observed", tool: toolName, phase: "before" });
         }
       }, { priority: 100, timeoutMs: 5000 });
       api.on("after_tool_call", async (event, ctx) => {
         if (!isAllowedAgent(cfg, ctx)) return;
         const toolName = optional(event?.toolName) || "unknown";
-        if (repoTool(cfg, toolName, "memory_doctor") || repoTool(cfg, toolName, "memory_search") || repoTool(cfg, toolName, "memory_get") || repoTool(cfg, toolName, "memory_timeline")) {
+        if (repoTool(cfg, toolName, "memory_doctor") || repoTool(cfg, toolName, "memory_search") || repoTool(cfg, toolName, "memory_get") || repoTool(cfg, toolName, "memory_timeline") || repoTool(cfg, toolName, "memory_observe") || repoTool(cfg, toolName, "memory_reflect")) {
           const counts = resultCounts(event?.result ?? event?.output ?? event?.resultText);
           await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "tool_observed", tool: toolName, phase: "after", outcome: event?.error ? "error" : "completed", verified: counts.verified, citations: counts.citations, freshness: counts.freshness, latency_ms: numeric(event?.durationMs) });
         }

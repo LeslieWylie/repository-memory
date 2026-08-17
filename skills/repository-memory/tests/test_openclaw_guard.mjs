@@ -261,7 +261,7 @@ const nativeApi = {
   },
 };
 plugin.register(nativeApi);
-for (const name of ["repository_memory_doctor", "repository_memory_search", "repository_memory_get", "repository_memory_timeline"]) {
+for (const name of ["repository_memory_doctor", "repository_memory_search", "repository_memory_get", "repository_memory_timeline", "repository_memory_observe", "repository_memory_reflect"]) {
   assert.equal(nativeTools.has(name), true, `native tool ${name} should be registered`);
 }
 for (const name of ["before_prompt_build", "before_agent_run", "agent_end", "session_start", "session_end", "tool_result_persist", "before_tool_call", "after_tool_call"]) {
@@ -272,5 +272,9 @@ assert.equal(nativeSearch.isError, undefined);
 assert.match(nativeSearch.content[0].text, /accepted profile context/);
 const nativeTimeline = await nativeTools.get("repository_memory_timeline").execute("call-2", { session_id: "native-session" });
 assert.equal(nativeTimeline.isError, undefined);
+const nativeObserve = await nativeTools.get("repository_memory_observe").execute("call-3", { session_id: "native-session" });
+assert.equal(nativeObserve.isError, undefined);
+const nativeReflect = await nativeTools.get("repository_memory_reflect").execute("call-4", { query: "memory" });
+assert.equal(nativeReflect.isError, undefined);
 
 console.log("openclaw guard ok");

@@ -6,7 +6,7 @@ optional process boundaries, not dependencies of the public package.
 An implementation exposes JSON operations with the same names as the CLI:
 
 ```text
-doctor  sync  search  get  timeline  feedback  promote
+ doctor  sync  search  get  timeline  observe  reflect  feedback  promote
 ```
 
 Provider responses should preserve the source result and include:

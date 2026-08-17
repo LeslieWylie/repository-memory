@@ -7,7 +7,7 @@ plugin a required dependency.
 Host (OpenClaw / Claude / Codex)
         |
         +-- Skill: instructions and evidence policy
-        +-- MCP: memory_doctor / sync / search / get / timeline
+        +-- MCP: memory_doctor / sync / search / get / timeline / observe / reflect
         +-- OpenClaw lifecycle extension: recall + capture + audit
         |
         +-- Python runtime
@@ -45,6 +45,8 @@ L0 conversation/trace
 `memory_timeline` is diagnostic only. It does not promote a trace, and it
 does not turn an L0/L1 conversation into Git evidence. `memory_search` keeps
 the repository, local memory, and `scope=all` groups separate.
+`memory_observe` is an ordered raw trace; `memory_reflect` is a generated,
+candidate-labelled digest and never an accepted fact.
 
 ## OpenClaw installation
 

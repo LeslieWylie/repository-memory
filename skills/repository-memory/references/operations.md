@@ -57,6 +57,8 @@ repository-memory team-export --output <bundle.json> --json
 repository-memory team-import --input <bundle.json> --json
 repository-memory team-activate --id <team-memory-id> [--reviewer <agent>] --json
 repository-memory memory promote-l3 --candidate <autocapture:L2:id> --accept --json
+repository-memory memory-observe --session-id <id> --limit N --json
+repository-memory memory-reflect --query "..." [--session-id <id>] --limit N --json
 repository-memory evaluate --queries <queries.jsonl> --qrels <qrels.jsonl> [--revision <commit>] [--scope repository|memory|all] --json
 repository-memory semantic status --json
 repository-memory semantic configure --model <hugging-face-model-id> [--download] --json
@@ -84,6 +86,9 @@ memory_doctor
 memory_sync
 memory_search
 memory_get
+memory_timeline
+memory_observe
+memory_reflect
 ```
 
 Use the CLI `init`, `source add`, `ingest-session`, `feedback`, `promote`, and

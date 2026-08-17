@@ -11,7 +11,7 @@ silently become a second runtime or a second canonical source.
 | [TencentDB Agent Memory](https://github.com/Tencent/TencentDB-Agent-Memory) | `97f94654280b2932c35ba4806a491999ed244cc9` | MIT | Layer lifecycle and explicit read-back discipline | TencentDB service, Wiki/TCVDB and its memory slot |
 | [Mem0](https://github.com/mem0ai/mem0) | `001c235229be8795e3834520467bd0d661ed8f34` | Apache-2.0 | Small provider boundary and feedback-oriented API shape | Hosted/vector database defaults and a competing memory authority |
 | [MemPalace](https://github.com/MemPalace/mempalace) | `639c69a1d6be41a04964ceb72a3d29d6f45629e9` | MIT | Local-first retention and original-record preservation ideas | Its server deployment and unrelated personal-memory semantics |
-| [Hindsight](https://github.com/vectorize-io/hindsight) | `ec9cc702ec55898bcac0db9c9e598305772ad7ad` | MIT | Retention/recall concepts are reference material only | No code copied into the runtime |
+| [Hindsight](https://github.com/vectorize-io/hindsight) | `b919b97df37705e87f8583e9224777707a033cd4` | MIT | Retention/recall concepts are reference material only | No code copied into the runtime |
 
 ## Decision
 
@@ -24,6 +24,11 @@ The first concrete reuse is in the standalone runtime:
 
 - results expose `tier`, `ref_kind`, `ref_id`, and bounded `snippet` fields;
 - `memory_timeline` exposes an ordered L0/L1 trace for diagnosis and replay;
+- `memory_observe` and `memory_reflect` expose the retain/recall/reflect/observe
+  split as explicit operations; reflection is always generated/candidate and
+  never accepted automatically;
+- standalone local recall uses deterministic recency decay plus MMR-style
+  diversity selection, with ranking features returned for audit;
 - L2 is labelled `policy`, and L3 is labelled `world_model`, while the
   canonical L0/L1/L2/L3 names remain unchanged;
 - all of this is local SQLite and does not require a daemon or model download.
@@ -41,12 +46,16 @@ left as adapter promises:
   session, version and read-back fields; feedback remains explicit and does not
   silently rewrite a fact.
 - Hindsight's separation between retention, recall and reflection is reflected
-  in separate `ingest-session`, `search`, `timeline` and supervisor paths.
+  in separate `memory-retain`, `search`, `memory-observe`, `memory-reflect`,
+  and supervisor paths.
   Reflection/supervision remains optional and cannot auto-accept L2/L3.
 - Cognee's explainable relationship idea is implemented as a tiny derived graph:
   Markdown links and explicit local file references are indexed, relationship
   queries expand one hop, and results expose `related` citations. There is no
   graph server and no inferred edge pretending to be evidence.
+- The same graph seam now exists for native local memory: only explicit
+  `source_record_ids`/`related_ids` metadata creates `memory_links`, and
+  `get/search` returns the one-hop relation for inspection.
 - Mem0-style identity/session/run scoping and deduplication are retained in the
   standalone memory and team-memory stores.
 - TencentDB's layer readiness versus population/read-back distinction is kept
