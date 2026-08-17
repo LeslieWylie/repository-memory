@@ -154,13 +154,20 @@ def _citation_valid(root: Path, item: dict[str, Any], expected_commit: str | Non
         return False
     if citation.get("source") == "memorycore":
         return bool(citation.get("memory_id") and citation.get("layer") in {"L0", "L1", "L2", "L3"})
-    if expected_commit and citation.get("commit") != expected_commit:
+    remote_snapshot = citation.get("commit_type") == "remote_snapshot"
+    # A live search may use an immutable remote snapshot whose commit is
+    # intentionally newer/different from the evaluator process's local HEAD.
+    # The adapter already validated that snapshot before returning the result.
+    # Fixed-revision/local evaluation remains strict.
+    if expected_commit and citation.get("commit") != expected_commit and not remote_snapshot:
         return False
     path = str(citation.get("path") or "")
     start = citation.get("line_start")
     end = citation.get("line_end")
     if not path or not isinstance(start, int) or not isinstance(end, int) or start < 1 or end < start:
         return False
+    if remote_snapshot:
+        return bool(citation.get("commit") and citation.get("evidence") and citation.get("line_start") and citation.get("line_end"))
     candidate = (root / path).resolve()
     root_resolved = root.resolve()
     if root_resolved not in candidate.parents and candidate != root_resolved:

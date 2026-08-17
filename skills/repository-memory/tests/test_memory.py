@@ -136,7 +136,7 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(value["document_count"], len(value["documents"]))
         self.assertGreaterEqual(value["text_bytes"], 0)
         self.assertGreater(value["index_bytes"], 0)
-        self.assertEqual(VERSION, "0.7.10")
+        self.assertEqual(VERSION, "0.7.11")
 
     def test_multisource_search_has_verified_and_candidates(self):
         result = core.search(None, "Atlas evidence", limit=5)
@@ -862,6 +862,11 @@ class RepositoryMemoryTest(unittest.TestCase):
         with patch("evaluate.search", return_value={"verified": [mismatched], "candidates": [], "abstain": False, "mode": "exact"}):
             mismatched_report = evaluate_queries(self.alpha, queries, qrels, local=True)
         self.assertEqual(mismatched_report["citation_parseability"], 0.0)
+
+        remote = {**verified, "citation": {**verified["citation"], "commit": "remote-commit", "commit_type": "remote_snapshot", "evidence": "Atlas evidence"}}
+        with patch("evaluate.search", return_value={"verified": [remote], "candidates": [], "abstain": False, "mode": "exact"}):
+            remote_report = evaluate_queries(self.alpha, queries, qrels, local=False)
+        self.assertEqual(remote_report["citation_parseability"], 1.0)
 
     def test_memory_layer_metadata_is_preserved_but_citation_still_controls_verification(self):
         view = prepare_view(SourceSpec("alpha", self.alpha, "alpha"), local=True)

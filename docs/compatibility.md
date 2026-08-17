@@ -4,7 +4,7 @@ There are two different version numbers in this project:
 
 | Surface | Current value | Meaning |
 | --- | --- | --- |
-| Repository Memory release | `0.7.10` | The Python project, standalone SQLite/vector L0-L3 runtime, MemOS-inspired episode/feedback/policy lifecycle, citation-first index, installer, MCP server, native OpenClaw lifecycle/tools, provider contract, supervisor, benchmark runner and AML Add/Search wrapper. |
+| Repository Memory release | `0.7.11` | The Python project, standalone SQLite/vector L0-L3 runtime, MemOS-inspired episode/feedback/policy lifecycle, citation-first index, installer, MCP server, native OpenClaw lifecycle/tools, provider contract, supervisor, benchmark runner and AML Add/Search wrapper. |
 | MCP protocol | `2026-07-28` | The wire-level protocol revision negotiated with a host. |
 
 The release version is stored in
