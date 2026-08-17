@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import sqlite3
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -33,12 +34,59 @@ def index_path(view: SourceView, deep: bool = False) -> Path:
     return cache_root() / "indexes" / fingerprint(view.spec) / f"{_revision_key(view, deep)}.json"
 
 
+def fts_path(view: SourceView, deep: bool = False) -> Path:
+    return Path(f"{index_path(view, deep)}.fts.sqlite3")
+
+
 def _load(path: Path) -> dict[str, Any] | None:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     return value if isinstance(value, dict) and value.get("schema_version") == SCHEMA_VERSION and isinstance(value.get("documents"), list) else None
+
+
+def _ensure_fts(destination: Path, documents: list[dict[str, Any]]) -> Path:
+    """Build a disposable trigram candidate index for large repositories."""
+
+    database = Path(f"{destination}.fts.sqlite3")
+    if database.exists():
+        try:
+            connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+            try:
+                connection.execute("SELECT 1 FROM paths LIMIT 1").fetchone()
+            finally:
+                connection.close()
+            return database
+        except sqlite3.Error:
+            # Replace an older, content-bearing cache with the compact format
+            # below. It is derived state and can always be rebuilt from JSON.
+            pass
+    temporary = Path(tempfile.mkdtemp(prefix="fts-", dir=destination.parent)) / database.name
+    try:
+        connection = sqlite3.connect(temporary)
+        try:
+            # Contentless FTS stores only the trigram index. The source text is
+            # already in the JSON cache and is never returned from this
+            # candidate index; ``paths`` maps FTS rowids back to source paths.
+            connection.execute("CREATE TABLE paths(rowid INTEGER PRIMARY KEY, path TEXT NOT NULL)")
+            connection.execute("CREATE VIRTUAL TABLE documents USING fts5(text, tokenize='trigram', content='')")
+            connection.executemany(
+                "INSERT INTO paths(rowid, path) VALUES (?, ?)",
+                ((rowid, str(item.get("path") or "")) for rowid, item in enumerate(documents, 1) if item.get("path")),
+            )
+            connection.executemany(
+                "INSERT INTO documents(rowid, text) VALUES (?, ?)",
+                ((rowid, str(item.get("text") or "")) for rowid, item in enumerate(documents, 1) if item.get("path")),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        os.replace(temporary, database)
+    finally:
+        temporary.unlink(missing_ok=True)
+        temporary.parent.rmdir()
+    return database
 
 
 def build(view: SourceView, deep: bool = False) -> dict[str, Any]:
@@ -70,6 +118,8 @@ def build(view: SourceView, deep: bool = False) -> dict[str, Any]:
         os.replace(temporary, destination)
     finally:
         Path(temporary).unlink(missing_ok=True)
+    if len(documents) >= 5000:
+        value["fts_path"] = str(_ensure_fts(destination, documents))
     return value
 
 
@@ -81,6 +131,8 @@ def ensure(view: SourceView, deep: bool = False) -> dict[str, Any]:
         return build(view, deep)
     value = _load(destination) if destination.exists() else None
     if value and value.get("commit") == view.commit and bool(value.get("deep")) == deep:
+        if len(value.get("documents", [])) >= 5000:
+            value["fts_path"] = str(_ensure_fts(destination, value["documents"]))
         return value
     return build(view, deep)
 

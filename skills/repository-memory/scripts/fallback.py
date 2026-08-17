@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import math
 import re
+import sqlite3
 from functools import lru_cache
 from itertools import pairwise
 from pathlib import Path
@@ -288,6 +289,29 @@ def _read_document(root: Path, relative: str, mtime_ns: int, size: int) -> str:
     return (root / relative).read_text(encoding="utf-8")
 
 
+def _fts_candidates(indexed: dict[str, Any] | None, terms: list[str], limit: int = 2048) -> set[str] | None:
+    """Return a bounded lexical candidate set for large cached indexes."""
+
+    if not isinstance(indexed, dict) or not indexed.get("fts_path"):
+        return None
+    usable = [term.replace('"', '""') for term in terms if len(term) >= 3]
+    if not usable:
+        return None
+    expression = " OR ".join(f'"{term}"' for term in usable)
+    try:
+        connection = sqlite3.connect(f"file:{indexed['fts_path']}?mode=ro", uri=True)
+        try:
+            rows = connection.execute(
+                "SELECT paths.path FROM documents JOIN paths ON paths.rowid = documents.rowid WHERE documents MATCH ? LIMIT ?",
+                (expression, int(limit)),
+            ).fetchall()
+        finally:
+            connection.close()
+    except (OSError, sqlite3.Error, ValueError):
+        return None
+    return {str(row[0]) for row in rows if row and row[0]}
+
+
 def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -> list[dict[str, Any]]:
     raw_terms = query_terms(query)
     has_compound_term = any("-" in term for term in raw_terms)
@@ -322,11 +346,17 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
     hits: list[dict[str, Any]] = []
     indexed = source.metadata.get("local_index") if isinstance(source.metadata, dict) else None
     indexed_documents = indexed.get("documents") if isinstance(indexed, dict) else None
-    documents = (
+    all_documents = (
         [(str(item.get("path")), str(item.get("text") or "")) for item in indexed_documents if isinstance(item, dict) and item.get("path")]
         if isinstance(indexed_documents, list)
         else [(relative, None) for relative in paths(source.path, deep)]
     )
+    fts_paths = _fts_candidates(indexed, terms)
+    documents = [(relative, text) for relative, text in all_documents if fts_paths is None or relative in fts_paths]
+    # A semantic rewrite can have no lexical hit. Keep the full path/text map
+    # only as a cheap in-process view of the already-loaded JSON cache, then
+    # narrow it to semantic candidates after scoring below.
+    document_by_path = dict(all_documents) if fts_paths is not None else None
     loaded_documents: list[tuple[str, str]] = []
     for relative, indexed_text in documents:
         try:
@@ -344,13 +374,27 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
     semantic_index = source.metadata.get("semantic_index") if isinstance(source.metadata, dict) else None
     if isinstance(semantic_index, dict) and semantic_index.get("available") is True:
         semantic_paths = semantic_index.get("paths") if isinstance(semantic_index.get("paths"), list) else []
+        vector_store = semantic_index.get("vector_store")
+        dimension = int(semantic_index.get("dimension") or 0)
         semantic_vectors = semantic_index.get("vectors") if isinstance(semantic_index.get("vectors"), list) else []
         query_vector = vectorize(query)
-        for relative, vector in zip(semantic_paths, semantic_vectors):
-            if not isinstance(vector, list):
-                continue
-            score = cosine(query_vector, vector)
-            semantic_scores[str(relative)] = score
+        if vector_store is not None and dimension == len(query_vector):
+            # Read the compact flat float array without materializing a list
+            # for every document.
+            for offset, relative in enumerate(semantic_paths):
+                start = offset * dimension
+                end = start + dimension
+                if end > len(vector_store):
+                    break
+                score = sum(left * right for left, right in zip(query_vector, vector_store[start:end]))
+                semantic_scores[str(relative)] = max(-1.0, min(1.0, score))
+        else:
+            # Backward-compatible reader for older derived caches.
+            for relative, vector in zip(semantic_paths, semantic_vectors):
+                if not isinstance(vector, list):
+                    continue
+                score = cosine(query_vector, vector)
+                semantic_scores[str(relative)] = score
         ranked_semantic = sorted(semantic_scores.items(), key=lambda item: (-item[1], item[0]))
         # The semantic lane widens recall only inside this repository/source.
         # Lexical/path evidence still controls exact queries and citation
@@ -359,6 +403,11 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
             relative for relative, score in ranked_semantic[:64]
             if score >= 0.20
         }
+        if document_by_path is not None:
+            selected = set(fts_paths or set()) | semantic_candidates
+            documents = [(relative, document_by_path[relative]) for relative in selected if relative in document_by_path]
+        elif fts_paths is not None:
+            documents = [(relative, text) for relative, text in documents if relative in semantic_candidates or relative in fts_paths]
     available_layers = {Path(relative).parts[0] for relative, _text in documents if Path(relative).parts}
     preferred_layers = _preferred_layers(query, available_layers)
     # Use corpus-local inverse document frequency as a generic specificity

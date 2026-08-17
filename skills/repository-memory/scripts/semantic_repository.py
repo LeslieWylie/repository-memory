@@ -10,6 +10,7 @@ available.
 from __future__ import annotations
 
 import datetime as dt
+import array
 import json
 import os
 import sys
@@ -21,7 +22,6 @@ from discovery import config_path, read_config
 from local_embedding import (
     embedding_status,
     pack,
-    unpack,
     vectorize_many,
 )
 from local_index import index_path
@@ -101,19 +101,26 @@ def load(view: SourceView, deep: bool = False) -> dict[str, Any] | None:
     if not metadata or metadata.get("commit") != view.commit:
         return None
     vectors_path = _vectors_path(view, deep)
-    try:
-        raw = vectors_path.read_bytes()
-    except OSError:
-        return None
     dimension = int(metadata.get("dimension") or 0)
     paths = metadata.get("paths") if isinstance(metadata.get("paths"), list) else []
-    stride = dimension * 4
-    if dimension <= 0 or len(raw) != len(paths) * stride:
+    if dimension <= 0:
         return None
-    vectors = [unpack(raw[offset:offset + stride], dimension) for offset in range(0, len(raw), stride)]
+    try:
+        # Keep the derived vector cache compact. The old reader unpacked every
+        # float into a nested Python list on every request, creating hundreds
+        # of MB of transient objects for a large repository.
+        raw = vectors_path.read_bytes()
+        vectors = array.array("f")
+        vectors.frombytes(raw)
+    except (OSError, ValueError, OverflowError):
+        return None
+    if sys.byteorder != "little":
+        vectors.byteswap()
+    if len(vectors) != len(paths) * dimension:
+        return None
     return {
         **metadata,
-        "vectors": vectors,
+        "vector_store": vectors,
         "available": True,
         "strategy": "local-hybrid",
         "native_neural_model": metadata.get("provider") != "builtin",
@@ -211,7 +218,7 @@ def summary(value: dict[str, Any] | None) -> dict[str, Any]:
 
     if not isinstance(value, dict):
         return {"configured": False, "available": False, "strategy": "lexical"}
-    result = {key: item for key, item in value.items() if key not in {"vectors", "paths"}}
+    result = {key: item for key, item in value.items() if key not in {"vectors", "vector_store", "paths"}}
     if isinstance(value.get("paths"), list):
         result["document_count"] = len(value["paths"])
     return result
