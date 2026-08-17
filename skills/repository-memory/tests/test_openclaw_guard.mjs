@@ -216,17 +216,26 @@ const RECALL_PAYLOAD = JSON.stringify({
 });
 
 let recallRuntime;
-let restoreNodeOptions;
 if (process.platform === "win32") {
   const shimPath = join(auditDir, "fake-repository-memory-shim.cjs").split("\\").join("/");
   await writeFile(shimPath, `process.stdout.write(${JSON.stringify(RECALL_PAYLOAD)});\nprocess.exit(0);\n`, { encoding: "utf8" });
   recallRuntime = process.execPath;
   const previousNodeOptions = process.env.NODE_OPTIONS;
   process.env.NODE_OPTIONS = `${previousNodeOptions ? `${previousNodeOptions} ` : ""}--require ${shimPath}`;
-  restoreNodeOptions = () => {
+  // Restored at exit rather than after the recall test, because the preload has
+  // to stay in effect for *every* spawn of recallRuntime -- and on Windows
+  // recallRuntime is node.exe itself. Restoring inline reads as tidy and is a
+  // Windows-only footgun: the recall spawn above it kept working while the
+  // native-tools spawns below it received the fixed ["search", ...] argv with no
+  // preload, tried to resolve "search" as a script, and came back isError:true.
+  // Neither POSIX CI leg can reproduce that (there recallRuntime is the shell
+  // script, which does not read NODE_OPTIONS), so it sat on the default branch
+  // failing all three windows-latest legs. An exit handler makes the ordering
+  // hazard structurally impossible instead of merely currently-correct.
+  process.on("exit", () => {
     if (previousNodeOptions === undefined) delete process.env.NODE_OPTIONS;
     else process.env.NODE_OPTIONS = previousNodeOptions;
-  };
+  });
 } else {
   recallRuntime = join(auditDir, "fake-repository-memory");
   await writeFile(recallRuntime, `#!/bin/sh\nprintf '%s' '${RECALL_PAYLOAD}'\n`, { encoding: "utf8" });
@@ -241,7 +250,6 @@ const recallApi = {
 };
 plugin.register(recallApi);
 const recall = await recallHooks.get("before_prompt_build")({ prompt: "记住这个上下文" }, { agentId: "yaole", sessionKey: "recall-1" });
-restoreNodeOptions?.();
 assert.match(recall.prependContext, /accepted profile context/);
 assert.doesNotMatch(recall.prependContext, /do not inject/);
 
