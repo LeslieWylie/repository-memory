@@ -191,6 +191,8 @@ def build(view: SourceView, deep: bool = False) -> dict[str, Any]:
         "deep": deep,
         "built_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "documents": documents,
+        "document_count": len(documents),
+        "text_bytes": sum(len(str(item.get("text") or "").encode("utf-8")) for item in documents),
     }
     destination = index_path(view, deep)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -205,6 +207,7 @@ def build(view: SourceView, deep: bool = False) -> dict[str, Any]:
     if len(documents) >= 5000:
         value["fts_path"] = str(_ensure_fts(destination, documents))
         value["fts_path_paths"] = str(_ensure_path_fts(destination, documents))
+    value["index_bytes"] = destination.stat().st_size if destination.exists() else 0
     return value
 
 
@@ -216,6 +219,11 @@ def ensure(view: SourceView, deep: bool = False) -> dict[str, Any]:
         return build(view, deep)
     value = _load(destination) if destination.exists() else None
     if value and value.get("commit") == view.commit and bool(value.get("deep")) == deep:
+        # Older caches remain readable.  These fields avoid an O(document_count)
+        # text-size scan on every query and are only computed once per process.
+        value.setdefault("document_count", len(value.get("documents", [])))
+        value.setdefault("text_bytes", sum(len(str(item.get("text") or "").encode("utf-8")) for item in value.get("documents", []) if isinstance(item, dict)))
+        value.setdefault("index_bytes", destination.stat().st_size if destination.exists() else 0)
         if len(value.get("documents", [])) >= 5000:
             value["fts_path"] = str(_ensure_fts(destination, value["documents"]))
             value["fts_path_paths"] = str(_ensure_path_fts(destination, value["documents"]))
@@ -234,5 +242,8 @@ def status(view: SourceView, deep: bool = False) -> dict[str, Any]:
         "current_commit": view.commit,
         "stale": bool(indexed_commit and view.commit and indexed_commit != view.commit),
         "document_count": len(value.get("documents", [])) if value else 0,
+        "text_bytes": int(value.get("text_bytes") or 0) if value else 0,
+        "index_bytes": int(value.get("index_bytes") or destination.stat().st_size if value and destination.exists() else 0),
+        "scale_class": "small" if not value or len(value.get("documents", [])) < 1000 else "medium" if len(value.get("documents", [])) < 10000 else "large",
         "deep": deep,
     }

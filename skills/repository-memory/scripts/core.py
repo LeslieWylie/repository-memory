@@ -560,7 +560,7 @@ def _fallback_items(view: SourceView, query: str, limit: int, deep: bool, *, sta
             semantic_index = cached_semantic["value"]
         else:
             documents = local_index.get("documents") if isinstance(local_index, dict) else []
-            estimated_bytes = sum(len(str(item.get("text") or "")) for item in documents if isinstance(item, dict))
+            estimated_bytes = int(local_index.get("text_bytes") or 0)
             # MemOS' vector lane is useful as a rescue path, but eagerly
             # hashing a large Git corpus for every new snapshot can make a
             # simple filename/date query look like a hung agent.  Start with
@@ -1852,7 +1852,7 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate_parser = common("evaluate"); evaluate_parser.add_argument("--queries", required=True); evaluate_parser.add_argument("--qrels", required=True); evaluate_parser.add_argument("--limit", type=int, default=5); evaluate_parser.add_argument("--deep", action="store_true"); evaluate_parser.add_argument("--local", action="store_true"); evaluate_parser.add_argument("--scope", choices=("repository", "memory", "all"), default="repository"); evaluate_parser.add_argument("--revision"); evaluate_parser.add_argument("--fallback-only", action="store_true"); evaluate_parser.add_argument("--json", action="store_true")
     team_evaluate_parser = common("team-evaluate"); team_evaluate_parser.add_argument("--records", required=True); team_evaluate_parser.add_argument("--queries", required=True); team_evaluate_parser.add_argument("--qrels", required=True); team_evaluate_parser.add_argument("--limit", type=int, default=5); team_evaluate_parser.add_argument("--gate", action="store_true"); team_evaluate_parser.add_argument("--min-p1", type=float, default=1.0); team_evaluate_parser.add_argument("--min-recall", type=float, default=1.0); team_evaluate_parser.add_argument("--min-negative", type=float, default=1.0); team_evaluate_parser.add_argument("--max-candidate-contamination", type=float, default=0.0); team_evaluate_parser.add_argument("--json", action="store_true")
     supervisor_parser = common("supervise"); supervisor_parser.add_argument("--lane", choices=("team", "memory", "all"), default="all"); supervisor_parser.add_argument("--all", action="store_true"); supervisor_parser.add_argument("--apply", action="store_true"); supervisor_parser.add_argument("--reviewer"); supervisor_parser.add_argument("--command", dest="supervisor_command", help="JSON argv array for the optional supervisor model"); supervisor_parser.add_argument("--min-confidence", type=float, default=0.7); supervisor_parser.add_argument("--limit", type=int, default=100); supervisor_parser.add_argument("--json", action="store_true")
-    benchmark_parser = common("benchmark"); benchmark_parser.add_argument("--suite", choices=("public", "agentmemories", "locomo", "longmemeval", "rlvr"), required=True); benchmark_parser.add_argument("--data"); benchmark_parser.add_argument("--queries"); benchmark_parser.add_argument("--qrels"); benchmark_parser.add_argument("--limit", type=int, default=5); benchmark_parser.add_argument("--revision"); benchmark_parser.add_argument("--json", action="store_true")
+    benchmark_parser = common("benchmark"); benchmark_parser.add_argument("--suite", choices=("public", "agentmemories", "locomo", "longmemeval", "rlvr"), required=True); benchmark_parser.add_argument("--data"); benchmark_parser.add_argument("--queries"); benchmark_parser.add_argument("--qrels"); benchmark_parser.add_argument("--limit", type=int, default=5); benchmark_parser.add_argument("--revision"); benchmark_parser.add_argument("--semantic-model", help="Run an isolated A/B with a configured local Hugging Face model"); benchmark_parser.add_argument("--semantic-download", action="store_true", help="Allow this benchmark to download the explicit semantic model"); benchmark_parser.add_argument("--json", action="store_true")
     compact_parser = common("team-compact"); compact_parser.add_argument("--keep", type=int, default=1); compact_parser.add_argument("--json", action="store_true")
     memorycore = sub.add_parser("memorycore")
     memorycore.add_argument("action", choices=["configure", "install", "start", "stop", "status", "promote-l3"])
@@ -1869,11 +1869,15 @@ def build_parser() -> argparse.ArgumentParser:
     memorycore.add_argument("--accept", action="store_true")
     memorycore.add_argument("--json", action="store_true")
     memory = sub.add_parser("memory", help="Inspect and explicitly operate the standalone local memory runtime")
-    memory.add_argument("action", choices=["status", "project", "timeline", "promote-l3"])
+    memory.add_argument("action", choices=["status", "project", "evolve", "timeline", "promote-l3"])
     memory.add_argument("--session-id")
     memory.add_argument("--limit", type=int, default=50)
     memory.add_argument("--candidate")
     memory.add_argument("--accept", action="store_true")
+    memory.add_argument("--apply", action="store_true", help="Apply a configured supervisor decision; without it only candidates are produced")
+    memory.add_argument("--reviewer")
+    memory.add_argument("--command", dest="supervisor_command", help="JSON argv array for the optional supervisor model")
+    memory.add_argument("--min-confidence", type=float, default=0.7)
     memory.add_argument("--json", action="store_true")
     knowledge = sub.add_parser("knowledge")
     knowledge.add_argument("action", choices=("status", "configure", "install", "start", "stop", "create", "sync", "search"))
@@ -1902,7 +1906,10 @@ def build_parser() -> argparse.ArgumentParser:
     memmy.add_argument("--limit", type=int, default=5)
     memmy.add_argument("--json", action="store_true")
     gui = sub.add_parser("gui")
-    gui.add_argument("--open", action="store_true")
+    gui.add_argument("--open", action="store_true", help="Open the configured optional provider UI")
+    gui.add_argument("--serve", action="store_true", help="Start the built-in zero-dependency local dashboard")
+    gui.add_argument("--host", default="127.0.0.1")
+    gui.add_argument("--port", type=int, default=0)
     gui.add_argument("--json", action="store_true")
     semantic = sub.add_parser("semantic", help="Configure the optional local Hugging Face repository encoder")
     semantic.add_argument("action", choices=("status", "configure"))
@@ -2069,6 +2076,8 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
                 qrels=Path(args.qrels).expanduser().resolve() if args.qrels else None,
                 limit=args.limit,
                 revision=args.revision,
+                semantic_model=args.semantic_model,
+                semantic_download=args.semantic_download,
             )
         elif args.command == "team-compact":
             from team_memory import team_memory_backend
@@ -2162,7 +2171,12 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
                     "canonical_repo_changed": False,
                 }
         elif args.command == "gui":
-            value = memmy_gui(args.open)
+            if args.serve:
+                from dashboard import serve_dashboard
+
+                value = serve_dashboard(root if root_arg else None, host=args.host, port=args.port, open_window=args.open)
+            else:
+                value = memmy_gui(args.open)
         elif args.command == "semantic":
             if args.action == "status":
                 value = semantic_model_status()
@@ -2197,6 +2211,20 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
                 value = {"schema_version": SCHEMA_VERSION, **client.health(refresh=True, probe_layers=True), "external_mode": getattr(client, "backend", "") != "standalone-memory", "canonical_repo_changed": False}
             elif args.action == "project":
                 value = {"schema_version": SCHEMA_VERSION, **project_memory_candidates()}
+            elif args.action == "evolve":
+                from supervisor import supervise
+
+                projected = project_memory_candidates()
+                command = None
+                if args.supervisor_command:
+                    try:
+                        command = json.loads(args.supervisor_command)
+                    except json.JSONDecodeError as exc:
+                        raise RuntimeError("memory evolve --command must be a JSON argv array") from exc
+                    if not isinstance(command, list) or not all(isinstance(item, str) and item for item in command):
+                        raise RuntimeError("memory evolve --command must be a non-empty JSON argv array")
+                review = supervise(lane="memory", apply=bool(args.apply), limit=100, reviewer=args.reviewer, command=command, min_confidence=args.min_confidence)
+                value = {"schema_version": SCHEMA_VERSION, "projection": projected, "supervision": review, "accepted_requires_explicit_l3": True}
             elif args.action == "timeline":
                 value = _memory_timeline(args.session_id, args.limit)
             else:

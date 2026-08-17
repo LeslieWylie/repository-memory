@@ -40,7 +40,7 @@ _CJK_RE = re.compile(r"[\u3400-\u9fff]")
 _HF_ENCODER: Any | None = None
 _HF_DIMENSION: int | None = None
 _HF_ERROR: str | None = None
-_HF_ERROR_KEY: tuple[str, bool] | None = None
+_HF_ERROR_KEY: tuple[bool, str, bool] | None = None
 
 
 def _features(text: str) -> Iterable[tuple[str, float]]:
@@ -72,9 +72,11 @@ def _semantic_config() -> dict[str, Any]:
 
 def _hf_config() -> tuple[bool, str, bool]:
     config = _semantic_config()
-    provider = str(config.get("provider") or "builtin").strip().casefold()
-    model = str(config.get("model") or HF_DEFAULT_MODEL).strip()
-    enabled = bool(config.get("enabled", False)) and provider in {"huggingface", "hf", "gte", "gte-multilingual"}
+    provider = str(os.environ.get("REPOSITORY_MEMORY_SEMANTIC_PROVIDER") or config.get("provider") or "builtin").strip().casefold()
+    model = str(os.environ.get("REPOSITORY_MEMORY_SEMANTIC_MODEL") or config.get("model") or HF_DEFAULT_MODEL).strip()
+    enabled_value = os.environ.get("REPOSITORY_MEMORY_SEMANTIC_ENABLED")
+    enabled = bool(config.get("enabled", False)) if enabled_value is None else enabled_value.strip().casefold() in {"1", "true", "yes", "on"}
+    enabled = enabled and provider in {"huggingface", "hf", "gte", "gte-multilingual"}
     allow_download = bool(config.get("allow_download", False))
     return enabled, model, allow_download
 
@@ -92,8 +94,8 @@ def _load_hf_encoder(*, allow_download: bool = False) -> Any | None:
         return None
     # ``allow_download`` is an operation-level capability.  A persisted
     # preference must never make every doctor/search call the network.
-    allow_download = bool(allow_download)
-    cache_key = (model, allow_download)
+    allow_download = bool(allow_download) or os.environ.get("REPOSITORY_MEMORY_SEMANTIC_ALLOW_DOWNLOAD", "").strip().casefold() in {"1", "true", "yes", "on"}
+    cache_key = (enabled, model, allow_download)
     if _HF_ENCODER is not None and _HF_ERROR_KEY == cache_key:
         return _HF_ENCODER
     if _HF_ERROR_KEY == cache_key and _HF_ERROR:

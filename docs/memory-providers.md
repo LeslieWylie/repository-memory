@@ -82,11 +82,40 @@ repository-memory memmy configure --endpoint http://127.0.0.1:18960 --json
 repository-memory memmy search --query "..." --json
 repository-memory gui --json
 repository-memory gui --open
+repository-memory gui --serve --open
 ```
 
 `memmy configure` writes only user-level configuration. It does not modify a
 canonical repository. `gui --open` opens the configured Memmy endpoint on
-macOS; without `--open`, it is a read-only reachability check.
+macOS; without `--open`, it is a read-only reachability check. `gui --serve`
+starts the built-in standard-library-only read-only dashboard, so the public
+product has a usable local GUI even when Memmy is absent. It calls the same
+doctor/search/memory runtime as CLI and MCP and does not add a write path.
+
+## Optional neural retrieval
+
+The default `builtin-char-ngram-v1` projection is dependency-free and is
+reported as `local-hybrid` with `native_neural_model=false`. For a multilingual
+neural A/B, install the optional dependency in the target environment and
+explicitly configure the model:
+
+```bash
+python -m pip install "sentence-transformers>=3.0"
+repository-memory semantic configure --model Alibaba-NLP/gte-multilingual-base
+repository-memory semantic status --json
+```
+
+If the model or dependency is unavailable, search remains usable and reports
+`lexical-fallback`; it never claims a neural encoder is active. An isolated
+benchmark can compare a model without changing user configuration:
+
+```bash
+repository-memory benchmark --suite public \
+  --semantic-model Alibaba-NLP/gte-multilingual-base --json
+```
+
+Use `--semantic-download` only when downloading during that benchmark is
+explicitly intended.
 
 ## Failure and fallback rules
 

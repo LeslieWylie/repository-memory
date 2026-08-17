@@ -8,6 +8,18 @@ It gives an agent one consistent way to answer questions about project
 documents, research notes, reports, source-code evidence, and explicitly
 imported conversation memory.
 
+The standalone product also includes a read-only local viewer:
+
+```bash
+repository-memory gui --serve --open
+```
+
+Neural retrieval is opt-in. The zero-dependency default is reported honestly as
+`builtin-char-ngram-v1`; install `sentence-transformers` and explicitly
+configure `Alibaba-NLP/gte-multilingual-base` before claiming a neural model
+is active. A benchmark A/B can select that model without writing provider
+settings to the Git repository.
+
 The important idea is simple:
 
 > An answer is a fact only when the runtime can show where it came from.

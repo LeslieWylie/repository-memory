@@ -120,3 +120,9 @@ revision is a separate compatibility identifier; see
 
 - Initial citation-first repository memory runtime, CLI, stdio MCP server,
   optional MemoryCore adapter, and OpenClaw integration.
+## 0.7.6
+
+- Add an isolated semantic benchmark A/B selector with truthful effective-mode diagnostics.
+- Add a zero-dependency read-only local dashboard (`gui --serve`).
+- Record repository index scale metadata and reuse it during large-source routing.
+- Add `memory evolve` for explicit L2 projection plus optional supervisor review; L3 remains explicit.

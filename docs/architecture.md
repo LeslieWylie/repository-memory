@@ -144,3 +144,12 @@ OS secret store. They are not written to source indexes, MCP responses, audit
 records, or Git. The audit proxy records tool metadata, counts, freshness, and
 latency, not full query/answer bodies. The OpenClaw guard is advisory/output
 validation and does not block normal file, shell, Git, test, or debugging tools.
+### Scale behavior
+
+Derived repository indexes record `document_count`, `text_bytes`,
+`index_bytes`, and a `scale_class` (`small`, `medium`, or `large`). The query
+path reuses these values instead of rescanning every document merely to decide
+whether semantic projection should be deferred. Large sources therefore take
+a lexical/path first pass; the optional semantic cache is built only when the
+first pass needs rescue. The index remains disposable derived state and the
+canonical checkout is never rewritten.

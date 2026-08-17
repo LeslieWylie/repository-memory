@@ -27,6 +27,7 @@ from mcp_server import SERVER_VERSION
 from snapshot import _snapshot_lock, prepare_view, snapshot_lock_backend
 from team_memory import TeamMemoryStore
 from version import VERSION
+from benchmark import _semantic_override
 
 from models import SourceSpec
 
@@ -118,7 +119,23 @@ class RepositoryMemoryTest(unittest.TestCase):
     def test_runtime_version_comes_from_skill_version_file(self):
         self.assertEqual(SERVER_VERSION, VERSION)
         self.assertEqual(VERSION, (SCRIPTS.parent / "VERSION").read_text(encoding="utf-8").strip())
-        self.assertEqual(VERSION, "0.7.5")
+
+    def test_semantic_benchmark_override_is_ephemeral(self):
+        os.environ.pop("REPOSITORY_MEMORY_SEMANTIC_MODEL", None)
+        with _semantic_override("Alibaba-NLP/gte-multilingual-base"):
+            self.assertEqual(os.environ["REPOSITORY_MEMORY_SEMANTIC_MODEL"], "Alibaba-NLP/gte-multilingual-base")
+            self.assertEqual(os.environ["REPOSITORY_MEMORY_SEMANTIC_ENABLED"], "1")
+        self.assertNotIn("REPOSITORY_MEMORY_SEMANTIC_MODEL", os.environ)
+        self.assertNotIn("REPOSITORY_MEMORY_SEMANTIC_ENABLED", os.environ)
+
+    def test_index_reports_scale_metadata(self):
+        from local_index import build
+        view = prepare_view(SourceSpec(id="alpha", root=self.alpha, repository="alpha"), local=True)
+        value = build(view)
+        self.assertEqual(value["document_count"], len(value["documents"]))
+        self.assertGreaterEqual(value["text_bytes"], 0)
+        self.assertGreater(value["index_bytes"], 0)
+        self.assertEqual(VERSION, "0.7.6")
 
     def test_multisource_search_has_verified_and_candidates(self):
         result = core.search(None, "Atlas evidence", limit=5)
