@@ -28,6 +28,7 @@ from models import SourceView
 # document in a large repository.
 SCHEMA_VERSION = 5
 PATH_FTS_SCHEMA_VERSION = 1
+FTS_DOCUMENT_THRESHOLD = 1000
 
 _DATE_RE = re.compile(r"20\d{2}[-/]\d{1,2}(?:[-/]\d{1,2})?|20\d{2}-W\d{1,2}", re.IGNORECASE)
 _MARKDOWN_LINK_RE = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
@@ -204,7 +205,7 @@ def build(view: SourceView, deep: bool = False) -> dict[str, Any]:
         os.replace(temporary, destination)
     finally:
         Path(temporary).unlink(missing_ok=True)
-    if len(documents) >= 5000:
+    if len(documents) >= FTS_DOCUMENT_THRESHOLD:
         value["fts_path"] = str(_ensure_fts(destination, documents))
         value["fts_path_paths"] = str(_ensure_path_fts(destination, documents))
     value["index_bytes"] = destination.stat().st_size if destination.exists() else 0
@@ -224,7 +225,7 @@ def ensure(view: SourceView, deep: bool = False) -> dict[str, Any]:
         value.setdefault("document_count", len(value.get("documents", [])))
         value.setdefault("text_bytes", sum(len(str(item.get("text") or "").encode("utf-8")) for item in value.get("documents", []) if isinstance(item, dict)))
         value.setdefault("index_bytes", destination.stat().st_size if destination.exists() else 0)
-        if len(value.get("documents", [])) >= 5000:
+        if len(value.get("documents", [])) >= FTS_DOCUMENT_THRESHOLD:
             value["fts_path"] = str(_ensure_fts(destination, value["documents"]))
             value["fts_path_paths"] = str(_ensure_path_fts(destination, value["documents"]))
         return value

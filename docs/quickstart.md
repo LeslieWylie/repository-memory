@@ -49,6 +49,8 @@ and `embedding.strategy=local-hybrid` with the built-in vector projection.
 
 ```bash
 repository-memory doctor --json
+# For a large source, use a metadata-only first probe; sync builds the cache:
+repository-memory doctor --local --no-index --json
 ```
 
 Look for:
