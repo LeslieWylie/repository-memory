@@ -81,15 +81,19 @@ lane; it is not a neural embedding model and is reported as such.
 ## Reference locations
 
 The clone locations are user-level reference material, not import paths used
-by the runtime:
+by the runtime. `<references-root>` stands for wherever you keep reference
+checkouts; the resolved path is deliberately absent, because a maintainer's
+home-directory layout is user data and this file is public:
 
 ```text
-/Users/mlamp/Desktop/03-Knowledge/MemOS-reference
-/Users/mlamp/Desktop/03-Knowledge/memory-references/cognee
-/Users/mlamp/Desktop/03-Knowledge/memory-references/tencentdb-agent-memory
-/Users/mlamp/Desktop/03-Knowledge/memory-references/mem0
-/Users/mlamp/Desktop/03-Knowledge/memory-references/mempalace
-/Users/mlamp/Desktop/03-Knowledge/memory-references/hindsight
+<references-root>/MemOS-reference
+<references-root>/memory-references/cognee
+<references-root>/memory-references/tencentdb-agent-memory
+<references-root>/memory-references/mem0
+<references-root>/memory-references/mempalace
+<references-root>/memory-references/hindsight
 ```
 
-Do not add these absolute paths to Skill instructions or user configuration.
+Do not add resolved absolute paths to Skill instructions or user
+configuration — or to this file. `personal-absolute-path` in
+`tools/scan-tree.sh` now fails CI if they come back.

@@ -37,9 +37,9 @@ standalone runtime now incorporates the useful local-plugin mechanics in
 These are deliberately ported into the Python runtime so installation remains
 one-command and dependency-free. Provider daemons, OpenClaw-specific bridges,
 and MemOS's Node dependency tree are not required. The algorithmic reference is
-the Apache-2.0 MemOS Local Plugin source at
-`/Users/mlamp/Desktop/MemOS-reference/apps/memos-local-plugin` and its upstream
-repository [MemOS Local Plugin](https://github.com/MemTensor/MemOS/tree/main/apps/memos-local-plugin).
+the Apache-2.0 MemOS Local Plugin source, read from a local checkout of its
+upstream repository
+[MemOS Local Plugin](https://github.com/MemTensor/MemOS/tree/main/apps/memos-local-plugin).
 The reference checkout is not part of the production runtime.
 
 ## Optional TencentDB compatibility backend
