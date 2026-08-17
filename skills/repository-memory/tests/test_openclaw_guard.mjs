@@ -245,4 +245,32 @@ restoreNodeOptions?.();
 assert.match(recall.prependContext, /accepted profile context/);
 assert.doesNotMatch(recall.prependContext, /do not inject/);
 
+// MemOS-style native OpenClaw tools and lifecycle coverage must be available
+// without introducing a second retrieval implementation.  The fake runtime
+// is the same executable used by the recall test, so this exercises the real
+// spawn/JSON boundary rather than a mocked tool result.
+const nativeTools = new Map();
+const nativeHooks = new Map();
+const nativeApi = {
+  pluginConfig: { enabled: true, nativeTools: true, runtime: recallRuntime, auditPath: join(auditDir, "native-tools.jsonl") },
+  logger: { info() {}, warn() {} },
+  on(name, handler) { nativeHooks.set(name, handler); },
+  registerTool(tool, options = {}) {
+    const descriptor = typeof tool === "function" ? tool({ agentId: "yaole", sessionKey: "native-session" }) : tool;
+    nativeTools.set(options.name || descriptor.name, descriptor);
+  },
+};
+plugin.register(nativeApi);
+for (const name of ["repository_memory_doctor", "repository_memory_search", "repository_memory_get", "repository_memory_timeline"]) {
+  assert.equal(nativeTools.has(name), true, `native tool ${name} should be registered`);
+}
+for (const name of ["before_prompt_build", "before_agent_run", "agent_end", "session_start", "session_end", "tool_result_persist", "before_tool_call", "after_tool_call"]) {
+  assert.equal(nativeHooks.has(name), true, `lifecycle hook ${name} should be registered`);
+}
+const nativeSearch = await nativeTools.get("repository_memory_search").execute("call-1", { query: "memory" });
+assert.equal(nativeSearch.isError, undefined);
+assert.match(nativeSearch.content[0].text, /accepted profile context/);
+const nativeTimeline = await nativeTools.get("repository_memory_timeline").execute("call-2", { session_id: "native-session" });
+assert.equal(nativeTimeline.isError, undefined);
+
 console.log("openclaw guard ok");

@@ -379,12 +379,11 @@ function formatMemoryContext(value, maxChars) {
   return lines.join("\n").slice(0, Math.max(1000, Number(maxChars) || 12000));
 }
 
-function runRecall(cfg, prompt) {
+function runRuntimeJSON(cfg, args, label) {
   const runtime = optional(cfg.runtime) || "repository-memory";
-  const limit = Math.max(1, Math.min(10, Number(cfg.recallMaxResults) || 5));
   const timeoutMs = Math.max(1000, Math.min(60000, Number(cfg.timeoutMs) || DEFAULT_TIMEOUT_MS));
   return new Promise((resolve) => {
-    const child = spawn(runtime, ["search", prompt, "--scope", "memory", "--limit", String(limit), "--json"], {
+    const child = spawn(runtime, args, {
       stdio: ["ignore", "pipe", "pipe"],
       env: process.env,
     });
@@ -394,7 +393,7 @@ function runRecall(cfg, prompt) {
     child.stderr?.on("data", (chunk) => { stderr = (stderr + String(chunk)).slice(-8192); });
     const timer = setTimeout(() => {
       child.kill("SIGTERM");
-      resolve({ ok: false, error: "memory recall timeout" });
+      resolve({ ok: false, error: `${label} timeout` });
     }, timeoutMs);
     child.on("error", (error) => {
       clearTimeout(timer);
@@ -402,17 +401,105 @@ function runRecall(cfg, prompt) {
     });
     child.on("close", (code) => {
       clearTimeout(timer);
-      if (code !== 0) {
-        resolve({ ok: false, error: (stderr || stdout || `runtime exited ${code}`).trim().slice(0, 400) });
-        return;
+        if (code !== 0) {
+          resolve({ ok: false, error: (stderr || stdout || `runtime exited ${code}`).trim().slice(0, 400) });
+          return;
       }
-      try {
-        resolve({ ok: true, result: JSON.parse(stdout) });
-      } catch {
-        resolve({ ok: false, error: "memory recall runtime returned invalid JSON" });
-      }
+        try {
+          resolve({ ok: true, result: JSON.parse(stdout) });
+        } catch {
+          resolve({ ok: false, error: `${label} runtime returned invalid JSON` });
+        }
     });
   });
+}
+
+function runRecall(cfg, prompt) {
+  const limit = Math.max(1, Math.min(10, Number(cfg.recallMaxResults) || 5));
+  return runRuntimeJSON(cfg, ["search", prompt, "--scope", "memory", "--limit", String(limit), "--json"], "memory recall");
+}
+
+function toolResult(outcome) {
+  if (!outcome.ok) {
+    return {
+      isError: true,
+      content: [{ type: "text", text: JSON.stringify({ ok: false, error: outcome.error }) }],
+      details: { ok: false, error: outcome.error },
+    };
+  }
+  return {
+    content: [{ type: "text", text: JSON.stringify(outcome.result) }],
+    details: outcome.result,
+  };
+}
+
+const EMPTY_PARAMETERS = { type: "object", properties: {}, additionalProperties: false };
+const SEARCH_PARAMETERS = {
+  type: "object",
+  required: ["query"],
+  properties: {
+    query: { type: "string", minLength: 1, description: "Original user query; do not rewrite it into a filename." },
+    scope: { type: "string", enum: ["repository", "memory", "all"], default: "repository" },
+    limit: { type: "integer", minimum: 1, maximum: 50, default: 5 },
+  },
+  additionalProperties: false,
+};
+const GET_PARAMETERS = {
+  type: "object",
+  required: ["id"],
+  properties: { id: { type: "string", minLength: 1 } },
+  additionalProperties: false,
+};
+const TIMELINE_PARAMETERS = {
+  type: "object",
+  properties: {
+    session_id: { type: "string" },
+    limit: { type: "integer", minimum: 1, maximum: 500, default: 50 },
+  },
+  additionalProperties: false,
+};
+
+function registerNativeTools(api, cfg) {
+  if (cfg.nativeTools === false || typeof api.registerTool !== "function") return;
+  const register = (name, description, parameters, args) => {
+    api.registerTool(() => ({
+      name,
+      label: name.replaceAll("_", " "),
+      description,
+      parameters,
+      async execute(_toolCallId, input = {}) {
+        const outcome = await runRuntimeJSON(cfg, args(input), name);
+        return toolResult(outcome);
+      },
+    }), { name });
+  };
+  register(
+    "repository_memory_doctor",
+    "Inspect repository-memory runtime, source freshness, index state, and L0-L3 capability/population. Read-only.",
+    EMPTY_PARAMETERS,
+    () => ["doctor", "--json"],
+  );
+  register(
+    "repository_memory_search",
+    "Search repository evidence or explicitly requested conversation memory through the shared repository-memory runtime. Read-only.",
+    SEARCH_PARAMETERS,
+    (input) => [
+      "search", String(input.query || ""), "--scope", ["repository", "memory", "all"].includes(input.scope) ? input.scope : "repository",
+      "--limit", String(Math.max(1, Math.min(50, Number(input.limit) || 5))), "--json",
+    ],
+  );
+  register(
+    "repository_memory_get",
+    "Fetch a result and its citation/provenance through the shared runtime. Read-only.",
+    GET_PARAMETERS,
+    (input) => ["get", String(input.id || ""), "--json"],
+  );
+  register(
+    "repository_memory_timeline",
+    "Read ordered L0/L1 capture provenance for a session. This is memory provenance, not a Git citation. Read-only.",
+    TIMELINE_PARAMETERS,
+    (input) => ["memory-timeline", "--session-id", String(input.session_id || ""), "--limit", String(Math.max(1, Math.min(500, Number(input.limit) || 50))), "--json"],
+  );
 }
 
 export default {
@@ -439,8 +526,14 @@ export default {
       recallEnabled: raw.recallEnabled !== false,
       recallMaxResults: Math.max(1, Math.min(10, Number(raw.recallMaxResults) || 5)),
       recallMaxChars: Math.max(1000, Math.min(20000, Number(raw.recallMaxChars) || 12000)),
+      nativeTools: raw.nativeTools !== false,
     };
     if (!cfg.enabled) return;
+
+    // MemOS exposes native OpenClaw tools in addition to lifecycle hooks.  We
+    // expose the same ergonomics, but every tool delegates to this runtime's
+    // CLI so MCP, CLI, and plugin results cannot diverge.
+    registerNativeTools(api, cfg);
 
     // TencentDB's client plugin performs recall in before_prompt_build. Keep
     // the same lifecycle while delegating to the shared Python runtime, so
@@ -644,7 +737,42 @@ export default {
           });
         }
       }, { priority: 100, timeoutMs: 5000 });
+    } else {
+      // Audit-only lifecycle coverage.  These listeners never return a block
+      // decision and never write memory; they make plugin behavior observable
+      // on hosts where the advisory guard is intentionally disabled.
+      api.on("before_tool_call", async (event, ctx) => {
+        if (!isAllowedAgent(cfg, ctx)) return;
+        const toolName = optional(event?.toolName) || "unknown";
+        if (repoTool(cfg, toolName, "memory_doctor") || repoTool(cfg, toolName, "memory_search") || repoTool(cfg, toolName, "memory_get") || repoTool(cfg, toolName, "memory_timeline")) {
+          await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "tool_observed", tool: toolName, phase: "before" });
+        }
+      }, { priority: 100, timeoutMs: 5000 });
+      api.on("after_tool_call", async (event, ctx) => {
+        if (!isAllowedAgent(cfg, ctx)) return;
+        const toolName = optional(event?.toolName) || "unknown";
+        if (repoTool(cfg, toolName, "memory_doctor") || repoTool(cfg, toolName, "memory_search") || repoTool(cfg, toolName, "memory_get") || repoTool(cfg, toolName, "memory_timeline")) {
+          const counts = resultCounts(event?.result ?? event?.output ?? event?.resultText);
+          await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "tool_observed", tool: toolName, phase: "after", outcome: event?.error ? "error" : "completed", verified: counts.verified, citations: counts.citations, freshness: counts.freshness, latency_ms: numeric(event?.durationMs) });
+        }
+      }, { priority: -100, timeoutMs: 5000 });
     }
+
+    // MemOS wires these lifecycle points for visibility and session hygiene.
+    // We keep them metadata-only: session events do not create L0 records and
+    // persisted tool results never enter the canonical repository implicitly.
+    api.on("session_start", async (event, ctx) => {
+      if (!isAllowedAgent(cfg, ctx)) return;
+      await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "session_start", session_id: optional(event?.sessionId) || optional(ctx?.sessionId) || null, resumed_from: optional(event?.resumedFrom) || null });
+    }, { priority: 20, timeoutMs: 5000 });
+    api.on("session_end", async (event, ctx) => {
+      if (!isAllowedAgent(cfg, ctx)) return;
+      await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "session_end", session_id: optional(event?.sessionId) || optional(ctx?.sessionId) || null, reason: optional(event?.reason) || null });
+    }, { priority: -20, timeoutMs: 5000 });
+    api.on("tool_result_persist", async (event, ctx) => {
+      if (!isAllowedAgent(cfg, ctx)) return;
+      await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "tool_result_persist", tool: optional(event?.toolName) || "unknown", tool_call_id: optional(event?.toolCallId) || null, result_hash: digest(event?.result ?? event?.message ?? {}), error: optional(event?.error) || null });
+    }, { priority: -50, timeoutMs: 5000 });
 
     api.on("agent_end", (event, ctx) => {
       if (!isAllowedAgent(cfg, ctx) || event?.success === false) return;

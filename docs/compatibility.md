@@ -4,7 +4,7 @@ There are two different version numbers in this project:
 
 | Surface | Current value | Meaning |
 | --- | --- | --- |
-| Repository Memory release | `0.7.7` | The Python project, standalone SQLite/vector L0-L3 runtime, MemOS-inspired episode/feedback/policy lifecycle, citation-first index, installer, MCP server, OpenClaw plugin, provider contract, supervisor, benchmark runner and AML Add/Search wrapper. |
+| Repository Memory release | `0.7.8` | The Python project, standalone SQLite/vector L0-L3 runtime, MemOS-inspired episode/feedback/policy lifecycle, citation-first index, installer, MCP server, native OpenClaw lifecycle/tools, provider contract, supervisor, benchmark runner and AML Add/Search wrapper. |
 | MCP protocol | `2026-07-28` | The wire-level protocol revision negotiated with a host. |
 
 The release version is stored in
@@ -17,6 +17,11 @@ The Python distribution is a standard wheel with a
 `repository-memory` console entry point. The legacy Skill directory remains
 the source layout used by the installer, so existing OpenClaw/Codex/Claude
 installations continue to use the same runtime files.
+
+OpenClaw support includes lifecycle hooks and native read-only tools. Native
+tools delegate to the same CLI runtime used by MCP; they are not a second
+retrieval backend. Hosts without `api.registerTool` continue to use the
+namespaced stdio MCP and lifecycle capture hooks.
 
 The MCP server advertises `2026-07-28` first. It retains compatibility with
 the older initialize/Content-Length protocol revisions listed by

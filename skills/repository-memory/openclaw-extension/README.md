@@ -5,6 +5,20 @@ OpenClaw `before_prompt_build` and `agent_end` lifecycle events invoke the
 installed shared `repository-memory` runtime. The first hook performs bounded
 `scope=memory` recall; the second invokes `capture-turn` asynchronously.
 
+When the host exposes `api.registerTool`, the extension also registers four
+native read-only OpenClaw tools:
+
+- `repository_memory_doctor`
+- `repository_memory_search`
+- `repository_memory_get`
+- `repository_memory_timeline`
+
+They delegate to the same CLI runtime as MCP, so the plugin does not create a
+second ranking or storage implementation. The extension also observes
+`session_start`, `session_end`, `tool_result_persist`, `before_tool_call`, and
+`after_tool_call`. These hooks write metadata-only audit records; they never
+promote memory or block ordinary tools.
+
 This follows the useful part of TencentDB's client plugin: L1 search, L2
 scenario navigation, and L3 profile context are recalled before the model turn;
 L0/L1/L2/L3 stay labelled and are never converted into repository citations.
@@ -34,4 +48,20 @@ The write contract is deliberately conservative:
 
 The extension does not replace an existing OpenClaw memory slot and does not
 expose a write MCP tool to the model. Configure `agentIds` when only selected
-agents should capture turns.
+agents should capture turns. Set `nativeTools: false` only for hosts without
+native tool registration; the namespaced stdio MCP remains available.
+
+## Verify the OpenClaw path
+
+After installation, inspect the plugin and MCP registration, then run one
+positive and one fabricated negative query through the selected agent profile:
+
+```bash
+openclaw plugins inspect repository-memory-autocapture --json
+openclaw mcp probe repository-memory --json
+repository-memory doctor --json
+```
+
+The result must show the actual runtime, source commit, retrieval mode, and
+memory population. A ready endpoint alone is not evidence that L2/L3 contain
+useful records.
