@@ -2,7 +2,7 @@
   "id": "repository-memory-autocapture",
   "name": "Repository Memory Auto Capture",
   "description": "Audit repository-memory evidence and capture reusable shared team memory without blocking ordinary agent work.",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "activation": {
     "onStartup": true
   },

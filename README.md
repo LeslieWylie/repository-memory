@@ -217,9 +217,14 @@ The same evaluator is exposed as a benchmark entry point. It never downloads
 external datasets:
 
 ```bash
+repository-memory benchmark --suite public --json
 repository-memory benchmark --suite public --root /path/to/knowledge --json
 repository-memory benchmark --suite locomo --data /path/to/manifest.json --root /path/to/knowledge --json
 ```
+
+When the command is run from a checked-out public repository, the first form
+automatically discovers that repository as the fixture root. Use `--root` for
+an explicit fixture or an RLVR profile.
 
 External suites must provide a manifest or `queries.jsonl` plus `qrels.jsonl`;
 an unsupported format is reported as such rather than producing fabricated

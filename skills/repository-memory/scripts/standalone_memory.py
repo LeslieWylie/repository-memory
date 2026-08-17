@@ -43,10 +43,50 @@ from models import MEMORY_LAYERS, memory_layer_state
 
 
 def dt_from_timestamp(value: object) -> str:
+    if isinstance(value, str) and value.strip():
+        text = value.strip()
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        except ValueError:
+            pass
     try:
-        return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat().replace("+00:00", "Z")
+        numeric = float(value)
+        # AML sends Unix milliseconds.  Local runtime records use seconds.
+        if abs(numeric) >= 100_000_000_000:
+            numeric /= 1000.0
+        return datetime.fromtimestamp(numeric, tz=timezone.utc).isoformat().replace("+00:00", "Z")
     except (TypeError, ValueError, OverflowError, OSError):
         return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def epoch_from_timestamp(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+        except ValueError:
+            value = text
+    try:
+        numeric = float(value)
+        if abs(numeric) >= 100_000_000_000:
+            numeric /= 1000.0
+        return numeric
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+_LATEST_QUERY = re.compile(
+    r"\b(latest|recent|newest|current|most\s+recent|last)\b|最近|最新|当前|上次|最近一次",
+    re.IGNORECASE,
+)
 
 
 def _terms(query: str) -> list[str]:
@@ -459,8 +499,11 @@ class StandaloneMemoryClient:
                     raise ValueError("AML messages must be objects")
                 role = str(message.get("role") or "").strip()
                 content = str(message.get("content") or "").strip()
-                if role not in {"user", "assistant"} or not content:
-                    raise ValueError("AML messages require role=user|assistant and non-empty content")
+                # The public contract requires a non-empty role but does not
+                # restrict it to user/assistant.  Tool, system, and other
+                # producer roles are valid memory evidence too.
+                if not role or not content:
+                    raise ValueError("AML messages require a non-empty role and content")
                 if SECRET_CONTENT.search(content):
                     skipped_sensitive += 1
                     continue
@@ -515,15 +558,21 @@ class StandaloneMemoryClient:
             ).fetchall()
         finally:
             connection.close()
+        latest_requested = bool(_LATEST_QUERY.search(query))
+        row_epochs = [epoch_from_timestamp(row["timestamp"]) or float(row["updated_at"] or 0) for row in rows]
+        min_epoch = min(row_epochs, default=0.0)
+        max_epoch = max(row_epochs, default=0.0)
+        epoch_span = max(0.0, max_epoch - min_epoch)
         ranked = []
-        for row in rows:
+        for row, row_epoch in zip(rows, row_epochs):
             content = str(row["content"])
             matched = [term for term in terms if term in content.casefold()]
             semantic_score = cosine(query_vector, unpack(row["embedding"], int(row["embedding_dim"] or EMBEDDING_DIMENSION)))
             if not matched and semantic_score < 0.12:
                 continue
             lexical_score = min(0.65, len(matched) * 0.16)
-            ranked.append((semantic_score + lexical_score, str(row["id"]), row, semantic_score))
+            recency_bonus = ((row_epoch - min_epoch) / epoch_span) * 0.35 if latest_requested and epoch_span else 0.0
+            ranked.append((semantic_score + lexical_score + recency_bonus, str(row["id"]), row, semantic_score))
         ranked.sort(key=lambda item: (-item[0], item[1]))
         results = []
         seen_content: set[str] = set()
@@ -537,7 +586,7 @@ class StandaloneMemoryClient:
                 "id": str(row["id"]),
                 "content": content,
                 "score": round(score, 6),
-                "created_at": dt_from_timestamp(row["updated_at"]),
+                "created_at": dt_from_timestamp(row["timestamp"] or row["updated_at"]),
             })
             if len(results) >= max(1, int(limit)):
                 break

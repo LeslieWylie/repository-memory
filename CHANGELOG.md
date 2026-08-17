@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.2
+
+- Align the AML wrapper with the current public contract: accept any non-empty
+  message role and normalize Unix-millisecond source timestamps.
+- Use source event time in `created_at` and add a bounded recency signal for
+  explicit latest/recent queries.
+- Add a submission-ready code-route runbook without claiming local fixture
+  scores as leaderboard results.
+
 ## 0.7.1
 
 - make `repository-memory benchmark --suite public --json` discover the

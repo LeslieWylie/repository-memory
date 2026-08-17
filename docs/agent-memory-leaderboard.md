@@ -10,6 +10,11 @@ claim about leaderboard placement.
 - `POST /add` persists the supplied messages before returning HTTP 200.
 - `POST /search` returns `{"data": [...]}` in relevance order.
 - `user_id` is the sole retrieval isolation boundary.
+- Message `role` is preserved as any non-empty producer role; the current
+  contract does not restrict it to `user` and `assistant`.
+- Unix-millisecond source timestamps are normalized to ISO-8601 `created_at`
+  values. Explicit latest/recent queries receive a bounded recency tie-breaker;
+  ordinary queries remain relevance-first.
 - Add responses echo `request_id`, `user_id`, and `session_id` exactly.
 - Search returns at most `top_k` items; the formal contract permits 100.
 - `Token`, `Bearer`, and `X-Api-Key` authentication are accepted when
@@ -61,6 +66,11 @@ the Docker command, the endpoint paths, the public method description and any
 required attribution through the official evaluation request. The platform
 must deploy the service and run its own smoke/full evaluation; local fixture
 scores are not leaderboard results.
+
+For the form, choose the academic **code submission** route when available. It
+uses the public GitHub repository and Docker entrypoint, so it does not require
+putting a local API address or an Eval Key in the form. The exact material is
+listed in [`docs/aml-submission.md`](aml-submission.md).
 
 ## Local verification
 
