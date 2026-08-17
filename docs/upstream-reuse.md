@@ -51,6 +51,15 @@ left as adapter promises:
   standalone memory and team-memory stores.
 - TencentDB's layer readiness versus population/read-back distinction is kept
   as a hard contract: an available endpoint is not counted as useful memory.
+- TencentDB's capture boundary is now implemented in the public OpenClaw
+  extension: when the host exposes a pre-turn message count or timestamp
+  cursor, capture keeps only the new turn, restores the original user text,
+  and removes injected recall from the durable input. Hosts that do not expose
+  those fields retain the bounded safe fallback.
+- MemOS' short-CJK retrieval lesson is implemented without importing its
+  runtime: the derived trigram index includes the relative path as searchable
+  text, so a person/card name that appears only in a filename can still reach
+  the citation-first scorer. This is a recall fix, not a semantic claim.
 
 The repository index stores conservative date anchors from paths and headings,
 plus explicit local references. Temporal routing uses those anchors instead of

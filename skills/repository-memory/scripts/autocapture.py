@@ -64,14 +64,74 @@ def _content_text(value: Any) -> str:
     return ""
 
 
-def normalize_turn(payload: dict[str, Any], *, max_messages: int = 24, max_message_chars: int = 12000) -> dict[str, Any]:
-    """Return a bounded, provider-neutral session accepted by MemoryCore."""
+def _timestamp_value(value: Any) -> float | None:
+    """Normalize common OpenClaw millisecond/ISO cursors."""
+
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return number / 1000 if number > 10_000_000_000 else number
+    if isinstance(value, str) and value.strip():
+        raw = value.strip()
+        try:
+            number = float(raw)
+            return number / 1000 if number > 10_000_000_000 else number
+        except ValueError:
+            try:
+                return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                return None
+    return None
+
+
+def _message_timestamp(raw: dict[str, Any]) -> float | None:
+    for key in ("timestamp", "ts", "created_at", "createdAt", "time"):
+        value = _timestamp_value(raw.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _capture_messages(payload: dict[str, Any]) -> list[Any]:
+    """Apply upstream-style turn boundaries before role/content cleanup.
+
+    OpenClaw can send the whole session to ``agent_end``.  A position cursor
+    is preferred when the host exposes it; an optional timestamp cursor then
+    removes older stamped messages.  If a host omits either cursor we retain
+    the previous bounded behavior rather than guessing and dropping data.
+    """
 
     raw_messages = payload.get("messages")
     if not isinstance(raw_messages, list):
+        return []
+    start_value = payload.get("original_user_message_count")
+    try:
+        start = max(0, int(start_value)) if start_value is not None else None
+    except (TypeError, ValueError):
+        start = None
+    selected = raw_messages[start:] if start is not None and start <= len(raw_messages) else raw_messages
+    cursor = _timestamp_value(payload.get("after_timestamp"))
+    if cursor is not None:
+        stamped = [_message_timestamp(item) for item in selected if isinstance(item, dict)]
+        if any(value is not None for value in stamped):
+            selected = [
+                item for item in selected
+                if not isinstance(item, dict)
+                or _message_timestamp(item) is None
+                or (_message_timestamp(item) or 0) > cursor
+            ]
+    return selected
+
+
+def normalize_turn(payload: dict[str, Any], *, max_messages: int = 24, max_message_chars: int = 12000) -> dict[str, Any]:
+    """Return a bounded, provider-neutral session accepted by MemoryCore."""
+
+    raw_messages = _capture_messages(payload)
+    if not isinstance(raw_messages, list):
         raise ValueError("post-turn payload requires a messages list")
+    original_user_text = sanitize_text(payload.get("original_user_text"), max_message_chars)
+    last_user_index = max((index for index, raw in enumerate(raw_messages) if isinstance(raw, dict) and raw.get("role") == "user"), default=-1)
     messages: list[dict[str, str]] = []
-    for raw in raw_messages[-max_messages:]:
+    for index, raw in enumerate(raw_messages[-max_messages:], start=max(0, len(raw_messages) - max_messages)):
         if not isinstance(raw, dict):
             continue
         role = str(raw.get("role") or "").strip()
@@ -79,7 +139,8 @@ def normalize_turn(payload: dict[str, Any], *, max_messages: int = 24, max_messa
             continue
         if role not in {"user", "assistant"}:
             continue
-        content = sanitize_text(_content_text(raw.get("content")), max_message_chars)
+        source_content = original_user_text if original_user_text and index == last_user_index else _content_text(raw.get("content"))
+        content = sanitize_text(source_content, max_message_chars)
         if role == "assistant":
             # Match the upstream capture boundary: code is useful for a
             # coding answer but too noisy to promote into durable memory.

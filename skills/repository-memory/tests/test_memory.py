@@ -19,7 +19,8 @@ sys.path.insert(0, str(SCRIPTS))
 import core
 from citation import locate, validate
 from evaluate import evaluate_queries
-from fallback import paths, query_terms
+from fallback import _fts_candidates, paths, query_terms
+from local_index import _ensure_fts
 from memorycore import MemoryCoreClient, MemoryCoreConfig, MemoryCoreError
 from memmy import MemmyClient, MemmyConfig
 from mcp_server import SERVER_VERSION
@@ -88,6 +89,11 @@ class RepositoryMemoryTest(unittest.TestCase):
             ]
         })
 
+    def test_large_index_fts_keeps_filename_cjk_anchor(self):
+        destination = Path(self.temp.name) / "derived-index.json"
+        fts = _ensure_fts(destination, [{"path": "standup/武垚乐.md", "text": "日报：今天完成了实验。"}])
+        self.assertIn("standup/武垚乐.md", _fts_candidates({"fts_path": str(fts)}, ["武垚乐"]))
+
     def tearDown(self):
         os.environ.clear()
         os.environ.update(self.old_env)
@@ -110,7 +116,7 @@ class RepositoryMemoryTest(unittest.TestCase):
     def test_runtime_version_comes_from_skill_version_file(self):
         self.assertEqual(SERVER_VERSION, VERSION)
         self.assertEqual(VERSION, (SCRIPTS.parent / "VERSION").read_text(encoding="utf-8").strip())
-        self.assertEqual(VERSION, "0.7.4")
+        self.assertEqual(VERSION, "0.7.5")
 
     def test_multisource_search_has_verified_and_candidates(self):
         result = core.search(None, "Atlas evidence", limit=5)

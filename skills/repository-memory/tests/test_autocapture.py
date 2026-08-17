@@ -69,6 +69,23 @@ class AutoCaptureTest(unittest.TestCase):
         self.assertEqual(turn["messages"][0]["content"], "真实问题")
         self.assertEqual(turn["messages"][1]["content"], "结论\n\n保留这条结论")
 
+    def test_upstream_style_turn_boundary_uses_position_and_timestamp_cursor(self):
+        turn = normalize_turn({
+            "session_id": "session-1",
+            "original_user_message_count": 2,
+            "after_timestamp": 1704067200,
+            "original_user_text": "用户的原始问题",
+            "messages": [
+                {"role": "user", "timestamp": 1704067100, "content": "旧问题"},
+                {"role": "assistant", "timestamp": 1704067150, "content": "旧回答"},
+                {"role": "user", "timestamp": 1704067210, "content": "被 recall 污染的问题"},
+                {"role": "assistant", "timestamp": 1704067220, "content": "新的结论：保留这个决定"},
+            ],
+        })
+        self.assertEqual([item["role"] for item in turn["messages"]], ["user", "assistant"])
+        self.assertEqual(turn["messages"][0]["content"], "用户的原始问题")
+        self.assertIn("新的结论", turn["messages"][1]["content"])
+
 
 if __name__ == "__main__":
     unittest.main()

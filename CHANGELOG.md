@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.5
+
+- Preserve explicit OpenClaw turn boundaries during automatic capture: use the
+  host's position/timestamp cursor and original user text when available, so
+  recalled context and old session messages do not become new memory.
+- Include relative paths in the disposable large-repository FTS stream. Short
+  CJK/person-name queries can now reach filename-anchored evidence instead of
+  being discarded before deterministic ranking.
+
 ## 0.7.4
 
 - Add conservative date anchors and explicit local-reference metadata to the

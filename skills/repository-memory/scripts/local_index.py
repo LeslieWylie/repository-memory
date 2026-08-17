@@ -23,7 +23,8 @@ from fallback import _read_document, paths
 
 from models import SourceView
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
+FTS_SCHEMA_VERSION = 2
 
 _DATE_RE = re.compile(r"20\d{2}[-/]\d{1,2}(?:[-/]\d{1,2})?|20\d{2}-W\d{1,2}", re.IGNORECASE)
 _MARKDOWN_LINK_RE = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
@@ -85,9 +86,17 @@ def _reference_targets(relative: str, text: str, known_paths: set[str]) -> list[
 
 
 def _ensure_fts(destination: Path, documents: list[dict[str, Any]]) -> Path:
-    """Build a disposable trigram candidate index for large repositories."""
+    """Build a disposable trigram candidate index for large repositories.
 
-    database = Path(f"{destination}.fts.sqlite3")
+    The path is part of the searchable evidence surface.  MemOS' CJK fallback
+    showed why: a short question often names a person or card only in the
+    filename, not in the document body.  The previous content-only FTS cache
+    silently discarded those documents before the deterministic scorer could
+    apply its path anchor bonus.  Keep the source text as the primary field,
+    but include a separator and the relative path in the derived FTS stream.
+    """
+
+    database = Path(f"{destination}.fts.v{FTS_SCHEMA_VERSION}.sqlite3")
     if database.exists():
         try:
             connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
@@ -115,7 +124,11 @@ def _ensure_fts(destination: Path, documents: list[dict[str, Any]]) -> Path:
             )
             connection.executemany(
                 "INSERT INTO documents(rowid, text) VALUES (?, ?)",
-                ((rowid, str(item.get("text") or "")) for rowid, item in enumerate(documents, 1) if item.get("path")),
+                (
+                    (rowid, f"{str(item.get('text') or '')}\n{str(item.get('path') or '')}")
+                    for rowid, item in enumerate(documents, 1)
+                    if item.get("path")
+                ),
             )
             connection.commit()
         finally:

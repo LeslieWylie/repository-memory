@@ -10,6 +10,7 @@ const STATE_TTL_MS = 30 * 60 * 1000;
 const completionKeys = new Set();
 const runStates = new Map();
 const activeAgentStates = new Map();
+const captureBoundaryStates = new Map();
 
 function text(value) {
   if (typeof value === "string") return value;
@@ -27,13 +28,41 @@ function digest(value) {
   return createHash("sha256").update(typeof value === "string" ? value : JSON.stringify(value || {})).digest("hex").slice(0, 24);
 }
 
-function messagesFrom(event, maxMessages, maxMessageChars) {
-  const messages = Array.isArray(event?.messages) ? event.messages : [];
+function numeric(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() && Number.isFinite(Number(value))) return Number(value);
+  return undefined;
+}
+
+function captureBoundary(event, prompt) {
+  const originalUserMessageCount = [
+    event?.originalUserMessageCount,
+    event?.original_user_message_count,
+    event?.messageCountBeforeTurn,
+    event?.message_count_before_turn,
+  ].map(numeric).find((value) => value !== undefined && value >= 0);
+  const afterTimestamp = event?.afterTimestamp ?? event?.after_timestamp ?? event?.captureCursor?.afterTimestamp ?? event?.capture_cursor?.after_timestamp;
+  return {
+    originalUserText: optional(event?.originalUserText) || optional(event?.original_user_text) || optional(prompt),
+    originalUserMessageCount,
+    afterTimestamp,
+  };
+}
+
+function messagesFrom(event, maxMessages, maxMessageChars, boundary) {
+  const allMessages = Array.isArray(event?.messages) ? event.messages : [];
+  const start = numeric(boundary?.originalUserMessageCount);
+  const messages = start !== undefined && start >= 0 && start <= allMessages.length
+    ? allMessages.slice(start)
+    : allMessages.slice(-maxMessages);
   return messages.slice(-maxMessages).flatMap((message) => {
     const role = optional(message?.role);
     if (role !== "user" && role !== "assistant") return [];
     const content = text(message?.content).trim().slice(0, maxMessageChars);
-    return content ? [{ role, content }] : [];
+    if (!content) return [];
+    const item = { role, content };
+    if (message?.timestamp !== undefined) item.timestamp = message.timestamp;
+    return [item];
   });
 }
 
@@ -420,6 +449,8 @@ export default {
       api.on("before_prompt_build", async (event, ctx) => {
         if (!isAllowedAgent(cfg, ctx)) return;
         const prompt = optional(event?.prompt) || optional(event?.message) || "";
+        const boundaryKey = stateKey(ctx, event);
+        captureBoundaryStates.set(boundaryKey, { ...captureBoundary(event, prompt), startedAt: Date.now() });
         if (!shouldRecallPrompt(prompt)) return;
         const outcome = await runRecall(cfg, prompt);
         if (!outcome.ok) {
@@ -448,6 +479,15 @@ export default {
         return context ? { prependContext: context } : undefined;
       }, { priority: 80, timeoutMs: Math.min(cfg.timeoutMs, 30000) });
     }
+
+    // Capture boundaries are useful even when the optional audit guard is off.
+    // Hosts differ in whether the original prompt arrives in before_agent_run
+    // or before_prompt_build, so keep the state independently of the guard.
+    api.on("before_agent_run", async (event, ctx) => {
+      if (!isAllowedAgent(cfg, ctx)) return;
+      const prompt = optional(event?.prompt) || optional(event?.message) || "";
+      captureBoundaryStates.set(stateKey(ctx, event), { ...captureBoundary(event, prompt), startedAt: Date.now() });
+    }, { priority: 95, timeoutMs: 5000 });
 
     if (cfg.guardEnabled) {
       api.on("before_agent_run", async (event, ctx) => {
@@ -608,7 +648,9 @@ export default {
 
     api.on("agent_end", (event, ctx) => {
       if (!isAllowedAgent(cfg, ctx) || event?.success === false) return;
-      const messages = messagesFrom(event, cfg.maxMessages, cfg.maxMessageChars);
+      const boundaryKey = stateKey(ctx, event);
+      const boundary = captureBoundaryStates.get(boundaryKey) || captureBoundary(event, optional(event?.prompt) || optional(event?.message) || "");
+      const messages = messagesFrom(event, cfg.maxMessages, cfg.maxMessageChars, boundary);
       if (!messages.some((item) => item.role === "user") || !messages.some((item) => item.role === "assistant")) return;
       const turnId = runId(ctx, event, messages);
       const key = `${sessionId(ctx, event)}\u0000${turnId}`;
@@ -638,6 +680,12 @@ export default {
         agent_id: optional(ctx?.agentId) || "main",
         workspace: optional(ctx?.workspaceDir),
         messages,
+        // The Node adapter may already slice by position.  A zero count keeps
+        // the Python normalizer from applying the cursor a second time while
+        // preserving the timestamp and original-user-text safeguards.
+        original_user_message_count: 0,
+        original_user_text: boundary.originalUserText,
+        after_timestamp: boundary.afterTimestamp,
       };
       void runCapture(cfg, payload).then((outcome) => {
         if (!outcome.ok) {
@@ -650,6 +698,7 @@ export default {
       if (activeAgentStates.get(optional(ctx?.agentId) || "main") === state) {
         activeAgentStates.delete(optional(ctx?.agentId) || "main");
       }
+      captureBoundaryStates.delete(boundaryKey);
     });
   },
 };
