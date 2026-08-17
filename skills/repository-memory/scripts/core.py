@@ -1505,7 +1505,7 @@ def get_result(
     return {"schema_version": SCHEMA_VERSION, "found": False, "id": result_id, "errors": errors, "reason": "result not found or adapter unavailable"}
 
 
-def doctor(root: Path | None = None, source_id: str | None = None) -> dict[str, Any]:
+def doctor(root: Path | None = None, source_id: str | None = None, *, local: bool = False) -> dict[str, Any]:
     try:
         if root is None and not configured_sources():
             resolve_root()
@@ -1574,7 +1574,7 @@ def doctor(root: Path | None = None, source_id: str | None = None) -> dict[str, 
         # canonical worktree state separately in ``state`` so a dirty local
         # checkout is visible without making every agent distrust the clean
         # remote evidence view.
-        view = prepare_view(spec, local=False)
+        view = prepare_view(spec, local=local)
         adapter = discover_adapter(view)
         report = adapter_status(adapter, probe_memory_layers=True)
         # Build only the disposable index.  A first-run doctor must not report
@@ -1587,7 +1587,7 @@ def doctor(root: Path | None = None, source_id: str | None = None) -> dict[str, 
             repository_semantic = {"configured": False, "available": False, "strategy": "lexical", "error": "repository semantic index probe failed"}
         snapshot_path = cache_root() / "snapshots" / fingerprint(spec)
         snapshot = {"path": str(snapshot_path), "exists": (snapshot_path / ".git").exists(), "commit": git(snapshot_path, "rev-parse", "HEAD") if (snapshot_path / ".git").exists() else None}
-        report.update({"source": spec.id, "repository": spec.repository, "local_only": spec.local_only, "state": state, "index": {**local_index_status(view), "semantic": repository_semantic}, "repository_semantic": repository_semantic, "snapshot_cache": {**snapshot, **view.metadata}, "freshness": view.freshness})
+        report.update({"source": spec.id, "repository": spec.repository, "local_only": spec.local_only, "state": state, "index": {**local_index_status(view), "semantic": repository_semantic}, "repository_semantic": repository_semantic, "snapshot_cache": {**snapshot, **view.metadata}, "freshness": view.freshness, "inspection_mode": "local" if local else "remote_snapshot_preferred"})
         reports.append(report)
     active = [report.get("name") for report in reports if report.get("available")]
     capabilities = sorted({capability for report in reports for capability in report.get("capabilities", [])})
@@ -1831,7 +1831,7 @@ def build_parser() -> argparse.ArgumentParser:
         child.add_argument("--source", default=argparse.SUPPRESS)
         return child
 
-    common("doctor").add_argument("--json", action="store_true")
+    doctor_parser = common("doctor"); doctor_parser.add_argument("--local", action="store_true", help="Inspect the local checkout without attempting a remote snapshot"); doctor_parser.add_argument("--json", action="store_true")
     sync = common("sync"); sync.add_argument("--deep", action="store_true"); sync.add_argument("--local", action="store_true"); sync.add_argument("--all", action="store_true"); sync.add_argument("--json", action="store_true")
     search_parser = common("search"); search_parser.add_argument("query"); search_parser.add_argument("--limit", type=int, default=5); search_parser.add_argument("--deep", action="store_true"); search_parser.add_argument("--local", action="store_true"); search_parser.add_argument("--scope", choices=("repository", "memory", "all"), default="repository"); search_parser.add_argument("--json", action="store_true")
     get_parser = common("get"); get_parser.add_argument("result_id"); get_parser.add_argument("--commit"); get_parser.add_argument("--line-start", type=int); get_parser.add_argument("--line-end", type=int); get_parser.add_argument("--json", action="store_true")
@@ -1925,7 +1925,7 @@ def _mcp_dispatch(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     root = Path(arguments["root"]).expanduser().resolve() if arguments.get("root") else None
     source = arguments.get("source")
     if name == "memory_doctor":
-        return doctor(root, source)
+        return doctor(root, source, local=bool(arguments.get("local")))
     if name == "memory_sync":
         return sync_index(root, source_id=source, local=bool(arguments.get("local")))
     if name == "memory_search":
@@ -2014,7 +2014,7 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
         if args.command in {"init", "source"} and root_arg:
             root = resolve_root(root_arg)
         if args.command == "doctor":
-            value = doctor(root if root_arg else None, getattr(args, "source", None))
+            value = doctor(root if root_arg else None, getattr(args, "source", None), local=bool(args.local))
         elif args.command == "sync":
             value = sync_index(root if root_arg else None, args.deep, None if args.all else getattr(args, "source", None), args.local)
         elif args.command == "search":

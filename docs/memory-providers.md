@@ -77,6 +77,7 @@ returns separate repository and memory groups.
 
 ```bash
 repository-memory doctor --json
+repository-memory doctor --local --json
 repository-memory memmy status --json
 repository-memory memmy configure --endpoint http://127.0.0.1:18960 --json
 repository-memory memmy search --query "..." --json
