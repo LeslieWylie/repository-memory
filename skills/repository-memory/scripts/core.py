@@ -261,6 +261,34 @@ def _interleave_results(buckets: list[list[dict[str, Any]]], limit: int) -> list
     return output
 
 
+def _source_route_score(view: SourceView, query: str, bucket: list[dict[str, Any]]) -> int:
+    """Prefer the source with an explicit lexical/path anchor.
+
+    Multi-source search must not pretend that scores from unrelated stores are
+    comparable.  It still needs a safe default when the caller omits
+    ``source``.  This score is therefore only a routing signal: source id,
+    repository name, and returned citation paths/excerpts may provide an
+    anchor; ties preserve configured source order.  Document ranking remains
+    entirely inside each source.
+    """
+
+    terms = [
+        term for term in query_terms(query)
+        if len(term) >= 3 or any("\u3400" <= char <= "\u9fff" for char in term)
+    ]
+    if not terms:
+        return 0
+    source_text = " ".join((view.spec.id, view.spec.repository, view.spec.root.name)).casefold()
+    result_text = " ".join(
+        str(item.get(key) or "")
+        for item in bucket[:3]
+        for key in ("path", "title", "excerpt")
+    ).casefold()
+    return sum(4 if term.casefold() in result_text else 0 for term in terms) + sum(
+        2 if term.casefold() in source_text else 0 for term in terms
+    )
+
+
 def _discover_views(root: Path | None, source_id: str | None, scope: str, local: bool = False) -> tuple[list[SourceView], SourceView | None, str | None]:
     """Resolve repository views without making MemoryCore depend on a repo."""
 
@@ -707,15 +735,15 @@ def search(root: Path | None, query: str, limit: int = 5, deep: bool = False, so
         return _empty(query, mode, views, "negative intent requires explicit evidence", scope=scope)
     groups = {"repository": {"verified": [], "candidates": [], "results": []}, "memory": {"verified": [], "candidates": [], "results": []}}
     diagnostics: list[dict[str, Any]] = []
-    repository_verified_buckets: list[list[dict[str, Any]]] = []
-    repository_candidate_buckets: list[list[dict[str, Any]]] = []
-    for view in repository_views:
+    repository_verified_buckets: list[tuple[int, int, list[dict[str, Any]]]] = []
+    repository_candidate_buckets: list[tuple[int, int, list[dict[str, Any]]]] = []
+    for source_index, view in enumerate(repository_views):
         adapter = discover_adapter(view)
         if scope in {"repository", "all"}:
             items, diagnostic = _repository_items(view, adapter, query, limit, deep, local)
             verified, candidates = _split_results(items)
-            repository_verified_buckets.append(verified)
-            repository_candidate_buckets.append(candidates)
+            repository_verified_buckets.append((_source_route_score(view, query, verified), source_index, verified))
+            repository_candidate_buckets.append((_source_route_score(view, query, candidates), source_index, candidates))
             diagnostics.append(diagnostic)
     if memory_view is not None:
         adapter = Adapter(None, memory_view)
@@ -729,8 +757,10 @@ def search(root: Path | None, query: str, limit: int = 5, deep: bool = False, so
         diagnostics.append({"source": None, "adapter": "repository-memory", "fallback": False, "memory_skipped": True, "reason": discovery_error})
     if discovery_error and scope == "memory" and memory_view is not None:
         diagnostics.append({"source": None, "adapter": "repository-memory", "repository_skipped": True, "reason": discovery_error})
-    groups["repository"]["verified"] = _interleave_results(repository_verified_buckets, limit)
-    groups["repository"]["candidates"] = _interleave_results(repository_candidate_buckets, limit)
+    ordered_verified = [bucket for _score, _index, bucket in sorted(repository_verified_buckets, key=lambda item: (-item[0], item[1]))]
+    ordered_candidates = [bucket for _score, _index, bucket in sorted(repository_candidate_buckets, key=lambda item: (-item[0], item[1]))]
+    groups["repository"]["verified"] = _interleave_results(ordered_verified, limit)
+    groups["repository"]["candidates"] = _interleave_results(ordered_candidates, limit)
     for group in groups.values():
         group["verified"] = group["verified"][:limit]
         group["candidates"] = group["candidates"][:limit]

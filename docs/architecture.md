@@ -45,7 +45,10 @@ memory_context
 The source adapter ranks within its own source. `memory_context` is the fusion
 seam, but it returns repository evidence, decisions, failures, solutions,
 discoveries, and handoffs as separate sections. The two recalls run in
-parallel, but scores are not combined into an opaque global RRF score. The
+parallel, but scores are not combined into an opaque global RRF score. When a
+repository query omits `source`, a small lexical/path anchor can order the
+source buckets (for example a repository-specific filename); ties preserve
+configured order. This is routing, not cross-source score fusion. The
 accurate capability name is `multi-source-lexical`, not semantic hybrid.
 
 ## Freshness

@@ -133,6 +133,10 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(len(pending["verified"]), 0)
         self.assertEqual(pending["candidates"][0]["evidence_status"], "pending")
 
+    def test_multisource_search_routes_explicit_anchor_to_matching_source(self):
+        result = core.search(None, "alpha", limit=5)
+        self.assertEqual(result["verified"][0]["source"], "alpha")
+
     def test_negative_and_local_structured_backend_are_conservative(self):
         negative = core.search(None, "fictional benchmark ZZZQWE")
         self.assertTrue(negative["abstain"])
