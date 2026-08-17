@@ -364,7 +364,11 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
         if isinstance(indexed_documents, list)
         else [(relative, None) for relative in paths(source.path, deep)]
     )
-    fts_paths = _fts_candidates(indexed, terms)
+    # Content/path FTS is an acceleration lane for genuinely large indexes.
+    # Medium indexes may already have an old sidecar from an experiment, but
+    # using it as a hard candidate gate can reduce semantic/temporal recall.
+    indexed_count = int(indexed.get("document_count") or len(indexed_documents or [])) if isinstance(indexed, dict) else 0
+    fts_paths = _fts_candidates(indexed, terms) if indexed_count >= 5000 else None
     documents = [(relative, text) for relative, text in all_documents if fts_paths is None or relative in fts_paths]
     # A semantic rewrite can have no lexical hit. Keep the full path/text map
     # only as a cheap in-process view of the already-loaded JSON cache, then

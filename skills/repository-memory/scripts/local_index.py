@@ -28,7 +28,7 @@ from models import SourceView
 # document in a large repository.
 SCHEMA_VERSION = 5
 PATH_FTS_SCHEMA_VERSION = 1
-FTS_DOCUMENT_THRESHOLD = 1000
+FTS_DOCUMENT_THRESHOLD = 5000
 
 _DATE_RE = re.compile(r"20\d{2}[-/]\d{1,2}(?:[-/]\d{1,2})?|20\d{2}-W\d{1,2}", re.IGNORECASE)
 _MARKDOWN_LINK_RE = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
