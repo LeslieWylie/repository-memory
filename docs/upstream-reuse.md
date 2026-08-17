@@ -32,6 +32,39 @@ The defaults from upstream were not copied blindly. In particular, a low
 induction threshold can create impressive-looking but noisy L2/L3 records. Our
 runtime keeps explicit candidate/accepted states and read-back verification.
 
+## What was added after the comparison
+
+The useful parts are implemented in the independent local core rather than
+left as adapter promises:
+
+- MemOS-style lifecycle metadata is represented by layer, status, source,
+  session, version and read-back fields; feedback remains explicit and does not
+  silently rewrite a fact.
+- Hindsight's separation between retention, recall and reflection is reflected
+  in separate `ingest-session`, `search`, `timeline` and supervisor paths.
+  Reflection/supervision remains optional and cannot auto-accept L2/L3.
+- Cognee's explainable relationship idea is implemented as a tiny derived graph:
+  Markdown links and explicit local file references are indexed, relationship
+  queries expand one hop, and results expose `related` citations. There is no
+  graph server and no inferred edge pretending to be evidence.
+- Mem0-style identity/session/run scoping and deduplication are retained in the
+  standalone memory and team-memory stores.
+- TencentDB's layer readiness versus population/read-back distinction is kept
+  as a hard contract: an available endpoint is not counted as useful memory.
+
+The repository index stores conservative date anchors from paths and headings,
+plus explicit local references. Temporal routing uses those anchors instead of
+dates buried in arbitrary evidence text. This improves latest/report queries
+without changing canonical Git files.
+
+## Deliberate non-goals
+
+We did not copy Neo4j/Qdrant/Postgres deployment, a second canonical document
+store, opaque graph edges, automatic LLM memory acceptance, or a mandatory
+remote embedding service. The default remains zero-service and citation-first.
+The current `builtin-char-ngram-v1` projection is a deterministic local recall
+lane; it is not a neural embedding model and is reported as such.
+
 ## Reference locations
 
 The clone locations are user-level reference material, not import paths used

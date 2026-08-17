@@ -56,6 +56,25 @@ fails, the runtime can expose a local fallback, but its freshness says
 `fallback` and it cannot silently become fresh evidence. `--local` is an
 explicit opt-in for current checkout state.
 
+## Derived repository knowledge
+
+The local index stores two conservative metadata layers in addition to document
+text:
+
+- date anchors found in the path, Markdown headings, and explicit date fields;
+- explicit local Markdown/path references resolved to files in the same source.
+
+Latest queries use the date anchors. Relationship queries may expand one hop
+through the explicit references and return those files in `related`. This is a
+small, deterministic and inspectable graph seam; it does not infer edges from
+embedding similarity and it does not require a graph database. The canonical
+source remains the file and its Git citation.
+
+The current semantic capability is reported per source. `local-hybrid` means
+the optional deterministic builtin projection is available; it does not mean a
+neural model is installed. A neural provider and an LLM supervisor remain
+explicit opt-ins.
+
 ## Evidence state
 
 The citation validator checks:

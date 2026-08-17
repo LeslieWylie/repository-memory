@@ -67,6 +67,5 @@ class DeliveryContractTest(unittest.TestCase):
         self.assertEqual(report["status"], "completed")
         self.assertTrue(report["report"]["qrels_audit"]["ok"])
 
-
 if __name__ == "__main__":
     unittest.main()

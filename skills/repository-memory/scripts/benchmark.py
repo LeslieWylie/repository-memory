@@ -31,6 +31,12 @@ def _local_public_root() -> Path | None:
     return None
 
 
+def _user_data_public() -> Path:
+    configured = os.environ.get("XDG_DATA_HOME")
+    base = Path(configured).expanduser() if configured else Path.home() / ".local" / "share"
+    return base / "repository-memory" / "eval" / "public"
+
+
 def _paths(suite: str, data: Path | None, queries: Path | None, qrels: Path | None) -> tuple[Path, Path, Path | None]:
     if queries and qrels:
         return queries, qrels, data
@@ -38,6 +44,7 @@ def _paths(suite: str, data: Path | None, queries: Path | None, qrels: Path | No
         if suite == "public":
             candidates = [
                 Path(__file__).resolve().parents[3] / "eval" / "public",
+                _user_data_public(),
                 Path(sys.prefix) / "share" / "repository-memory" / "eval" / "public",
                 Path(site.getuserbase()) / "share" / "repository-memory" / "eval" / "public",
             ]

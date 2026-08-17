@@ -346,6 +346,11 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
     hits: list[dict[str, Any]] = []
     indexed = source.metadata.get("local_index") if isinstance(source.metadata, dict) else None
     indexed_documents = indexed.get("documents") if isinstance(indexed, dict) else None
+    document_metadata = {
+        str(item.get("path")): item
+        for item in indexed_documents or []
+        if isinstance(item, dict) and item.get("path")
+    }
     all_documents = (
         [(str(item.get("path")), str(item.get("text") or "")) for item in indexed_documents if isinstance(item, dict) and item.get("path")]
         if isinstance(indexed_documents, list)
@@ -356,6 +361,10 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
     # A semantic rewrite can have no lexical hit. Keep the full path/text map
     # only as a cheap in-process view of the already-loaded JSON cache, then
     # narrow it to semantic candidates after scoring below.
+    all_document_by_path = dict(all_documents)
+    # Keep the original semantic candidate behavior for small/non-FTS indexes:
+    # without a lexical candidate set, do not discard documents solely
+    # because the optional projection ranks them below its recall threshold.
     document_by_path = dict(all_documents) if fts_paths is not None else None
     loaded_documents: list[tuple[str, str]] = []
     for relative, indexed_text in documents:
@@ -445,6 +454,26 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
         and ("-" in term or any(char.isdigit() for char in term) or basename_term_counts.get(term, 0) <= 3)
     }
     relationship_query = bool(re.search(r"related|relationship|compare|comparison|关联|相关|对比|比较", query, re.IGNORECASE))
+    graph_paths: set[str] = set()
+    if relationship_query and named_terms and document_metadata:
+        # Expand one hop through explicit local references. This borrows the
+        # useful part of graph retrieval without adding a graph server or
+        # inventing opaque similarity edges.
+        anchor_paths = {
+            relative
+            for relative, text in all_document_by_path.items()
+            if any(term in f"{relative} {text}".casefold() for term in named_terms)
+        }
+        for relative in anchor_paths:
+            links = document_metadata.get(relative, {}).get("links", [])
+            graph_paths.update(str(link) for link in links if str(link) in all_document_by_path)
+        for relative, metadata in document_metadata.items():
+            links = metadata.get("links", []) if isinstance(metadata, dict) else []
+            if any(str(link) in anchor_paths for link in links):
+                graph_paths.add(relative)
+        if graph_paths:
+            selected = {relative for relative, _text in documents} | graph_paths
+            documents = [(relative, all_document_by_path[relative]) for relative in selected if relative in all_document_by_path]
     entity_layers = {
         layer for layer in available_layers
         if any(layer.casefold().rstrip("s") in GENERIC_LAYER_ALIASES[key] for key in ("paper", "model", "person", "benchmark"))
@@ -514,7 +543,7 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
             and not deep
             and not latest
             and layer not in preferred_layers
-            and not (relationship_query and named_terms and layer in entity_layers)
+            and not (relationship_query and named_terms and (layer in entity_layers or relative in graph_paths))
         ):
             # A relationship query can legitimately cross from a named entity
             # card into a second entity layer (for example model -> benchmark).
@@ -526,17 +555,23 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
         temporal_candidate = latest and bool(preferred_layers) and layer in preferred_layers
         layer_only_candidate = bool(preferred_layers) and not specific_terms and layer in preferred_layers
         semantic_candidate = relative in semantic_candidates
-        if matched < minimum_matches and not temporal_candidate and not layer_only_candidate and not semantic_candidate:
+        graph_candidate = relative in graph_paths
+        if matched < minimum_matches and not temporal_candidate and not layer_only_candidate and not semantic_candidate and not graph_candidate:
             continue
         excerpt_terms = list(dict.fromkeys(
             term for term in [*raw_terms, *terms]
             if term not in {"what", "latest", "recent", "source", "evidence", "citation", "model", "paper", "benchmark", "report", "note", "section"}
         ))
         excerpt, excerpt_start, excerpt_end = _evidence_window(text, excerpt_terms or terms)
-        dates = []
-        for value in DATE_RE.findall(relative):
-            normalized = value.replace("/", "-").replace("-W", "-")
-            dates.append(tuple(int(part) for part in normalized.split("-") if part.isdigit()))
+        dates = [
+            tuple(int(part) for part in re.findall(r"\d+", value)[:3])
+            for value in (document_metadata.get(relative, {}).get("dates", []) if isinstance(document_metadata.get(relative), dict) else [])
+        ]
+        if not dates:
+            dates = [
+                tuple(int(part) for part in value.replace("/", "-").replace("-W", "-").split("-") if part.isdigit())
+                for value in DATE_RE.findall(relative)
+            ]
         latest_score = max(dates, default=(0, 0, 0)) if temporal_candidate else (0, 0, 0)
         latest_score = tuple((*latest_score, 0, 0)[:3])
         start, end = locate(source.path, relative, excerpt)
@@ -556,6 +591,7 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
         evidence_status = "secondary"
         support = _claim_support(terms, excerpt, start or excerpt_start, end or excerpt_end)
         semantic_score = semantic_scores.get(relative, 0.0)
+        graph_bonus = 900 if graph_candidate else 0
         # Keep P@1 deterministic for exact/entity queries: the builtin
         # projection is a recall lane, not a replacement for a real lexical
         # foothold.  It may rescue a paraphrase with no term match, but it
@@ -636,7 +672,18 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
             "evidence_status": evidence_status,
             "generated": False,
             "accepted": None,
-            "related": [],
+            "related": [
+                {
+                    "id": f"{source.spec.id}:{target}",
+                    "path": target,
+                    "source": source.spec.id,
+                    "repository": source.spec.repository,
+                    "commit": source.commit,
+                    "relation": "explicit-local-reference",
+                }
+                for target in (document_metadata.get(relative, {}).get("links", []) if isinstance(document_metadata.get(relative), dict) else [])
+                if str(target) in all_document_by_path
+            ],
             "citation": {"source": "repository", "backend": "repository-local-structured", "repository": source.spec.repository, "commit": source.commit, "path": relative, "memory_id": f"{source.spec.id}:{relative}", "line_start": start, "line_end": end, "evidence": excerpt, "generated": False, "accepted": None, "valid": bool(start and end), "stale": False},
             "_score": (
                 sum(min(haystack.count(term), 4) * (6 + 18 * term_idf.get(term, 1.0)) for term in terms)
@@ -645,6 +692,7 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
                 + int(coverage_ratio * 1800)
                 + full_coverage_bonus
                 + content_bonus
+                + graph_bonus
                 + semantic_bonus
                 + path_anchor_bonus
                 + sum(500 for term in raw_terms if "-" in term and term in haystack)

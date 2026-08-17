@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.4
+
+- Add conservative date anchors and explicit local-reference metadata to the
+  disposable repository index.
+- Improve latest/report routing from headings and explicit date fields without
+  treating arbitrary body dates as document dates.
+- Add explainable one-hop relationship expansion and `related` citations for
+  explicit local links, without a graph service or opaque score fusion.
+- Preserve the zero-service, citation-first default and report the builtin
+  projection as non-neural.
+
 ## 0.7.3
 
 - Align the AML wrapper with the current public contract: accept any non-empty

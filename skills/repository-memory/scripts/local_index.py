@@ -11,17 +11,23 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import re
 import sqlite3
 import tempfile
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from discovery import cache_root, fingerprint
 from fallback import _read_document, paths
 
 from models import SourceView
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
+
+_DATE_RE = re.compile(r"20\d{2}[-/]\d{1,2}(?:[-/]\d{1,2})?|20\d{2}-W\d{1,2}", re.IGNORECASE)
+_MARKDOWN_LINK_RE = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
+_INLINE_PATH_RE = re.compile(r"(?<![A-Za-z0-9_./-])(?:[^\s`'\"()<>]+/)?[^\s`'\"()<>]+\.(?:md|mdx|txt|rst|yaml|yml|json)(?:#[^\s`'\"()<>]+)?", re.IGNORECASE)
 
 
 def _revision_key(view: SourceView, deep: bool) -> str:
@@ -44,6 +50,38 @@ def _load(path: Path) -> dict[str, Any] | None:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     return value if isinstance(value, dict) and value.get("schema_version") == SCHEMA_VERSION and isinstance(value.get("documents"), list) else None
+
+
+def _document_dates(relative: str, text: str) -> list[str]:
+    """Extract conservative temporal anchors for latest/history routing."""
+
+    anchors = [relative]
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("#", "date:", "Date:", "observed_at:", "review_date:")):
+            anchors.append(stripped)
+    return list(dict.fromkeys(_DATE_RE.findall("\n".join(anchors))))
+
+
+def _reference_targets(relative: str, text: str, known_paths: set[str]) -> list[str]:
+    """Resolve explicit local Markdown/path references into a tiny graph."""
+
+    raw_targets = list(_MARKDOWN_LINK_RE.findall(text))
+    raw_targets.extend(_INLINE_PATH_RE.findall(text))
+    resolved: list[str] = []
+    parent = Path(relative).parent
+    for raw in raw_targets:
+        target = unquote(str(raw).split("#", 1)[0].split("?", 1)[0]).strip()
+        if not target or target.startswith(("http://", "https://", "mailto:", "#")):
+            continue
+        candidates = [
+            Path(target).as_posix().lstrip("./"),
+            (parent / target).as_posix(),
+        ]
+        match = next((candidate for candidate in candidates if candidate in known_paths), None)
+        if match and match != relative and match not in resolved:
+            resolved.append(match)
+    return resolved[:32]
 
 
 def _ensure_fts(destination: Path, documents: list[dict[str, Any]]) -> Path:
@@ -91,13 +129,21 @@ def _ensure_fts(destination: Path, documents: list[dict[str, Any]]) -> Path:
 
 def build(view: SourceView, deep: bool = False) -> dict[str, Any]:
     documents: list[dict[str, Any]] = []
-    for relative in paths(view.path, deep):
+    relative_paths = paths(view.path, deep)
+    known_paths = set(relative_paths)
+    for relative in relative_paths:
         try:
             stat = (view.path / relative).stat()
             text = _read_document(view.path, relative, stat.st_mtime_ns, stat.st_size)
         except (OSError, UnicodeDecodeError):
             continue
-        documents.append({"path": relative, "text": text, "size": stat.st_size})
+        documents.append({
+            "path": relative,
+            "text": text,
+            "size": stat.st_size,
+            "dates": _document_dates(relative, text),
+            "links": _reference_targets(relative, text, known_paths),
+        })
     value = {
         "schema_version": SCHEMA_VERSION,
         "source": view.spec.id,

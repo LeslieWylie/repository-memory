@@ -106,6 +106,26 @@ def _copy_skill(source: Path, destination: Path) -> None:
         shutil.rmtree(temporary, ignore_errors=True)
 
 
+def _copy_public_eval(source: Path) -> Path:
+    """Keep the privacy-free public fixture beside the user-level runtime."""
+
+    source_root = source.parents[1] / "eval" / "public"
+    if not source_root.is_dir():
+        raise RuntimeError(f"public benchmark fixture is missing: {source_root}")
+    destination = _data_home() / "repository-memory" / "eval" / "public"
+    temporary = Path(tempfile.mkdtemp(prefix=".repository-memory-eval-", dir=destination.parent.parent))
+    staged = temporary / "public"
+    try:
+        shutil.copytree(source_root, staged)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists():
+            shutil.rmtree(destination)
+        staged.replace(destination)
+    finally:
+        shutil.rmtree(temporary, ignore_errors=True)
+    return destination
+
+
 def _copy_openclaw_extension(source: Path, destination: Path) -> None:
     """Install the lifecycle extension without replacing an unmanaged plugin."""
 
@@ -558,6 +578,7 @@ def install(args: argparse.Namespace) -> dict[str, Any]:
     source = _source_skill()
     canonical = _canonical_skill()
     _copy_skill(source, canonical)
+    public_eval = _copy_public_eval(source)
     cli = _install_cli(canonical)
 
     targets = set(args.target or ["auto"])
@@ -607,6 +628,7 @@ def install(args: argparse.Namespace) -> dict[str, Any]:
         "hosts": hosts,
         "source": source_status,
         "source_root": str(source_root) if source_root else None,
+        "public_eval": str(public_eval),
         "verification": verification,
         "next_step": "restart or start a new agent turn, then ask it to use repository-memory",
     }

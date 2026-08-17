@@ -110,7 +110,7 @@ class RepositoryMemoryTest(unittest.TestCase):
     def test_runtime_version_comes_from_skill_version_file(self):
         self.assertEqual(SERVER_VERSION, VERSION)
         self.assertEqual(VERSION, (SCRIPTS.parent / "VERSION").read_text(encoding="utf-8").strip())
-        self.assertEqual(VERSION, "0.7.3")
+        self.assertEqual(VERSION, "0.7.4")
 
     def test_multisource_search_has_verified_and_candidates(self):
         result = core.search(None, "Atlas evidence", limit=5)
@@ -241,6 +241,40 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertFalse(result["abstain"])
         self.assertEqual(result["mode"], "temporal")
         self.assertEqual(result["verified"][0]["path"], "standup/daily.md")
+
+    def test_explicit_local_links_expand_relationship_queries(self):
+        docs = self.alpha / "docs"
+        (docs / "alpha.md").write_text(
+            "# Alpha entity\n\nRelated benchmark: [Beta benchmark](benchmark.md)\n",
+            encoding="utf-8",
+        )
+        (docs / "benchmark.md").write_text(
+            "# Beta benchmark\n\nA result only described by the linked entity.\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "-C", str(self.alpha), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(self.alpha), "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "links"], check=True)
+        self.write_config({"sources": [{"id": "alpha", "root": str(self.alpha)}]})
+
+        result = core.search(None, "Alpha related benchmark", local=True)
+
+        self.assertFalse(result["abstain"])
+        self.assertEqual(result["verified"][0]["path"], "docs/alpha.md")
+        self.assertTrue(any(item["path"] == "docs/benchmark.md" for item in result["verified"][0]["related"]))
+
+    def test_latest_routing_uses_dates_in_report_headings(self):
+        reports = self.alpha / "reports"
+        reports.mkdir()
+        (reports / "current.md").write_text("# 2026-08-09\n\nExperiment current result.\n", encoding="utf-8")
+        (reports / "older.md").write_text("# 2026-07-01\n\nExperiment older result.\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.alpha), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(self.alpha), "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "dated reports"], check=True)
+        self.write_config({"sources": [{"id": "alpha", "root": str(self.alpha)}]})
+
+        result = core.search(None, "最近 experiment", local=True)
+
+        self.assertFalse(result["abstain"])
+        self.assertEqual(result["verified"][0]["path"], "reports/current.md")
 
     def test_remote_snapshot_does_not_use_dirty_worktree(self):
         bare = Path(self.temp.name) / "origin.git"
