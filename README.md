@@ -90,6 +90,22 @@ python3 install.py --target openclaw --openclaw-config /path/to/openclaw.json \
   --source-root /path/to/knowledge-repository --json
 ```
 
+For a remote OpenClaw host, the shortest supported bootstrap is one command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/LeslieWylie/repository-memory/main/bootstrap.sh \
+  | sh -s -- --target openclaw --openclaw-agent auto \
+  --source-url <knowledge-git-url> --source-branch main --json
+```
+
+`--openclaw-agent auto` uses `OPENCLAW_AGENT_ID`/`AGENT_ID`, or selects the
+only configured OpenClaw agent. If the profile intentionally contains several
+agents, replace it with `--openclaw-all-agents` or an explicit repeated
+`--openclaw-agent <id>`. `--source-url` clones the knowledge repository into a
+user cache, registers it, and runs the same doctor/MCP smoke checks. Credentials
+are taken from the host's existing Git credential helper; they are not written
+to the command, config, or audit log.
+
 OpenClaw installation is least-privilege by default: `--openclaw-agent` is
 required and only that agent receives the Skill, MCP tool permissions, and
 automatic capture. Use `--openclaw-agent` repeatedly for a selected set. The

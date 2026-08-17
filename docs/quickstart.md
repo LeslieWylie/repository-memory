@@ -24,6 +24,22 @@ The source root must be a Git repository or a directory explicitly intended
 as a knowledge source. The installer writes user config and derived cache;
 the source files stay untouched.
 
+### Remote host one-liner
+
+On a remote OpenClaw host, send the bot this exact command (replace only the
+knowledge Git URL):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/LeslieWylie/repository-memory/main/bootstrap.sh | sh -s -- --target openclaw --openclaw-agent auto --source-url <knowledge-git-url> --source-branch main --json
+```
+
+The command clones the installer into user cache, discovers the active agent,
+registers the namespaced stdio MCP, enables the advisory lifecycle extension,
+registers the knowledge source, and runs `doctor` plus the MCP smoke probe.
+It does not modify the knowledge checkout, commit/push anything, or expose
+feedback/promote tools. For a multi-agent profile use
+`--openclaw-all-agents` explicitly.
+
 The install is self-contained. Do not start a vendor MemoryCore, Memmy, Wiki,
 or embedding service. The first `doctor` creates the user-level SQLite state
 and reports `memory.backend=standalone-memory`, `external_dependency=false`,

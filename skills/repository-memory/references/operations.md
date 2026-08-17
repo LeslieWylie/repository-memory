@@ -7,6 +7,20 @@ discovered from the current directory, user configuration, or an explicit
 
 ## Host setup handshake
 
+For a remote OpenClaw host, use the repository's bootstrap command instead of
+asking the agent to assemble separate clone/install/MCP commands:
+
+```text
+curl -fsSL https://raw.githubusercontent.com/LeslieWylie/repository-memory/main/bootstrap.sh | sh -s -- --target openclaw --openclaw-agent auto --source-url <knowledge-git-url> --source-branch main --json
+```
+
+`auto` resolves the current agent from `OPENCLAW_AGENT_ID`/`AGENT_ID` or from
+the only configured agent. If there are multiple configured agents, the
+installer fails with their ids rather than silently installing to the wrong
+profile. Use `--openclaw-all-agents` only when that scope is intentional.
+The bootstrap checkout and source checkout are user-cache data; the source
+repository is never modified, committed, or pushed by installation.
+
 Before running a query, establish which interface is actually available:
 
 1. Check that the Skill package is loaded and inspect the registered MCP with

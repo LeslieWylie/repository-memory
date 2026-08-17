@@ -150,6 +150,45 @@ def _run(command: list[str], env: dict[str, str] | None = None) -> tuple[bool, s
     return result.returncode == 0, output
 
 
+def _discover_git_root() -> Path:
+    """Find the nearest Git root for one-command remote installation."""
+
+    current = Path.cwd().resolve()
+    for candidate in (current, *current.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    raise RuntimeError("source root was not found; pass --source-root or --source-url")
+
+
+def _checkout_source(url: str, branch: str | None = None) -> Path:
+    """Clone/update a source into user cache without touching a workspace."""
+
+    clean = url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git") or "source"
+    safe_name = "".join(char if char.isalnum() or char in "._-" else "_" for char in clean)
+    destination = _data_home() / "repository-memory" / "sources" / safe_name
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if (destination / ".git").exists():
+        fetch = ["git", "-C", str(destination), "fetch", "--depth", "1", "origin"]
+        if branch:
+            fetch.append(branch)
+        ok, output = _run(fetch)
+        if not ok:
+            raise RuntimeError(f"source fetch failed: {output[:500]}")
+        target = "FETCH_HEAD"
+        ok, output = _run(["git", "-C", str(destination), "checkout", "--detach", target])
+        if not ok:
+            raise RuntimeError(f"source checkout failed: {output[:500]}")
+    else:
+        command = ["git", "clone", "--depth", "1"]
+        if branch:
+            command.extend(["--branch", branch])
+        command.extend([url, str(destination)])
+        ok, output = _run(command)
+        if not ok:
+            raise RuntimeError(f"source clone failed: {output[:500]}")
+    return destination
+
+
 def _audit_log() -> Path:
     return _data_home() / "repository-memory" / "audit.jsonl"
 
@@ -299,6 +338,15 @@ def _install_openclaw(
         for row in rows
         if isinstance(row, dict) and row.get("workspace")
     }
+    if agent_ids and "auto" in agent_ids:
+        explicit = os.environ.get("OPENCLAW_AGENT_ID") or os.environ.get("AGENT_ID")
+        if explicit:
+            agent_ids = [explicit]
+        elif len(configured_ids) == 1:
+            agent_ids = [next(iter(configured_ids))]
+        else:
+            available = ", ".join(sorted(configured_ids)) or "none"
+            raise RuntimeError(f"cannot resolve --openclaw-agent auto; set OPENCLAW_AGENT_ID or choose one of: {available}")
     selected_ids = configured_ids if all_agents else set(agent_ids or [])
     if not selected_ids:
         raise RuntimeError("OpenClaw installation requires --openclaw-agent <id>; use --openclaw-all-agents only when intentional")
@@ -540,10 +588,15 @@ def install(args: argparse.Namespace) -> dict[str, Any]:
             args.openclaw_all_agents,
         )
 
-    source_status = None
-    if args.source_root:
-        source_status = _configure_source(canonical, Path(args.source_root).expanduser().resolve(), args.source_local_only)
-    verification = None if args.no_verify else _verify(canonical, require_repository=bool(args.source_root))
+    if args.source_root and args.source_url:
+        raise ValueError("use only one of --source-root and --source-url")
+    source_root = None
+    if args.source_url:
+        source_root = _checkout_source(args.source_url, args.source_branch)
+    elif args.source_root:
+        source_root = _discover_git_root() if args.source_root == "auto" else Path(args.source_root).expanduser().resolve()
+    source_status = _configure_source(canonical, source_root, args.source_local_only) if source_root else None
+    verification = None if args.no_verify else _verify(canonical, require_repository=bool(source_root))
     return {
         "schema_version": 1,
         "status": "installed",
@@ -552,6 +605,7 @@ def install(args: argparse.Namespace) -> dict[str, Any]:
         "targets": sorted(targets),
         "hosts": hosts,
         "source": source_status,
+        "source_root": str(source_root) if source_root else None,
         "verification": verification,
         "next_step": "restart or start a new agent turn, then ask it to use repository-memory",
     }
@@ -562,6 +616,8 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--target", action="append", choices=["auto", "all", "codex", "claude", "openclaw"])
     value.add_argument("--all", action="store_true", help="install for Codex, Claude Code, and every configured OpenClaw agent")
     value.add_argument("--source-root", help="register and index a repository or document directory")
+    value.add_argument("--source-url", help="clone/update a Git knowledge source in the user cache and register it")
+    value.add_argument("--source-branch", help="branch to clone/fetch for --source-url")
     value.add_argument("--source-local-only", action="store_true", help="declare --source-root as an intentional offline/local snapshot")
     value.add_argument("--openclaw-config", help="override the OpenClaw config path")
     value.add_argument("--openclaw-agent", action="append", help="install and enable repository-memory only for this OpenClaw agent; repeat for multiple agents")
