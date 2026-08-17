@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "repository-memory"
-version = "0.5.0"
+version = "0.6.0"
 description = "Standalone citation-first repository memory Skill, CLI, MCP server, and local L0-L3 runtime"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -62,5 +62,14 @@ py-modules = [
   "team_memory",
   "team_memory_eval",
   "vendor_components",
+  "provider_protocol",
+  "supervisor",
+  "benchmark",
   "version",
+]
+
+[tool.setuptools.data-files]
+"share/repository-memory/eval/public" = [
+  "eval/public/queries.jsonl",
+  "eval/public/qrels.jsonl",
 ]

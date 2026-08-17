@@ -218,7 +218,24 @@ def evaluate_queries(root: Path, queries_path: Path, qrels_path: Path, *, limit:
     latencies: list[float] = []
     buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
     previous_source_id = os.environ.get("REPOSITORY_MEMORY_SOURCE_ID")
+    previous_reuse_view = os.environ.get("REPOSITORY_MEMORY_EVAL_REUSE_VIEW")
+    os.environ["REPOSITORY_MEMORY_EVAL_REUSE_VIEW"] = "1"
+    warmup = os.environ.get("REPOSITORY_MEMORY_EVAL_WARMUP", "1").casefold() not in {"0", "false", "no", "off"}
     try:
+        if warmup and queries:
+            first = queries[0]
+            first_source = str(first.get("source_scope") or root.name)
+            if revision:
+                os.environ["REPOSITORY_MEMORY_SOURCE_ID"] = first_source
+            search(
+                evaluated_root,
+                str(first.get("query") or ""),
+                limit=1,
+                deep=deep,
+                source_id=first_source if revision else first.get("source_scope"),
+                local=local or bool(revision),
+                scope=scope,
+            )
         for query in queries:
             query_id = str(query.get("id") or "")
             relevant = {doc_id for doc_id, relevance in grouped.get(query_id, {}).items() if relevance > 0}
@@ -270,6 +287,10 @@ def evaluate_queries(root: Path, queries_path: Path, qrels_path: Path, *, limit:
             os.environ.pop("REPOSITORY_MEMORY_SOURCE_ID", None)
         else:
             os.environ["REPOSITORY_MEMORY_SOURCE_ID"] = previous_source_id
+        if previous_reuse_view is None:
+            os.environ.pop("REPOSITORY_MEMORY_EVAL_REUSE_VIEW", None)
+        else:
+            os.environ["REPOSITORY_MEMORY_EVAL_REUSE_VIEW"] = previous_reuse_view
 
     positive = [row for row in rows if not row["expected_abstain"]]
     negatives = [row for row in rows if row["expected_abstain"]]
@@ -308,6 +329,7 @@ def evaluate_queries(root: Path, queries_path: Path, qrels_path: Path, *, limit:
         "qrels_sha256": _hash(qrels_path),
         "queries": str(queries_path),
         "qrels": str(qrels_path),
+        "warmup": warmup,
         "limit": limit,
         "scope": scope,
         "retrieval_mode": "repository-citation-first" if scope == "repository" else "layered-memory" if scope == "memory" else "grouped",

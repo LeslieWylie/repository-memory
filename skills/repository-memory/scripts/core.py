@@ -69,6 +69,7 @@ from models import SourceSpec, SourceView
 
 SCHEMA_VERSION = 4
 REPOSITORY_BACKEND = "repository-local-structured"
+_EVAL_VIEW_CACHE: dict[tuple[str, str, bool], SourceView] = {}
 # Keep fabricated-marker detection conservative: the ``ZZZ...`` form is used
 # by synthetic negative probes and should never fall through to generic
 # repository results after an agent translates the surrounding sentence.
@@ -269,7 +270,18 @@ def _discover_views(root: Path | None, source_id: str | None, scope: str, local:
     except RuntimeError as exc:
         specs = []
         discovery_error = str(exc)
-    repository_views = [prepare_view(spec, local=local) for spec in specs] if scope in {"repository", "all"} else []
+    repository_views: list[SourceView] = []
+    if scope in {"repository", "all"}:
+        reuse = os.environ.get("REPOSITORY_MEMORY_EVAL_REUSE_VIEW", "").casefold() in {"1", "true", "yes", "on"}
+        for spec in specs:
+            key = (str(spec.root), spec.id, bool(local))
+            if reuse and key in _EVAL_VIEW_CACHE:
+                repository_views.append(_EVAL_VIEW_CACHE[key])
+                continue
+            view = prepare_view(spec, local=local)
+            if reuse:
+                _EVAL_VIEW_CACHE[key] = view
+            repository_views.append(view)
     memory_view = _memory_view() if scope in {"memory", "all"} else None
     return repository_views, memory_view, discovery_error
 
@@ -508,9 +520,20 @@ def _answerable_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _fallback_items(view: SourceView, query: str, limit: int, deep: bool, *, stale: bool = False) -> list[dict[str, Any]]:
     try:
-        local_index = ensure_local_index(view, deep)
+        cached_index = view.metadata.get("_local_index_cache") if isinstance(view.metadata, dict) else None
+        if isinstance(cached_index, dict) and cached_index.get("deep") is deep and isinstance(cached_index.get("value"), dict) and cached_index["value"].get("commit") == view.commit:
+            local_index = cached_index["value"]
+        else:
+            local_index = ensure_local_index(view, deep)
+            view.metadata["_local_index_cache"] = {"deep": deep, "value": local_index}
         view.metadata["local_index"] = local_index
-        view.metadata["semantic_index"] = ensure_semantic_index(view, local_index, deep, allow_download=False)
+        cached_semantic = view.metadata.get("_semantic_index_cache") if isinstance(view.metadata, dict) else None
+        if isinstance(cached_semantic, dict) and cached_semantic.get("deep") is deep and isinstance(cached_semantic.get("value"), dict) and cached_semantic["value"].get("commit") == view.commit:
+            semantic_index = cached_semantic["value"]
+        else:
+            semantic_index = ensure_semantic_index(view, local_index, deep, allow_download=False)
+            view.metadata["_semantic_index_cache"] = {"deep": deep, "value": semantic_index}
+        view.metadata["semantic_index"] = semantic_index
     except (OSError, RuntimeError, TypeError, ValueError):
         # The index is disposable acceleration state; citation-first file
         # scanning remains the safe fallback if cache creation fails.
@@ -1776,6 +1799,8 @@ def build_parser() -> argparse.ArgumentParser:
     source_parser = sub.add_parser("source"); source_parser.add_argument("action", choices=("add", "list", "remove")); source_parser.add_argument("--path"); source_parser.add_argument("--id", dest="source_id"); source_parser.add_argument("--repository"); source_parser.add_argument("--profile"); source_parser.add_argument("--local-only", action="store_true"); source_parser.add_argument("--no-sync", action="store_true"); source_parser.add_argument("--json", action="store_true")
     evaluate_parser = common("evaluate"); evaluate_parser.add_argument("--queries", required=True); evaluate_parser.add_argument("--qrels", required=True); evaluate_parser.add_argument("--limit", type=int, default=5); evaluate_parser.add_argument("--deep", action="store_true"); evaluate_parser.add_argument("--local", action="store_true"); evaluate_parser.add_argument("--scope", choices=("repository", "memory", "all"), default="repository"); evaluate_parser.add_argument("--revision"); evaluate_parser.add_argument("--fallback-only", action="store_true"); evaluate_parser.add_argument("--json", action="store_true")
     team_evaluate_parser = common("team-evaluate"); team_evaluate_parser.add_argument("--records", required=True); team_evaluate_parser.add_argument("--queries", required=True); team_evaluate_parser.add_argument("--qrels", required=True); team_evaluate_parser.add_argument("--limit", type=int, default=5); team_evaluate_parser.add_argument("--gate", action="store_true"); team_evaluate_parser.add_argument("--min-p1", type=float, default=1.0); team_evaluate_parser.add_argument("--min-recall", type=float, default=1.0); team_evaluate_parser.add_argument("--min-negative", type=float, default=1.0); team_evaluate_parser.add_argument("--max-candidate-contamination", type=float, default=0.0); team_evaluate_parser.add_argument("--json", action="store_true")
+    supervisor_parser = common("supervise"); supervisor_parser.add_argument("--lane", choices=("team", "memory", "all"), default="all"); supervisor_parser.add_argument("--all", action="store_true"); supervisor_parser.add_argument("--apply", action="store_true"); supervisor_parser.add_argument("--reviewer"); supervisor_parser.add_argument("--command", dest="supervisor_command", help="JSON argv array for the optional supervisor model"); supervisor_parser.add_argument("--min-confidence", type=float, default=0.7); supervisor_parser.add_argument("--limit", type=int, default=100); supervisor_parser.add_argument("--json", action="store_true")
+    benchmark_parser = common("benchmark"); benchmark_parser.add_argument("--suite", choices=("public", "agentmemories", "locomo", "longmemeval", "rlvr"), required=True); benchmark_parser.add_argument("--data"); benchmark_parser.add_argument("--queries"); benchmark_parser.add_argument("--qrels"); benchmark_parser.add_argument("--limit", type=int, default=5); benchmark_parser.add_argument("--revision"); benchmark_parser.add_argument("--json", action="store_true")
     compact_parser = common("team-compact"); compact_parser.add_argument("--keep", type=int, default=1); compact_parser.add_argument("--json", action="store_true")
     memorycore = sub.add_parser("memorycore")
     memorycore.add_argument("action", choices=["configure", "install", "start", "stop", "status", "promote-l3"])
@@ -1926,7 +1951,7 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
                 return _mcp_dispatch(name, arguments)
             return serve(dispatch)
         gate_failed = False
-        root = None if args.command in {"init", "source", "doctor", "sync", "search", "get", "explain", "feedback", "promote", "publish", "team-activate", "team-export", "team-import", "team-evaluate", "team-compact", "context", "supersede", "memory-timeline", "ingest-session", "capture-turn", "knowledge", "memmy", "gui", "semantic", "memory", "memorycore"} else resolve_root(root_arg)
+        root = None if args.command in {"init", "source", "doctor", "sync", "search", "get", "explain", "feedback", "promote", "publish", "team-activate", "team-export", "team-import", "team-evaluate", "team-compact", "supervise", "benchmark", "context", "supersede", "memory-timeline", "ingest-session", "capture-turn", "knowledge", "memmy", "gui", "semantic", "memory", "memorycore"} else resolve_root(root_arg)
         if args.command in {"init", "source"} and root_arg:
             root = resolve_root(root_arg)
         if args.command == "doctor":
@@ -1969,6 +1994,30 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
                 gate_failed = bool(failures)
                 value["ok"] = not gate_failed
                 value["gate"] = {"passed": not gate_failed, "failures": failures, "thresholds": {"min_p1": args.min_p1, "min_recall": args.min_recall, "min_negative": args.min_negative, "max_candidate_contamination": args.max_candidate_contamination}}
+        elif args.command == "supervise":
+            from supervisor import supervise
+
+            command = None
+            if args.supervisor_command:
+                try:
+                    command = json.loads(args.supervisor_command)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError("--command must be a JSON argv array") from exc
+                if not isinstance(command, list) or not all(isinstance(item, str) and item for item in command):
+                    raise RuntimeError("--command must be a non-empty JSON argv array")
+            value = supervise(lane=args.lane, apply=bool(args.apply), limit=args.limit, reviewer=args.reviewer, command=command, min_confidence=args.min_confidence)
+        elif args.command == "benchmark":
+            from benchmark import run_benchmark
+
+            value = run_benchmark(
+                suite=args.suite,
+                root=Path(root_arg).expanduser().resolve() if root_arg else None,
+                data=Path(args.data).expanduser().resolve() if args.data else None,
+                queries=Path(args.queries).expanduser().resolve() if args.queries else None,
+                qrels=Path(args.qrels).expanduser().resolve() if args.qrels else None,
+                limit=args.limit,
+                revision=args.revision,
+            )
         elif args.command == "team-compact":
             from team_memory import team_memory_backend
 
@@ -2131,7 +2180,7 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
             raise RuntimeError(f"unknown command: {args.command}")
         print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
         return 1 if gate_failed else 0
-    except (OSError, RuntimeError, TypeError, AdapterError) as exc:
+    except (OSError, RuntimeError, TypeError, ValueError, AdapterError) as exc:
         print(json.dumps({"schema_version": SCHEMA_VERSION, "ok": False, "error": str(exc)}, ensure_ascii=False, indent=2))
         return 2
 

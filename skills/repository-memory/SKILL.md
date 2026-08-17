@@ -103,6 +103,16 @@ user or an explicit task-end workflow requests a write. Never silently rewrite
 the canonical repository. New memories remain candidate/pending until the
 documented review or promotion step; ordinary conversation never writes L3.
 
+For candidate review, run `supervise --lane all --json`. It reports `hold`
+when no user-configured supervisor command is available. Only explicit
+`--apply`, with a valid model decision and read-back, changes user-level L2 or
+Team Memory state. L3 still requires an explicit promotion operation.
+
+For reproducible measurements, run `benchmark --suite public` or provide a
+user-owned external benchmark manifest. The runtime does not download or
+silently reshape third-party datasets, and it does not claim leaderboard
+performance from the bundled fixture.
+
 ## Tool boundary
 
 The Skill does not forbid normal development tools. `read`, `grep`, `git`,

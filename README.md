@@ -206,6 +206,25 @@ memory_team_activate # explicit candidate review -> active
 The read-only MCP tools also include `memory_timeline` for the ordered trace
 view described above.
 
+Candidate review is explicit. `repository-memory supervise` uses a
+user-configured JSON argv command when one is available; without it the result
+is `hold` and no record is activated. This prevents an endpoint or a
+self-reported model answer from being mistaken for supervision. `--apply` is
+the only mode that changes the user-level memory store; it never changes the
+Git source.
+
+The same evaluator is exposed as a benchmark entry point. It never downloads
+external datasets:
+
+```bash
+repository-memory benchmark --suite public --root /path/to/knowledge --json
+repository-memory benchmark --suite locomo --data /path/to/manifest.json --root /path/to/knowledge --json
+```
+
+External suites must provide a manifest or `queries.jsonl` plus `qrels.jsonl`;
+an unsupported format is reported as such rather than producing fabricated
+scores.
+
 Records use the lifecycle `candidate -> active -> superseded|stale` and are
 stored in a user-level SQLite cache. SQLite is the default backend behind a
 `TeamMemoryBackend` seam; it uses WAL, a bounded busy timeout, and retryable

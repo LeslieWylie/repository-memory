@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.0
+
+- Added explicit supervisor receipts and safe candidate review for Team Memory
+  and standalone L2 scenarios.
+- Added a reproducible `benchmark` command for the bundled fixture and user-
+  supplied external benchmark manifests.
+- Added the provider protocol manifest/normalization seam without adding a
+  runtime dependency on any external memory product.
+
 ## 0.3.0
 
 - Bundle a clean, pinned TencentDB Agent Memory source snapshot for the native

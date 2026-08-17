@@ -165,3 +165,19 @@ controls whether the result is `verified` or remains a candidate.
 For MCP calls, omit `root` by default. The server process owns the configured
 root and source discovery; only pass an explicit root when the user has named a
 Git repository and the caller has verified that path.
+## Delivery commands
+
+The read path is shared by CLI and MCP. Candidate review and benchmark runs
+are explicit CLI operations:
+
+```text
+repository-memory supervise --lane all --json
+repository-memory supervise --lane all --apply --reviewer <id> --json
+repository-memory benchmark --suite public --root <repository> --json
+```
+
+`supervise` records a metadata-only receipt in the user data directory. It
+holds when no configured supervisor command returns a valid high-confidence
+decision. `--apply` never edits the canonical Git repository. External
+benchmark suites require user-supplied data; the runtime does not download or
+claim unsupported formats.
