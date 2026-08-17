@@ -389,7 +389,10 @@ function runRuntimeJSON(cfg, args, label) {
     });
     let stdout = "";
     let stderr = "";
-    child.stdout?.on("data", (chunk) => { stdout = (stdout + String(chunk)).slice(-131072); });
+    // Large repositories can legitimately produce >128 KiB JSON even for ten
+    // hits.  Keep enough bytes to parse the complete document, then compact
+    // the model-facing result below; truncating the raw JSON makes it invalid.
+    child.stdout?.on("data", (chunk) => { stdout = (stdout + String(chunk)).slice(-1048576); });
     child.stderr?.on("data", (chunk) => { stderr = (stderr + String(chunk)).slice(-8192); });
     const timer = setTimeout(() => {
       child.kill("SIGTERM");
@@ -412,6 +415,41 @@ function runRuntimeJSON(cfg, args, label) {
         }
     });
   });
+}
+
+function compactItem(item) {
+  if (!item || typeof item !== "object") return item;
+  const keep = [
+    "id", "memory_id", "kind", "layer", "tier", "status", "accepted",
+    "evidence_status", "generated", "source", "repository", "commit",
+    "commit_type", "path", "line_start", "line_end", "title", "citation",
+    "freshness", "support", "readback", "related", "provenance", "ref_id",
+    "ref_kind",
+  ];
+  const result = {};
+  for (const key of keep) {
+    if (item[key] !== undefined) result[key] = item[key];
+  }
+  if (typeof item.excerpt === "string") result.excerpt = item.excerpt.slice(0, 6000);
+  if (typeof item.content === "string") result.content = item.content.slice(0, 6000);
+  return result;
+}
+
+function compactRuntimeResult(label, result) {
+  if (!result || typeof result !== "object") return result;
+  if (!label.endsWith("_search")) return result;
+  const compactList = (value) => Array.isArray(value) ? value.slice(0, 10).map(compactItem) : value;
+  return {
+    ...result,
+    verified: compactList(result.verified),
+    candidates: compactList(result.candidates),
+    results: compactList(result.results),
+    answerable: compactList(result.answerable),
+    // Full source manifests are useful to doctor, but too large for a tool
+    // result.  Search keeps freshness and diagnostics, which are the routing
+    // and citation decisions the Agent needs.
+    sources: undefined,
+  };
 }
 
 function runRecall(cfg, prompt) {
@@ -469,6 +507,7 @@ function registerNativeTools(api, cfg) {
       parameters,
       async execute(_toolCallId, input = {}) {
         const outcome = await runRuntimeJSON(cfg, args(input), name);
+        if (outcome.ok) outcome.result = compactRuntimeResult(name, outcome.result);
         return toolResult(outcome);
       },
     }), { name });
@@ -485,7 +524,7 @@ function registerNativeTools(api, cfg) {
     SEARCH_PARAMETERS,
     (input) => [
       "search", String(input.query || ""), "--scope", ["repository", "memory", "all"].includes(input.scope) ? input.scope : "repository",
-      "--limit", String(Math.max(1, Math.min(50, Number(input.limit) || 5))), "--json",
+      "--limit", String(Math.max(1, Math.min(10, Number(input.limit) || 5))), "--json",
     ],
   );
   register(
