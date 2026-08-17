@@ -6,6 +6,14 @@
   "activation": {
     "onStartup": true
   },
+  "contracts": {
+    "tools": [
+      "repository_memory_doctor",
+      "repository_memory_search",
+      "repository_memory_get",
+      "repository_memory_timeline"
+    ]
+  },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
