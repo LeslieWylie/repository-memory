@@ -58,6 +58,7 @@ MCP_TOOLS = [
     "memory_sync",
     "memory_search",
     "memory_get",
+    "memory_timeline",
 ]
 OPENCLAW_TOOLS = [f"{MCP_NAME}__{name}" for name in MCP_TOOLS]
 

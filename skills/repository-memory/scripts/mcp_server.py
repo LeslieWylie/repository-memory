@@ -32,6 +32,7 @@ def _tool_schema() -> list[dict[str, Any]]:
         {"name": "memory_sync", "description": "Fetch remote snapshots and update derived indexes without changing the worktree. Uses the server-configured root by default.", "inputSchema": {"type": "object", "properties": {"root": {"type": "string", "description": "Optional verified Git repository root; omit to use server discovery."}, "source": {"type": "string"}, "local": {"type": "boolean"}}, "additionalProperties": False}},
         {"name": "memory_search", "description": "Search repository evidence, native conversation memory, or both. `verified` means the citation is real; use `answerable`/`results` for claims directly supported by the returned excerpt. If answerable is empty, abstain even when verified documents exist.", "inputSchema": {"type": "object", "required": ["query"], "properties": {"root": {"type": "string", "description": "Optional verified Git repository root; omit to use server discovery."}, "source": {"type": "string"}, "query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 50}, "deep": {"type": "boolean"}, "local": {"type": "boolean"}, "scope": {"type": "string", "enum": ["repository", "memory", "all"], "default": "repository"}}, "additionalProperties": False}},
         {"name": "memory_get", "description": "Resolve a memory result and its source evidence. Pass the result citation commit and line_start/line_end when pinning the exact evidence window.", "inputSchema": {"type": "object", "required": ["id"], "properties": {"root": {"type": "string", "description": "Optional verified Git repository root; omit to use server discovery."}, "id": {"type": "string"}, "commit": {"type": "string", "description": "Optional commit from the search citation; mismatch returns stale instead of silently reading a newer source."}, "line_start": {"type": "integer", "minimum": 1}, "line_end": {"type": "integer", "minimum": 1}}, "additionalProperties": False}},
+        {"name": "memory_timeline", "description": "Read the ordered L0/L1 trace for a session from the active local memory runtime. This is diagnostic provenance, not repository evidence, and never changes canonical Git data.", "inputSchema": {"type": "object", "properties": {"session_id": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 500}}, "additionalProperties": False}},
     ]
 
 
@@ -45,7 +46,7 @@ def _discover_result() -> dict[str, Any]:
         "supportedVersions": list(SUPPORTED_PROTOCOLS),
         "capabilities": {"tools": {}},
         "_meta": {"io.modelcontextprotocol/serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION}},
-        "instructions": "Use memory_doctor, memory_sync, memory_search, and memory_get for read/diagnostic work. Session ingest, feedback, promotion, and other writes are explicit CLI operations and are not exposed through this MCP surface. Keep repository citations distinct from native memory provenance.",
+        "instructions": "Use memory_doctor, memory_sync, memory_search, memory_get, and memory_timeline for read/diagnostic work. Session ingest, feedback, promotion, and other writes are explicit CLI operations and are not exposed through this MCP surface. Keep repository citations distinct from native memory provenance.",
         "ttlMs": 3600000,
         "cacheScope": "private",
     }

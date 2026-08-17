@@ -644,7 +644,7 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(responses[0]["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "repository-memory")
         self.assertEqual(responses[0]["result"]["resultType"], "complete")
         self.assertEqual(responses[1]["result"]["resultType"], "complete")
-        self.assertEqual({tool["name"] for tool in responses[1]["result"]["tools"]}, {"memory_doctor", "memory_sync", "memory_search", "memory_get"})
+        self.assertEqual({tool["name"] for tool in responses[1]["result"]["tools"]}, {"memory_doctor", "memory_sync", "memory_search", "memory_get", "memory_timeline"})
         payload = responses[2]["result"]["structuredContent"]
         self.assertEqual(responses[2]["result"]["resultType"], "complete")
         self.assertIn("verified", payload)
@@ -1384,10 +1384,17 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertFalse(found["abstain"])
         self.assertEqual(found["verified"][0]["source"], "standalone-memory")
         self.assertEqual(found["verified"][0]["memory"]["layer"], "L1")
+        self.assertEqual(found["verified"][0]["tier"], 1)
+        self.assertEqual(found["verified"][0]["ref_kind"], "trace")
         fetched = core.get_result(None, found["verified"][0]["id"])
         self.assertTrue(fetched["found"])
         self.assertEqual(fetched["source"], "standalone-memory")
         self.assertFalse(subprocess.check_output(["git", "-C", str(self.alpha), "status", "--porcelain"], text=True))
+
+        timeline = core._mcp_dispatch("memory_timeline", {"session_id": "local-session"})
+        self.assertTrue(timeline["ok"])
+        self.assertGreaterEqual(timeline["count"], 2)
+        self.assertEqual({event["layer"] for event in timeline["events"]}, {"L0", "L1"})
 
     def test_standalone_runtime_proves_four_layer_lifecycle_without_services(self):
         """The default install must not need a gateway or a vendor process."""

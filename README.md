@@ -63,6 +63,8 @@ For multi-agent work, the CLI `memory_context` command can package repository
 evidence and Team Memory sections together without making experience look like
 a Git citation. The public MCP surface remains deliberately read-only and uses
 `memory_search` with an explicit `scope` when native memory is needed.
+`memory_timeline` is also available for ordered L0/L1 trace inspection; it is
+diagnostic provenance, not repository evidence and cannot promote L2/L3.
 
 ## Install
 
@@ -201,6 +203,9 @@ memory_supersede   # explicit correction and lifecycle transition
 memory_team_activate # explicit candidate review -> active
 ```
 
+The read-only MCP tools also include `memory_timeline` for the ordered trace
+view described above.
+
 Records use the lifecycle `candidate -> active -> superseded|stale` and are
 stored in a user-level SQLite cache. SQLite is the default backend behind a
 `TeamMemoryBackend` seam; it uses WAL, a bounded busy timeout, and retryable
@@ -318,6 +323,7 @@ memory_doctor
 memory_sync
 memory_search
 memory_get
+memory_timeline
 ```
 
 Use the CLI for `init`, `source add`, `ingest-session`, `memory project`,

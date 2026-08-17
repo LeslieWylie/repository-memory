@@ -436,14 +436,24 @@ class StandaloneMemoryClient:
         status = str(row["status"] or ("accepted" if row["accepted"] else "candidate"))
         accepted = bool(row["accepted"]) and status == "accepted" if layer in {"L2", "L3"} else True
         generated = bool(row["generated"])
+        # MemOS exposes a stable tier/ref contract for consumers that need to
+        # distinguish trace, policy, and world-model results.  Keep our
+        # canonical L0-L3 names as the authority and add the compatibility
+        # fields instead of making callers infer them from ``kind``.
+        tier = {"L0": 0, "L1": 1, "L2": 2, "L3": 3}.get(layer)
+        ref_kind = {"L0": "conversation", "L1": "trace", "L2": "policy", "L3": "world_model"}.get(layer, "memory")
         return {
             "id": record_id,
             "kind": {"L0": "conversation", "L1": "atomic", "L2": "scenario", "L3": "profile"}.get(layer, "memory"),
             "title": layer,
             "content": content,
             "excerpt": content,
+            "snippet": content[:512],
             "memory_layer": layer,
             "memory_type": {"L0": "conversation", "L1": "atomic", "L2": "scenario", "L3": "profile"}.get(layer, "memory"),
+            "tier": tier,
+            "ref_kind": ref_kind,
+            "ref_id": record_id,
             "status": status,
             "generated": generated,
             "accepted": accepted,
@@ -480,6 +490,9 @@ class StandaloneMemoryClient:
         return {
             "id": result_id,
             "layer": layer,
+            "tier": {"L0": 0, "L1": 1, "L2": 2, "L3": 3}.get(layer),
+            "ref_kind": {"L0": "conversation", "L1": "trace", "L2": "policy", "L3": "world_model"}.get(layer, "memory"),
+            "ref_id": result_id,
             "status": str(row["status"]),
             "memory": {"session_id": row["session_id"], "message_index": row["message_index"], "role": row["role"], "content": content, "timestamp": row["timestamp"], "metadata": row["metadata"], "status": str(row["status"]), "accepted": accepted},
             "citation": {"source": self.backend, "memory_id": result_id, "layer": layer, "evidence": content, "locator": {"layer": layer, "memory_id": result_id}, "valid": True, "generated": bool(row["generated"]), "accepted": accepted},
@@ -574,6 +587,61 @@ class StandaloneMemoryClient:
 
     def search_all(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
         return self.search(query, limit)
+
+    def timeline(self, session_id: str | None = None, limit: int = 50) -> dict[str, Any]:
+        """Return an ordered trace view without changing retrieval ranking.
+
+        This is the useful, lightweight part of MemOS' timeline tool: callers
+        can inspect how an L0/L1 memory was formed, while the normal search
+        path remains citation-first and layer-aware.
+        """
+
+        connection = self._connect()
+        try:
+            bounded = max(1, min(int(limit), 500))
+            if session_id:
+                rows = connection.execute(
+                    "SELECT * FROM records WHERE session_id=? AND layer IN ('L0','L1') "
+                    "ORDER BY message_index ASC, layer ASC, created_at ASC LIMIT ?",
+                    (session_id, bounded),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM records WHERE layer IN ('L0','L1') "
+                    "ORDER BY created_at ASC, message_index ASC LIMIT ?",
+                    (bounded,),
+                ).fetchall()
+        finally:
+            connection.close()
+        events = []
+        for row in rows:
+            layer = str(row["layer"])
+            record_id = str(row["id"])
+            events.append({
+                "id": record_id,
+                "layer": layer,
+                "tier": {"L0": 0, "L1": 1}.get(layer),
+                "ref_kind": "conversation" if layer == "L0" else "trace",
+                "ref_id": record_id,
+                "session_id": str(row["session_id"]),
+                "message_index": int(row["message_index"]),
+                "role": str(row["role"]),
+                "content": str(row["content"]),
+                "snippet": str(row["content"])[:512],
+                "timestamp": row["timestamp"],
+                "status": str(row["status"]),
+                "metadata": json.loads(str(row["metadata"] or "{}")),
+            })
+        return {
+            "schema_version": 1,
+            "ok": True,
+            "backend": self.backend,
+            "session_id": session_id,
+            "events": events,
+            "count": len(events),
+            "readback": {"verified": True, "backend": self.backend},
+            "canonical_repo_changed": False,
+        }
 
 
 def standalone_memory_client() -> StandaloneMemoryClient:

@@ -21,6 +21,7 @@ repository-memory__memory_doctor
 repository-memory__memory_sync
 repository-memory__memory_search
 repository-memory__memory_get
+repository-memory__memory_timeline
 ```
 
 The exact namespace is host-defined. A bare `memory_search` may belong to a
@@ -65,6 +66,10 @@ After search:
    subclaim and abstain from the rest.
 5. If no directly supported result exists, say that the evidence is
    insufficient. Do not fill the gap with a similar document.
+
+Use `memory_timeline` only when the user asks how a conversation memory was
+formed or when diagnosing L0/L1 capture. It is provenance for the memory lane,
+not a Git citation and not a reason to promote L2/L3.
 
 `verified` means the runtime checked a citation or a stable memory
 layer/identifier. It does not mean one excerpt proves every part of a

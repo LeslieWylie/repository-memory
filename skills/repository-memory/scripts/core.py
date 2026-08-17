@@ -354,6 +354,16 @@ def normalize_item(item: dict[str, Any], view: SourceView, source_type: str, que
     citation_repository = citation.get("repository") or item.get("repository") or item.get("_repository") or metadata.get("repository") or (None if native else view.spec.repository)
     memory_layer = item.get("memory_layer") or item.get("layer") or item.get("level") or metadata.get("memory_layer") or metadata.get("layer") or metadata.get("level") or citation.get("layer")
     memory_type = item.get("memory_type") or item.get("type") or metadata.get("memory_type") or metadata.get("type") or citation.get("memory_type")
+    tier = item.get("tier")
+    if tier is None and memory_layer in {"L0", "L1", "L2", "L3"}:
+        tier = {"L0": 0, "L1": 1, "L2": 2, "L3": 3}[memory_layer]
+    ref_kind = item.get("ref_kind") or {
+        "L0": "conversation",
+        "L1": "trace",
+        "L2": "policy",
+        "L3": "world_model",
+    }.get(memory_layer, "memory")
+    ref_id = item.get("ref_id") or backend_id
     accepted = citation.get("accepted", item.get("accepted"))
     generated = bool(citation.get("generated", item.get("generated", False)))
     if native:
@@ -401,6 +411,9 @@ def normalize_item(item: dict[str, Any], view: SourceView, source_type: str, que
         "generated": generated,
         "accepted": accepted,
         "layer": memory_layer,
+        "tier": tier,
+        "ref_kind": ref_kind,
+        "ref_id": ref_id,
         "status": lifecycle_status,
         "provenance": provenance,
         "readback": {
@@ -1266,6 +1279,39 @@ def _memory_get_result(result_id: str, explain: bool = False) -> dict[str, Any]:
     return result
 
 
+def _memory_timeline(session_id: str | None = None, limit: int = 50) -> dict[str, Any]:
+    """Expose the standalone trace timeline without creating a second store."""
+
+    view = _memory_view()
+    adapter = Adapter(None, view)
+    memory = adapter.memory_status()
+    client = adapter.native_memory
+    timeline = getattr(client, "timeline", None)
+    if not callable(timeline):
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "ok": False,
+            "backend": memory.get("backend") or "memorycore",
+            "events": [],
+            "reason": "memory backend does not expose a local timeline",
+            "freshness": memory,
+            "canonical_repo_changed": False,
+        }
+    try:
+        value = timeline(session_id=session_id or None, limit=limit)
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "ok": False,
+            "backend": memory.get("backend") or "memorycore",
+            "events": [],
+            "reason": str(exc),
+            "freshness": memory,
+            "canonical_repo_changed": False,
+        }
+    return {"schema_version": SCHEMA_VERSION, **value, "freshness": memory, "canonical_repo_changed": False}
+
+
 def get_result(
     root: Path | None,
     result_id: str,
@@ -1723,6 +1769,7 @@ def build_parser() -> argparse.ArgumentParser:
     import_parser = common("team-import"); import_parser.add_argument("--input", required=True); import_parser.add_argument("--json", action="store_true")
     context_parser = common("context"); context_parser.add_argument("query"); context_parser.add_argument("--limit", type=int, default=5); context_parser.add_argument("--repo"); context_parser.add_argument("--issue"); context_parser.add_argument("--branch"); context_parser.add_argument("--agent"); context_parser.add_argument("--local", action="store_true"); context_parser.add_argument("--json", action="store_true")
     supersede_parser = common("supersede"); supersede_parser.add_argument("--id", required=True); supersede_parser.add_argument("--input", required=True); supersede_parser.add_argument("--json", action="store_true")
+    timeline_parser = common("memory-timeline"); timeline_parser.add_argument("--session-id"); timeline_parser.add_argument("--limit", type=int, default=50); timeline_parser.add_argument("--json", action="store_true")
     ingest_parser = common("ingest-session"); ingest_parser.add_argument("--input", required=True); ingest_parser.add_argument("--json", action="store_true")
     capture_parser = common("capture-turn"); capture_parser.add_argument("--input", required=True); capture_parser.add_argument("--json", action="store_true")
     init_parser = sub.add_parser("init"); init_parser.add_argument("--path", required=True); init_parser.add_argument("--id", dest="source_id"); init_parser.add_argument("--repository"); init_parser.add_argument("--profile"); init_parser.add_argument("--local-only", action="store_true"); init_parser.add_argument("--no-sync", action="store_true"); init_parser.add_argument("--json", action="store_true")
@@ -1745,7 +1792,9 @@ def build_parser() -> argparse.ArgumentParser:
     memorycore.add_argument("--accept", action="store_true")
     memorycore.add_argument("--json", action="store_true")
     memory = sub.add_parser("memory", help="Inspect and explicitly operate the standalone local memory runtime")
-    memory.add_argument("action", choices=["status", "project", "promote-l3"])
+    memory.add_argument("action", choices=["status", "project", "timeline", "promote-l3"])
+    memory.add_argument("--session-id")
+    memory.add_argument("--limit", type=int, default=50)
     memory.add_argument("--candidate")
     memory.add_argument("--accept", action="store_true")
     memory.add_argument("--json", action="store_true")
@@ -1805,6 +1854,8 @@ def _mcp_dispatch(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
             line_start=int(arguments["line_start"]) if arguments.get("line_start") is not None else None,
             line_end=int(arguments["line_end"]) if arguments.get("line_end") is not None else None,
         )
+    if name == "memory_timeline":
+        return _memory_timeline(str(arguments.get("session_id") or "") or None, int(arguments.get("limit") or 50))
     if name == "memory_context":
         return memory_context(root, str(arguments.get("query") or ""), limit=int(arguments.get("limit") or 5), source_id=source, repo=str(arguments.get("repo") or "") or None, issue=str(arguments.get("issue") or "") or None, branch=str(arguments.get("branch") or "") or None, agent=str(arguments.get("agent") or "") or None, local=bool(arguments.get("local")))
     if name == "memory_team_sync":
@@ -1875,7 +1926,7 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
                 return _mcp_dispatch(name, arguments)
             return serve(dispatch)
         gate_failed = False
-        root = None if args.command in {"init", "source", "doctor", "sync", "search", "get", "explain", "feedback", "promote", "publish", "team-activate", "team-export", "team-import", "team-evaluate", "team-compact", "context", "supersede", "ingest-session", "capture-turn", "knowledge", "memmy", "gui", "semantic", "memory", "memorycore"} else resolve_root(root_arg)
+        root = None if args.command in {"init", "source", "doctor", "sync", "search", "get", "explain", "feedback", "promote", "publish", "team-activate", "team-export", "team-import", "team-evaluate", "team-compact", "context", "supersede", "memory-timeline", "ingest-session", "capture-turn", "knowledge", "memmy", "gui", "semantic", "memory", "memorycore"} else resolve_root(root_arg)
         if args.command in {"init", "source"} and root_arg:
             root = resolve_root(root_arg)
         if args.command == "doctor":
@@ -1927,6 +1978,8 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
             value = memory_context(root if root_arg else None, args.query, limit=args.limit, source_id=getattr(args, "source", None), repo=args.repo, issue=args.issue, branch=args.branch, agent=args.agent, local=args.local)
         elif args.command == "supersede":
             value = supersede_memory(args.id, args.input)
+        elif args.command == "memory-timeline":
+            value = _memory_timeline(args.session_id, args.limit)
         elif args.command == "ingest-session":
             value = ingest_session(root if root_arg else None, args.input, getattr(args, "source", None))
         elif args.command == "capture-turn":
@@ -2043,6 +2096,8 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
                 value = {"schema_version": SCHEMA_VERSION, **client.health(refresh=True, probe_layers=True), "external_mode": getattr(client, "backend", "") != "standalone-memory", "canonical_repo_changed": False}
             elif args.action == "project":
                 value = {"schema_version": SCHEMA_VERSION, **project_memory_candidates()}
+            elif args.action == "timeline":
+                value = _memory_timeline(args.session_id, args.limit)
             else:
                 value = promote_l3(args.candidate or "")
         elif args.command == "memorycore":
