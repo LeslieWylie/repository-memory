@@ -39,6 +39,13 @@ from local_embedding import (
     vectorize,
 )
 from local_memory import SECRET_CONTENT, STOP_WORDS, _payload, _stable_id
+from memos_lifecycle import (
+    backpropagate,
+    classify_turn,
+    feedback_value,
+    policy_candidate,
+    ready_buckets,
+)
 from models import MEMORY_LAYERS, memory_layer_state
 
 
@@ -167,11 +174,29 @@ class StandaloneMemoryClient:
             ("embedding_provider", "TEXT"),
             ("embedding_model", "TEXT"),
             ("embedding_dim", "INTEGER"),
+            ("episode_id", "TEXT"),
+            ("turn_id", "TEXT"),
+            ("value", "REAL"),
+            ("priority", "REAL"),
+            ("alpha", "REAL NOT NULL DEFAULT 0.3"),
+            ("reflection", "TEXT"),
         ):
             if name not in existing:
                 connection.execute(f"ALTER TABLE records ADD COLUMN {name} {definition}")
         connection.execute("CREATE INDEX IF NOT EXISTS records_layer_idx ON records(layer)")
         connection.execute("CREATE INDEX IF NOT EXISTS records_session_idx ON records(session_id)")
+        connection.execute("CREATE INDEX IF NOT EXISTS records_episode_idx ON records(episode_id)")
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS memory_feedback (
+                feedback_id TEXT PRIMARY KEY,
+                memory_id TEXT NOT NULL,
+                rating TEXT NOT NULL,
+                note TEXT NOT NULL,
+                agent TEXT,
+                created_at REAL NOT NULL,
+                delta REAL NOT NULL
+            )"""
+        )
         try:
             connection.execute("CREATE VIRTUAL TABLE IF NOT EXISTS records_fts USING fts5(id UNINDEXED, content)")
         except sqlite3.OperationalError:
@@ -376,7 +401,100 @@ class StandaloneMemoryClient:
             "canonical_repo_changed": False,
         }
 
-    def _upsert(self, connection: sqlite3.Connection, *, record_id: str, layer: str, session_id: str, message_index: int, role: str, content: str, timestamp: str = "", metadata: dict[str, Any] | None = None, status: str = "verified", generated: bool = False, accepted: bool = True) -> None:
+    def evolve_policies(self, *, min_distinct_episodes: int = 2) -> dict[str, Any]:
+        """Build MemOS-style L2 policy candidates from repeated L1 evidence."""
+
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                "SELECT id, session_id, episode_id, content FROM records WHERE layer='L1' ORDER BY created_at ASC",
+            ).fetchall()
+            buckets = ready_buckets([dict(row) for row in rows], min_distinct_episodes=max(2, int(min_distinct_episodes)))
+            created: list[str] = []
+            for bucket in buckets:
+                candidate = policy_candidate(bucket)
+                signature = str(bucket["signature"])
+                path = f"policy/{hashlib.sha256(signature.encode('utf-8')).hexdigest()[:24]}"
+                record_id = f"local:L2:{path}"
+                content = "\n".join([
+                    "status: candidate",
+                    "layer: L2",
+                    "kind: policy",
+                    "generated: true",
+                    "",
+                    f"trigger: {candidate['trigger']}",
+                    "procedure:",
+                    *[f"- {step}" for step in candidate["procedure"]],
+                    f"verification: {candidate['verification']}",
+                    f"boundary: {candidate['boundary']}",
+                    f"support_episode_count: {candidate['support']['episode_count']}",
+                    f"support_record_ids: {','.join(candidate['support']['record_ids'])}",
+                    "evidence:",
+                    *[f"- {item}" for item in candidate["evidence"]],
+                    "",
+                ])
+                self._upsert(
+                    connection,
+                    record_id=record_id,
+                    layer="L2",
+                    session_id=path,
+                    message_index=-1,
+                    role="system",
+                    content=content,
+                    metadata={"pipeline": "memos-candidate-pool", "signature": signature, "source_record_ids": candidate["support"]["record_ids"], "source_episode_ids": bucket["episodes"]},
+                    status="candidate",
+                    generated=True,
+                    accepted=False,
+                )
+                created.append(record_id)
+            connection.commit()
+        finally:
+            connection.close()
+        return {
+            "ok": True,
+            "backend": self.backend,
+            "operation": "evolve-policies",
+            "created": len(created),
+            "candidate_ids": created,
+            "min_distinct_episodes": max(2, int(min_distinct_episodes)),
+            "accepted": False,
+            "canonical_repo_changed": False,
+        }
+
+    def feedback(self, memory_id: str, rating: str, note: str, *, agent: str | None = None, feedback_id: str | None = None) -> dict[str, Any]:
+        """Persist feedback and adjust value/priority without deleting evidence."""
+
+        basis = f"{memory_id}|{rating}|{note}|{agent or ''}"
+        feedback_id = feedback_id or f"fb:{hashlib.sha256(basis.encode('utf-8')).hexdigest()[:24]}"
+        delta = feedback_value(rating)
+        connection = self._connect()
+        try:
+            if connection.execute("SELECT 1 FROM memory_feedback WHERE feedback_id=?", (feedback_id,)).fetchone():
+                return {"ok": True, "duplicate": True, "feedback_id": feedback_id, "memory_id": memory_id, "canonical_repo_changed": False}
+            connection.execute(
+                "INSERT INTO memory_feedback(feedback_id,memory_id,rating,note,agent,created_at,delta) VALUES(?,?,?,?,?,?,?)",
+                (feedback_id, memory_id, rating, note, agent, time.time(), delta),
+            )
+            row = connection.execute("SELECT value FROM records WHERE id=?", (memory_id,)).fetchone()
+            if row is not None:
+                value = max(-1.0, min(1.0, float(row[0] or 0.0) + delta))
+                connection.execute("UPDATE records SET value=?, priority=? WHERE id=?", (value, max(value, 0.0), memory_id))
+                episode = connection.execute("SELECT episode_id FROM records WHERE id=?", (memory_id,)).fetchone()
+                episode_id = str(episode[0] or "") if episode else ""
+                if episode_id:
+                    traces = connection.execute("SELECT id, timestamp, alpha FROM records WHERE layer='L1' AND episode_id=? ORDER BY message_index ASC", (episode_id,)).fetchall()
+                    updates = backpropagate([
+                        {"id": str(trace[0]), "timestamp_epoch": epoch_from_timestamp(trace[1]), "alpha": float(trace[2] or 0.3)}
+                        for trace in traces
+                    ], value)
+                    for update in updates:
+                        connection.execute("UPDATE records SET value=?, priority=? WHERE id=?", (update["value"], update["priority"], update["id"]))
+            connection.commit()
+        finally:
+            connection.close()
+        return {"ok": True, "duplicate": False, "feedback_id": feedback_id, "memory_id": memory_id, "rating": rating, "delta": delta, "canonical_repo_changed": False}
+
+    def _upsert(self, connection: sqlite3.Connection, *, record_id: str, layer: str, session_id: str, message_index: int, role: str, content: str, timestamp: str = "", metadata: dict[str, Any] | None = None, status: str = "verified", generated: bool = False, accepted: bool = True, episode_id: str | None = None, turn_id: str | None = None, value: float | None = None, priority: float | None = None, alpha: float = 0.3, reflection: str | None = None) -> None:
         now = time.time()
         metadata_value = json.dumps(metadata or {}, ensure_ascii=False, sort_keys=True)
         spec = active_embedding_spec()
@@ -384,14 +502,15 @@ class StandaloneMemoryClient:
         embedding = pack(vector)
         connection.execute(
             """INSERT INTO records
-            (id, layer, session_id, message_index, role, content, timestamp, metadata, created_at, updated_at, status, generated, accepted, embedding, embedding_provider, embedding_model, embedding_dim)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, layer, session_id, message_index, role, content, timestamp, metadata, created_at, updated_at, status, generated, accepted, embedding, embedding_provider, embedding_model, embedding_dim, episode_id, turn_id, value, priority, alpha, reflection)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET content=excluded.content, timestamp=excluded.timestamp,
               metadata=excluded.metadata, updated_at=excluded.updated_at, status=excluded.status,
               generated=excluded.generated, accepted=excluded.accepted, embedding=excluded.embedding,
               embedding_provider=excluded.embedding_provider, embedding_model=excluded.embedding_model,
-              embedding_dim=excluded.embedding_dim""",
-            (record_id, layer, session_id, message_index, role, content, timestamp, metadata_value, now, now, status, int(generated), int(accepted), embedding, spec["provider"], spec["model"], len(vector)),
+              embedding_dim=excluded.embedding_dim, episode_id=excluded.episode_id, turn_id=excluded.turn_id,
+              value=excluded.value, priority=excluded.priority, alpha=excluded.alpha, reflection=excluded.reflection""",
+            (record_id, layer, session_id, message_index, role, content, timestamp, metadata_value, now, now, status, int(generated), int(accepted), embedding, spec["provider"], spec["model"], len(vector), episode_id or session_id, turn_id or f"turn:{message_index // 2}", value, priority, alpha, reflection),
         )
         if self._fts(connection):
             connection.execute("DELETE FROM records_fts WHERE id = ?", (record_id,))
@@ -413,15 +532,17 @@ class StandaloneMemoryClient:
                 if not messages:
                     continue
                 session_count += 1
+                episode_id = f"episode:{hashlib.sha256(session_id.encode('utf-8')).hexdigest()[:24]}"
                 for index, message in enumerate(messages):
                     content = message["content"]
                     if SECRET_CONTENT.search(content):
                         skipped_sensitive += 1
                         continue
                     role = message["role"]
-                    metadata = {"session_id": session_id, "message_index": index, "pipeline": "standalone"}
-                    self._upsert(connection, record_id=_stable_id("L0", session_id, index, role, content), layer="L0", session_id=session_id, message_index=index, role=role, content=content, timestamp=message["timestamp"], metadata=metadata)
-                    self._upsert(connection, record_id=_stable_id("L1", session_id, index, role, content), layer="L1", session_id=session_id, message_index=index, role=role, content=content, timestamp=message["timestamp"], metadata=metadata)
+                    turn_id = f"{episode_id}:turn:{index // 2}"
+                    metadata = {"session_id": session_id, "message_index": index, "episode_id": episode_id, "turn_id": turn_id, "pipeline": "standalone+memos-lifecycle"}
+                    self._upsert(connection, record_id=_stable_id("L0", session_id, index, role, content), layer="L0", session_id=session_id, message_index=index, role=role, content=content, timestamp=message["timestamp"], metadata=metadata, episode_id=episode_id, turn_id=turn_id)
+                    self._upsert(connection, record_id=_stable_id("L1", session_id, index, role, content), layer="L1", session_id=session_id, message_index=index, role=role, content=content, timestamp=message["timestamp"], metadata=metadata, episode_id=episode_id, turn_id=turn_id, alpha=0.3)
                     written_l0 += 1
                     written_l1 += 1
                 if messages:
@@ -434,6 +555,7 @@ class StandaloneMemoryClient:
         return {
             "backend": self.backend,
             "pipeline": "standalone L0 raw conversation -> deterministic L1 atomic",
+            "lifecycle": "memos-style episode/turn boundaries + feedback-weighted candidate pool",
             "sessions": session_count,
             "l0_recorded": written_l0,
             "l1_recorded": written_l1,
@@ -694,7 +816,18 @@ class StandaloneMemoryClient:
             rows = connection.execute("SELECT * FROM records WHERE layer='L2' ORDER BY updated_at DESC").fetchall()
         finally:
             connection.close()
-        return [{"path": str(row["session_id"]), "id": str(row["id"]), "status": str(row["status"]), "content": str(row["content"])} for row in rows]
+        items = []
+        for row in rows:
+            try:
+                metadata = json.loads(str(row["metadata"] or "{}"))
+            except json.JSONDecodeError:
+                metadata = {}
+            item = {"path": str(row["session_id"]), "id": str(row["id"]), "status": str(row["status"]), "content": str(row["content"]), "metadata": metadata}
+            source_ids = metadata.get("source_record_ids") if isinstance(metadata, dict) else None
+            if isinstance(source_ids, list) and source_ids:
+                item["provenance"] = {"citations": [{"memory_id": str(value), "layer": "L1"} for value in source_ids]}
+            items.append(item)
+        return items
 
     def scenario_snapshot(self) -> dict[str, str]:
         return {str(row["path"]): hashlib.sha256(str(row["content"]).encode()).hexdigest() for row in self.list_scenarios()}

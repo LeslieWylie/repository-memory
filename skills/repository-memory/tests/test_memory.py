@@ -28,6 +28,7 @@ from snapshot import _snapshot_lock, prepare_view, snapshot_lock_backend
 from team_memory import TeamMemoryStore
 from version import VERSION
 from benchmark import _semantic_override
+from memos_lifecycle import backpropagate, classify_turn, ready_buckets
 
 from models import SourceSpec
 
@@ -135,7 +136,7 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(value["document_count"], len(value["documents"]))
         self.assertGreaterEqual(value["text_bytes"], 0)
         self.assertGreater(value["index_bytes"], 0)
-        self.assertEqual(VERSION, "0.7.6")
+        self.assertEqual(VERSION, "0.7.7")
 
     def test_multisource_search_has_verified_and_candidates(self):
         result = core.search(None, "Atlas evidence", limit=5)
@@ -1526,6 +1527,34 @@ class RepositoryMemoryTest(unittest.TestCase):
         projected = core.project_memory_candidates()
         self.assertEqual(projected["status"], "candidate")
         self.assertGreaterEqual(projected["projected"], 1)
+
+    def test_memos_lifecycle_port_adds_episode_pool_and_feedback(self):
+        self.write_config({})
+        os.environ["REPOSITORY_MEMORY_AUTODISCOVER"] = "0"
+        for session_id in ("episode-a", "episode-b"):
+            session = Path(self.temp.name) / f"{session_id}.json"
+            session.write_text(json.dumps({
+                "session_id": session_id,
+                "messages": [{"role": "user", "content": "repository memory timeout failure"}],
+            }), encoding="utf-8")
+            core.ingest_session(None, str(session))
+        pool = core.evolve_memory_policies()
+        self.assertGreaterEqual(pool["created"], 1)
+        policy_id = pool["candidate_ids"][0]
+        feedback = core.feedback(None, policy_id, "reused successfully", "helpful", "memos-feedback-1")
+        self.assertTrue(feedback["ok"])
+        self.assertFalse(feedback["duplicate"])
+        duplicate = core.feedback(None, policy_id, "reused successfully", "helpful", "memos-feedback-1")
+        self.assertTrue(duplicate["duplicate"])
+
+    def test_memos_lifecycle_turn_and_value_contracts(self):
+        self.assertEqual(classify_turn("old answer", "不对，重做") ["relation"], "revision")
+        self.assertEqual(classify_turn("old answer", "换个新任务") ["relation"], "new_task")
+        self.assertEqual(classify_turn("old answer", "那这个呢") ["relation"], "follow_up")
+        rows = backpropagate([{"id": "a", "alpha": 0.3}, {"id": "b", "alpha": 0.3}], 1.0, now=100.0)
+        self.assertEqual([row["id"] for row in rows], ["a", "b"])
+        self.assertGreaterEqual(rows[-1]["priority"], rows[0]["priority"])
+        self.assertEqual(len(ready_buckets([{"id": "a", "episode_id": "e1", "content": "timeout failure"}, {"id": "b", "episode_id": "e2", "content": "timeout failure"}])), 1)
 
     def test_capture_turn_creates_one_team_candidate_without_accepting_it(self):
         self.write_config({})

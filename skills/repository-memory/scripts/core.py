@@ -1001,6 +1001,16 @@ def project_memory_candidates() -> dict[str, Any]:
     return projector()
 
 
+def evolve_memory_policies(min_distinct_episodes: int = 2) -> dict[str, Any]:
+    """Aggregate repeated local L1 traces into MemOS-style L2 candidates."""
+
+    native = native_memory_client()
+    projector = getattr(native, "evolve_policies", None)
+    if not callable(projector):
+        raise RuntimeError("memory evolve requires the built-in standalone runtime")
+    return projector(min_distinct_episodes=min_distinct_episodes)
+
+
 def _capture_ledger_path() -> Path:
     path = data_root() / "autocapture" / "ledger.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1640,6 +1650,11 @@ def doctor(root: Path | None = None, source_id: str | None = None, *, local: boo
 def feedback(root: Path | None, result_id: str, note: str, rating: str | None = None, feedback_id: str | None = None) -> dict[str, Any]:
     if result_id.startswith("team:"):
         return team_memory_store().feedback(result_id, rating or "helpful", note, feedback_id=feedback_id)
+    if result_id.startswith("local:"):
+        client = native_memory_client()
+        handler = getattr(client, "feedback", None)
+        if callable(handler):
+            return handler(result_id, rating or "helpful", note, agent=client.config.agent_id, feedback_id=feedback_id)
     destination = data_root() / "feedback.jsonl"
     destination.parent.mkdir(parents=True, exist_ok=True)
     item = {"timestamp": dt.datetime.now(dt.timezone.utc).isoformat(), "repository": str(root) if root else None, "result_id": result_id, "note": note, "rating": rating}
@@ -2216,6 +2231,7 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
                 from supervisor import supervise
 
                 projected = project_memory_candidates()
+                policy_pool = evolve_memory_policies()
                 command = None
                 if args.supervisor_command:
                     try:
@@ -2225,7 +2241,7 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
                     if not isinstance(command, list) or not all(isinstance(item, str) and item for item in command):
                         raise RuntimeError("memory evolve --command must be a non-empty JSON argv array")
                 review = supervise(lane="memory", apply=bool(args.apply), limit=100, reviewer=args.reviewer, command=command, min_confidence=args.min_confidence)
-                value = {"schema_version": SCHEMA_VERSION, "projection": projected, "supervision": review, "accepted_requires_explicit_l3": True}
+                value = {"schema_version": SCHEMA_VERSION, "projection": projected, "policy_pool": policy_pool, "supervision": review, "accepted_requires_explicit_l3": True}
             elif args.action == "timeline":
                 value = _memory_timeline(args.session_id, args.limit)
             else:

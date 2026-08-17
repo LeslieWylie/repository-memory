@@ -9,7 +9,7 @@ evaluation credential.
 Use the academic **code submission / platform deployment** route:
 
 - Public repository: `https://github.com/LeslieWylie/repository-memory`
-- Fixed version: `0.7.6`
+- Fixed version: `0.7.7`
 - Fixed commit: fill this with the release commit after it is pushed
 - Docker build:
 

@@ -21,6 +21,27 @@ The built-in vector projection is `builtin-char-ngram-v1`. It requires no model
 download and is reported as `local-hybrid`; it must not be described as a
 neural embedding model.
 
+## MemOS Local lifecycle ideas incorporated
+
+The public repository does not depend on the MemOS Node package, but the
+standalone runtime now incorporates the useful local-plugin mechanics in
+`memos_lifecycle.py`:
+
+- real episode/turn identifiers on L0/L1 records;
+- conservative revision/follow-up/new-task boundaries;
+- feedback-weighted value and time-decayed priority;
+- an L2 candidate pool that needs evidence from at least two independent
+  episodes and keeps the supporting record IDs;
+- a read-only timeline and dashboard over the same SQLite runtime.
+
+These are deliberately ported into the Python runtime so installation remains
+one-command and dependency-free. Provider daemons, OpenClaw-specific bridges,
+and MemOS's Node dependency tree are not required. The algorithmic reference is
+the Apache-2.0 MemOS Local Plugin source at
+`/Users/mlamp/Desktop/MemOS-reference/apps/memos-local-plugin` and its upstream
+repository [MemOS Local Plugin](https://github.com/MemTensor/MemOS/tree/main/apps/memos-local-plugin).
+The reference checkout is not part of the production runtime.
+
 ## Optional TencentDB compatibility backend
 
 MemoryCore separates memory by lifecycle:
@@ -84,6 +105,8 @@ repository-memory memmy search --query "..." --json
 repository-memory gui --json
 repository-memory gui --open
 repository-memory gui --serve --open
+repository-memory memory evolve --json
+repository-memory feedback local:L2:policy:<id> --rating helpful --note "reused"
 ```
 
 `memmy configure` writes only user-level configuration. It does not modify a

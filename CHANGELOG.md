@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.7
+
+- Port the useful MemOS Local lifecycle mechanics into the independent
+  provider-free runtime: episode/turn identifiers, conservative turn relation
+  classification, feedback-weighted trace values, and time-decayed priority.
+- Add an evidence-backed L2 policy candidate pool requiring multiple distinct
+  episodes and retaining source record IDs.
+- Keep Git citation retrieval, the CLI/MCP contract, and the canonical source
+  independent from the MemOS Node package.
+
 ## 0.7.5
 
 - Preserve explicit OpenClaw turn boundaries during automatic capture: use the
