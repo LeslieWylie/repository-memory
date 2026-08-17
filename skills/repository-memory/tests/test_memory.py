@@ -136,7 +136,7 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(value["document_count"], len(value["documents"]))
         self.assertGreaterEqual(value["text_bytes"], 0)
         self.assertGreater(value["index_bytes"], 0)
-        self.assertEqual(VERSION, "0.7.8")
+        self.assertEqual(VERSION, "0.7.9")
 
     def test_multisource_search_has_verified_and_candidates(self):
         result = core.search(None, "Atlas evidence", limit=5)
@@ -1325,10 +1325,15 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertIn("repository-memory", alpha["skills"])
         self.assertNotIn("legacy-memory", alpha["skills"])
         self.assertIn("repository-memory__memory_search", alpha["tools"]["alsoAllow"])
+        self.assertIn("repository_memory_search", alpha["tools"]["alsoAllow"])
+        self.assertIn("repository_memory_doctor", alpha["tools"]["alsoAllow"])
+        self.assertIn("repository_memory_get", alpha["tools"]["alsoAllow"])
+        self.assertIn("repository_memory_timeline", alpha["tools"]["alsoAllow"])
         self.assertNotIn("repository-memory__memory_context", alpha["tools"]["alsoAllow"])
         self.assertNotIn("repository-memory__memory_publish", alpha["tools"]["alsoAllow"])
         self.assertNotIn("repository-memory", beta.get("skills", []))
         self.assertNotIn("repository-memory__memory_search", beta.get("tools", {}).get("alsoAllow", []))
+        self.assertNotIn("repository_memory_search", beta.get("tools", {}).get("alsoAllow", []))
         wrapper = machine / ".local" / "bin" / ("repository-memory.cmd" if os.name == "nt" else "repository-memory")
         self.assertTrue(wrapper.is_file())
         searched = subprocess.run([

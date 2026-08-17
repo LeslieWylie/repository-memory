@@ -61,6 +61,16 @@ MCP_TOOLS = [
     "memory_timeline",
 ]
 OPENCLAW_TOOLS = [f"{MCP_NAME}__{name}" for name in MCP_TOOLS]
+# MemOS-style native OpenClaw tools are registered by the plugin itself.  They
+# still need to be present in the selected agent's tool allowlist; otherwise
+# OpenClaw loads the plugin but silently filters the native tools from the
+# agent runtime.  Keep this list read-only and scoped to the selected agents.
+NATIVE_OPENCLAW_TOOLS = [
+    "repository_memory_doctor",
+    "repository_memory_search",
+    "repository_memory_get",
+    "repository_memory_timeline",
+]
 
 
 def _home() -> Path:
@@ -399,7 +409,10 @@ def _install_openclaw(
         # names beside the four read/diagnostic MCP tools makes model routing
         # ambiguous and was the source of several false receipts.
         allowed = [name for name in allowed if name not in LEGACY_OPENCLAW_TOOL_NAMES]
-        tools["alsoAllow"] = [*allowed, *(name for name in OPENCLAW_TOOLS if name not in allowed)]
+        tools["alsoAllow"] = [
+            *allowed,
+            *(name for name in [*OPENCLAW_TOOLS, *NATIVE_OPENCLAW_TOOLS] if name not in allowed),
+        ]
         row["tools"] = tools
         installed.append({"agent": agent_id, "skill": str(destination)})
 
