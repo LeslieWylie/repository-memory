@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.0
+
+- add a dependency-free synchronous Agent Memory Leaderboard Add/Search
+  wrapper with user isolation, auth, health and Docker submission instructions;
+- expose `repository-memory-aml` as a packaged entry point;
+- keep AML ingestion on the standalone L0/L1 path without changing the
+  citation-first repository search contract.
+
 ## 0.6.0
 
 - Added explicit supervisor receipts and safe candidate review for Team Memory

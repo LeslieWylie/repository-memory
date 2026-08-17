@@ -225,6 +225,20 @@ External suites must provide a manifest or `queries.jsonl` plus `qrels.jsonl`;
 an unsupported format is reported as such rather than producing fabricated
 scores.
 
+### Agent Memory Leaderboard Add/Search wrapper
+
+The standalone core also ships a dependency-free synchronous HTTP wrapper for
+the official Agent Memory Leaderboard contract. It implements `/health`,
+`/add`, and `/search`, enforces `user_id` isolation, and persists each Add
+before returning HTTP 200. See
+[`docs/agent-memory-leaderboard.md`](docs/agent-memory-leaderboard.md) for the
+Docker submission path. Local fixture results are not leaderboard results;
+the official platform must run and review the submitted version.
+
+```bash
+repository-memory-aml --host 0.0.0.0 --port 8080
+```
+
 Records use the lifecycle `candidate -> active -> superseded|stale` and are
 stored in a user-level SQLite cache. SQLite is the default backend behind a
 `TeamMemoryBackend` seam; it uses WAL, a bounded busy timeout, and retryable

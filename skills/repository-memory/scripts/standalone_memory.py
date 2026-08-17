@@ -24,6 +24,7 @@ import re
 import sqlite3
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,13 @@ from local_embedding import (
 )
 from local_memory import SECRET_CONTENT, STOP_WORDS, _payload, _stable_id
 from models import MEMORY_LAYERS, memory_layer_state
+
+
+def dt_from_timestamp(value: object) -> str:
+    try:
+        return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _terms(query: str) -> list[str]:
@@ -410,6 +418,130 @@ class StandaloneMemoryClient:
             ).fetchall()
         finally:
             connection.close()
+
+    @staticmethod
+    def _aml_scope_prefix(user_id: str) -> str:
+        """Return a stable, non-reversible storage namespace for an AML user."""
+
+        digest = hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:32]
+        return f"aml:{digest}:"
+
+    def ingest_aml(
+        self,
+        *,
+        request_id: str,
+        user_id: str,
+        session_id: str,
+        messages: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Persist one AML Add request and make it immediately searchable.
+
+        AML's contract is intentionally narrower than the normal session
+        ingest path: the participant receives source messages and must make
+        them searchable before returning HTTP 200.  We keep the user scope in
+        a hashed session namespace and store only L0/L1 records here; L2/L3
+        promotion remains an explicit local lifecycle operation.
+        """
+
+        if not request_id or not user_id or not session_id:
+            raise ValueError("AML Add requires request_id, user_id and session_id")
+        if not isinstance(messages, list) or not messages:
+            raise ValueError("AML Add requires a non-empty messages array")
+        scope = self._aml_scope_prefix(user_id)
+        stored = 0
+        skipped_sensitive = 0
+        hashed_session = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
+        storage_session = f"{scope}{hashed_session}"
+        connection = self._connect()
+        try:
+            for index, message in enumerate(messages):
+                if not isinstance(message, dict):
+                    raise ValueError("AML messages must be objects")
+                role = str(message.get("role") or "").strip()
+                content = str(message.get("content") or "").strip()
+                if role not in {"user", "assistant"} or not content:
+                    raise ValueError("AML messages require role=user|assistant and non-empty content")
+                if SECRET_CONTENT.search(content):
+                    skipped_sensitive += 1
+                    continue
+                timestamp = str(message.get("timestamp") or "")
+                metadata = {
+                    "protocol": "agent-memory-leaderboard",
+                    "request_id": request_id,
+                    "user_id_hash": scope[4:-1],
+                    "session_id_hash": hashed_session,
+                }
+                digest = hashlib.sha256(f"{request_id}\0{index}\0{role}\0{content}".encode("utf-8")).hexdigest()[:32]
+                for layer in ("L0", "L1"):
+                    self._upsert(
+                        connection,
+                        record_id=f"aml:{layer}:{digest}",
+                        layer=layer,
+                        session_id=storage_session,
+                        message_index=index,
+                        role=role,
+                        content=content,
+                        timestamp=timestamp,
+                        metadata=metadata,
+                        status="verified",
+                        generated=False,
+                        accepted=True,
+                    )
+                stored += 1
+            if not stored:
+                raise ValueError("AML Add contained no storable messages")
+            connection.commit()
+        finally:
+            connection.close()
+        return {
+            "stored_messages": stored,
+            "stored_records": stored * 2,
+            "skipped_sensitive_messages": skipped_sensitive,
+            "readback": {"verified": True, "request_id": request_id},
+        }
+
+    def search_aml(self, query: str, user_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        """Search only one AML user namespace and return raw searchable memories."""
+
+        terms = list(dict.fromkeys(_terms(query)))
+        query_vector = vectorize(query)
+        scope = self._aml_scope_prefix(user_id)
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                "SELECT * FROM records WHERE session_id LIKE ? AND layer IN ('L0','L1') "
+                "ORDER BY updated_at DESC LIMIT ?",
+                (f"{scope}%", max(1000, int(limit) * 200)),
+            ).fetchall()
+        finally:
+            connection.close()
+        ranked = []
+        for row in rows:
+            content = str(row["content"])
+            matched = [term for term in terms if term in content.casefold()]
+            semantic_score = cosine(query_vector, unpack(row["embedding"], int(row["embedding_dim"] or EMBEDDING_DIMENSION)))
+            if not matched and semantic_score < 0.12:
+                continue
+            lexical_score = min(0.65, len(matched) * 0.16)
+            ranked.append((semantic_score + lexical_score, str(row["id"]), row, semantic_score))
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        results = []
+        seen_content: set[str] = set()
+        for score, _record_id, row, _semantic_score in ranked:
+            content = str(row["content"])
+            content_key = content.casefold().strip()
+            if content_key in seen_content:
+                continue
+            seen_content.add(content_key)
+            results.append({
+                "id": str(row["id"]),
+                "content": content,
+                "score": round(score, 6),
+                "created_at": dt_from_timestamp(row["updated_at"]),
+            })
+            if len(results) >= max(1, int(limit)):
+                break
+        return results
 
     def search(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
         terms = list(dict.fromkeys(_terms(query)))

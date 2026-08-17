@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "repository-memory"
-version = "0.6.0"
+version = "0.7.0"
 description = "Standalone citation-first repository memory Skill, CLI, MCP server, and local L0-L3 runtime"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -15,6 +15,7 @@ dependencies = []
 
 [project.scripts]
 repository-memory = "repository_memory:cli"
+repository-memory-aml = "aml_server:main"
 
 [project.optional-dependencies]
 test = [
@@ -65,6 +66,7 @@ py-modules = [
   "provider_protocol",
   "supervisor",
   "benchmark",
+  "aml_server",
   "version",
 ]
 
