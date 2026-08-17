@@ -381,7 +381,14 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
         if vector_store is not None and dimension == len(query_vector):
             # Read the compact flat float array without materializing a list
             # for every document.
+            score_paths = semantic_paths
+            if fts_paths:
+                lexical_paths = set(fts_paths)
+                score_paths = [relative for relative in semantic_paths if relative in lexical_paths]
+            score_path_set = set(score_paths) if score_paths is not semantic_paths else None
             for offset, relative in enumerate(semantic_paths):
+                if score_path_set is not None and relative not in score_path_set:
+                    continue
                 start = offset * dimension
                 end = start + dimension
                 if end > len(vector_store):
