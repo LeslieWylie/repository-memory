@@ -60,6 +60,10 @@ left as adapter promises:
   runtime: the derived trigram index includes the relative path as searchable
   text, so a person/card name that appears only in a filename can still reach
   the citation-first scorer. This is a recall fix, not a semantic claim.
+- MemOS' hybrid lane is also used as an explicit rescue path rather than an
+  always-on startup cost: large sources begin with lexical/path retrieval and
+  load the optional deterministic projection only after a lexical miss. This
+  preserves the useful fallback without making a fresh snapshot appear hung.
 
 The repository index stores conservative date anchors from paths and headings,
 plus explicit local references. Temporal routing uses those anchors instead of

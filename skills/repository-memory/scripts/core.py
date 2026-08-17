@@ -559,7 +559,22 @@ def _fallback_items(view: SourceView, query: str, limit: int, deep: bool, *, sta
         if isinstance(cached_semantic, dict) and cached_semantic.get("deep") is deep and isinstance(cached_semantic.get("value"), dict) and cached_semantic["value"].get("commit") == view.commit:
             semantic_index = cached_semantic["value"]
         else:
-            semantic_index = ensure_semantic_index(view, local_index, deep, allow_download=False)
+            documents = local_index.get("documents") if isinstance(local_index, dict) else []
+            estimated_bytes = sum(len(str(item.get("text") or "")) for item in documents if isinstance(item, dict))
+            # MemOS' vector lane is useful as a rescue path, but eagerly
+            # hashing a large Git corpus for every new snapshot can make a
+            # simple filename/date query look like a hung agent.  Start with
+            # the citation-first lexical/path lane for large sources and load
+            # the semantic cache only when that lane returns nothing.
+            defer_semantic = len(documents) >= 1000 or estimated_bytes >= 8 * 1024 * 1024
+            semantic_index = {
+                "configured": True,
+                "available": False,
+                "indexed": False,
+                "strategy": "lexical",
+                "deferred": True,
+                "defer_reason": "large_repository_first_pass",
+            } if defer_semantic else ensure_semantic_index(view, local_index, deep, allow_download=False)
             view.metadata["_semantic_index_cache"] = {"deep": deep, "value": semantic_index}
         view.metadata["semantic_index"] = semantic_index
     except (OSError, RuntimeError, TypeError, ValueError):
@@ -568,6 +583,13 @@ def _fallback_items(view: SourceView, query: str, limit: int, deep: bool, *, sta
         view.metadata.pop("local_index", None)
         view.metadata.pop("semantic_index", None)
     raw_items = fallback_search(view, query, limit, deep)
+    if not raw_items and isinstance(view.metadata.get("semantic_index"), dict) and view.metadata["semantic_index"].get("deferred"):
+        # A semantic rewrite with no lexical foothold is the one case that
+        # justifies loading/building the optional projection.
+        semantic_index = ensure_semantic_index(view, local_index, deep, allow_download=False)
+        view.metadata["semantic_index"] = semantic_index
+        view.metadata["_semantic_index_cache"] = {"deep": deep, "value": semantic_index}
+        raw_items = fallback_search(view, query, limit, deep)
     normalized = []
     for item in raw_items:
         if stale:

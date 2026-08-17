@@ -76,7 +76,10 @@ source remains the file and its Git citation.
 The current semantic capability is reported per source. `local-hybrid` means
 the optional deterministic builtin projection is available; it does not mean a
 neural model is installed. A neural provider and an LLM supervisor remain
-explicit opt-ins.
+explicit opt-ins. For large sources, the first pass deliberately uses the
+lexical/path lane and defers projection loading until lexical retrieval has
+no result; this keeps ordinary filename/date lookups responsive without
+removing the semantic rescue path.
 
 ## Evidence state
 
