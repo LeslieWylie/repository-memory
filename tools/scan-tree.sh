@@ -35,19 +35,34 @@ E='([^A-Za-z0-9_]|$)'
 # Placeholders that are *supposed* to appear. Scrubbed from a line before the
 # rule is re-applied, so a line carrying both a placeholder and a real address
 # is still reported — which a line-level `grep -v` exemption would have hidden.
-EXEMPT='[A-Za-z0-9._%+-]+@(example\.(com|org|net)|users\.noreply\.github\.com)'
+#
+# The path arm is what keeps `personal-absolute-path` alive: docs legitimately
+# write `/Users/you/projects`, and a rule that fails CI on every honest example
+# is a rule somebody eventually deletes. Its trailing `/` is load-bearing —
+# without it, `/Users/you` would be scrubbed out of `/Users/yourrealname/...`,
+# leaving a fragment the rule no longer matches. That is an exemption that
+# manufactures false negatives in the only direction that costs anything.
+EXEMPT='([A-Za-z0-9._%+-]+@(example\.(com|org|net)|users\.noreply\.github\.com)|/(Users|home)/(you|user|username|me|USER|NAME|<[A-Za-z-]+>)/)'
 
 # `named-secret-constant` — /[A-Z]+_(API_)?(KEY|TOKEN|SECRET)/ — is deliberately
 # NOT a rule here. This repository redacts secrets for a living: it ships a
 # "[REDACTED_SECRET]" placeholder, names the env vars it sets (LLM_API_KEY), and
 # tests both. Every hit is a false positive, and a rule that only ever cries
 # wolf gets muted, taking the real rules with it.
+# `personal-absolute-path` was added after the four rules above reported a clean
+# tree while `docs/upstream-reuse.md` and `docs/memory-providers.md` carried the
+# maintainer's real home-directory layout, macOS username included, on the
+# public default branch. Nothing here was broken — the shape simply had no rule,
+# and README.md meanwhile claimed the public boundary was "enforced, not just
+# asserted". A boundary with no rule for a category is asserted, and the clean
+# verdict is what made that indistinguishable from enforced.
 rules() {
   cat <<RULES
 corporate-hostname|${B}([a-z0-9-]+\.)+(internal|corp|intra|lan)${E}
 credential-blob|(-----BEGIN [A-Z ]*PRIVATE KEY-----|${B}(sk|ghp|gho|glpat)-[A-Za-z0-9_-]{16,})
 credential-in-url|${B}[a-z][a-z0-9+.-]*://[^/[:space:]:@]+:[^/[:space:]@]+@
 non-placeholder-email|[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}
+personal-absolute-path|${B}(/(Users|home)/|[Cc]:\\\\Users\\\\)[A-Za-z][A-Za-z0-9._-]*
 RULES
 }
 
@@ -67,16 +82,26 @@ scan() {
     # `xargs -a FILE` is GNU-only; the redirect form is portable.
     # `|| true` because grep exits 1 on no-match, the normal case, which would
     # otherwise abort the loop under `bash -e`.
+    # Passed through the environment, not `-v`. awk applies escape processing to
+    # `-v` assignments, so a backslash never survives one: measured on macOS awk
+    # 20200816, `-v re='a\.b'` arrives as `a.b`. Every `\.` in these rules was
+    # therefore reaching awk as "any character" — `hostXcorp` satisfied
+    # `corporate-hostname`, and `foo@exampleXcom` satisfied EXEMPT and got
+    # scrubbed, which is the direction that loses a real finding. grep sees the
+    # pattern unmangled, so this only ever corrupted the confirmation half, and
+    # a looser confirmation of an already-grep-matched line stays invisible
+    # until a rule needs a literal backslash — which `personal-absolute-path`
+    # does, and which is how this surfaced. ENVIRON is not escape-processed.
     xargs -0 grep -IHnE "$re" < "$list" 2>/dev/null \
-      | awk -v re="$re" -v ex="$EXEMPT" -v label="$label" '
+      | re="$re" ex="$EXEMPT" label="$label" awk '
           {
             # Split "path:line:content" by position, not by field, so that
             # colons inside the content stay inside the content.
             if (match($0, /^[^:]+:[0-9]+:/) == 0) next
             location = substr($0, 1, RLENGTH - 1)
             content  = substr($0, RLENGTH + 1)
-            gsub(ex, "", content)
-            if (content ~ re) print label "\t" location
+            gsub(ENVIRON["ex"], "", content)
+            if (content ~ ENVIRON["re"]) print ENVIRON["label"] "\t" location
           }' || true
   done < <(rules)
 }
@@ -92,6 +117,9 @@ trap 'rm -rf "$canary"' EXIT
   printf 'token glpat-ABCDEFGHIJKLMNOPQRSTUV\n'
   printf 'clone https://user:pw@git.somewhere.org/r.git\n'
   printf 'mail someone@somecorp.not-a-placeholder.net\n'
+  printf 'ref /Users/arealname/Desktop/thing\n'
+  printf 'ref C:\\Users\\arealname\\Desktop\\thing\n'
+  printf 'ref /Users/youruser/Desktop/thing\n'
 } > "$canary/planted.txt"
 printf '%s\0' "$canary/planted.txt" > "$canary/list"
 
@@ -105,15 +133,34 @@ while IFS='|' read -r label _; do
   }
 done < <(rules)
 
+# `personal-absolute-path` gets counted rather than merely seen, because one
+# label covers three things that fail independently:
+#
+#   1. the POSIX arm      — the only one the authors ever exercise;
+#   2. the Windows arm    — never typed on the machines this is written on, so
+#                           it can rot into a no-op while the rule still
+#                           "fires" on sample 1 and reports as working;
+#   3. `/Users/youruser/` — a name that merely *starts with* the placeholder
+#                           `you`. If the exemption's trailing `/` is ever
+#                           dropped, this scrubs down to `ruser/...` and stops
+#                           matching, which is a real leak the label-level
+#                           check above would still call green.
+found="$(grep -c '^personal-absolute-path' <<<"$planted" || true)"
+[ "$found" -eq 3 ] || {
+  echo "::error::rule 'personal-absolute-path' matched ${found}/3 planted samples (POSIX, Windows, placeholder-prefixed name)"
+  broken=1
+}
+
 # --- self-test: negative ------------------------------------------------------
 # The exemption is the half that fails silently in the safe direction's opposite:
 # if it stops working, CI fails on legitimate placeholders until someone deletes
 # the rule. An earlier version applied it after the path:line summary had already
 # replaced the matched text, so it could never match anything at all.
 printf 'contact test@example.com or ci@users.noreply.github.com\n' > "$canary/ok.txt"
+printf 'install into /Users/you/projects or /home/user/src or /Users/<name>/x\n' >> "$canary/ok.txt"
 printf '%s\0' "$canary/ok.txt" > "$canary/oklist"
 if [ -n "$(scan "$canary/oklist")" ]; then
-  echo "::error::placeholder addresses are being reported; the exemption is not working"
+  echo "::error::placeholder addresses or paths are being reported; the exemption is not working"
   broken=1
 fi
 
