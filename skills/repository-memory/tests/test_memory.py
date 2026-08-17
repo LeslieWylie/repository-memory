@@ -20,7 +20,7 @@ import core
 from citation import locate, validate
 from evaluate import evaluate_queries
 from fallback import _fts_candidates, paths, query_terms
-from local_index import _ensure_fts
+from local_index import _ensure_fts, _ensure_path_fts
 from memorycore import MemoryCoreClient, MemoryCoreConfig, MemoryCoreError
 from memmy import MemmyClient, MemmyConfig
 from mcp_server import SERVER_VERSION
@@ -91,8 +91,10 @@ class RepositoryMemoryTest(unittest.TestCase):
 
     def test_large_index_fts_keeps_filename_cjk_anchor(self):
         destination = Path(self.temp.name) / "derived-index.json"
-        fts = _ensure_fts(destination, [{"path": "standup/武垚乐.md", "text": "日报：今天完成了实验。"}])
-        self.assertIn("standup/武垚乐.md", _fts_candidates({"fts_path": str(fts)}, ["武垚乐"]))
+        documents = [{"path": "standup/武垚乐.md", "text": "日报：今天完成了实验。"}]
+        fts = _ensure_fts(destination, documents)
+        path_fts = _ensure_path_fts(destination, documents)
+        self.assertIn("standup/武垚乐.md", _fts_candidates({"fts_path": str(fts), "fts_path_paths": str(path_fts)}, ["武垚乐"]))
 
     def tearDown(self):
         os.environ.clear()

@@ -298,18 +298,26 @@ def _fts_candidates(indexed: dict[str, Any] | None, terms: list[str], limit: int
     if not usable:
         return None
     expression = " OR ".join(f'"{term}"' for term in usable)
-    try:
-        connection = sqlite3.connect(f"file:{indexed['fts_path']}?mode=ro", uri=True)
+    paths: set[str] = set()
+    databases = [indexed.get("fts_path"), indexed.get("fts_path_paths")]
+    for database in databases:
+        if not database:
+            continue
         try:
-            rows = connection.execute(
-                "SELECT paths.path FROM documents JOIN paths ON paths.rowid = documents.rowid WHERE documents MATCH ? LIMIT ?",
-                (expression, int(limit)),
-            ).fetchall()
-        finally:
-            connection.close()
-    except (OSError, sqlite3.Error, ValueError):
-        return None
-    return {str(row[0]) for row in rows if row and row[0]}
+            connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+            try:
+                rows = connection.execute(
+                    "SELECT paths.path FROM documents JOIN paths ON paths.rowid = documents.rowid WHERE documents MATCH ? LIMIT ?",
+                    (expression, int(limit)),
+                ).fetchall()
+            finally:
+                connection.close()
+        except (OSError, sqlite3.Error, ValueError):
+            continue
+        paths.update(str(row[0]) for row in rows if row and row[0])
+        if len(paths) >= limit:
+            break
+    return paths or None
 
 
 def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -> list[dict[str, Any]]:

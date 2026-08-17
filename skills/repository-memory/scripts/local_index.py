@@ -23,8 +23,11 @@ from fallback import _read_document, paths
 
 from models import SourceView
 
-SCHEMA_VERSION = 6
-FTS_SCHEMA_VERSION = 2
+# The JSON document shape is unchanged; keep the cache compatible so an
+# upgrade only builds the small path companion FTS instead of rereading every
+# document in a large repository.
+SCHEMA_VERSION = 5
+PATH_FTS_SCHEMA_VERSION = 1
 
 _DATE_RE = re.compile(r"20\d{2}[-/]\d{1,2}(?:[-/]\d{1,2})?|20\d{2}-W\d{1,2}", re.IGNORECASE)
 _MARKDOWN_LINK_RE = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
@@ -86,17 +89,14 @@ def _reference_targets(relative: str, text: str, known_paths: set[str]) -> list[
 
 
 def _ensure_fts(destination: Path, documents: list[dict[str, Any]]) -> Path:
-    """Build a disposable trigram candidate index for large repositories.
+    """Build or reuse the content trigram index.
 
-    The path is part of the searchable evidence surface.  MemOS' CJK fallback
-    showed why: a short question often names a person or card only in the
-    filename, not in the document body.  The previous content-only FTS cache
-    silently discarded those documents before the deterministic scorer could
-    apply its path anchor bonus.  Keep the source text as the primary field,
-    but include a separator and the relative path in the derived FTS stream.
+    Keep this large index content-only so an upgrade does not rewrite tens of
+    thousands of full documents.  Filename matching is provided by the small
+    companion index in ``_ensure_path_fts``.
     """
 
-    database = Path(f"{destination}.fts.v{FTS_SCHEMA_VERSION}.sqlite3")
+    database = Path(f"{destination}.fts.sqlite3")
     if database.exists():
         try:
             connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
@@ -124,12 +124,37 @@ def _ensure_fts(destination: Path, documents: list[dict[str, Any]]) -> Path:
             )
             connection.executemany(
                 "INSERT INTO documents(rowid, text) VALUES (?, ?)",
-                (
-                    (rowid, f"{str(item.get('text') or '')}\n{str(item.get('path') or '')}")
-                    for rowid, item in enumerate(documents, 1)
-                    if item.get("path")
-                ),
+                ((rowid, str(item.get("text") or "")) for rowid, item in enumerate(documents, 1) if item.get("path")),
             )
+            connection.commit()
+        finally:
+            connection.close()
+        os.replace(temporary, database)
+    finally:
+        temporary.unlink(missing_ok=True)
+        temporary.parent.rmdir()
+    return database
+
+
+def _ensure_path_fts(destination: Path, documents: list[dict[str, Any]]) -> Path:
+    """Build a tiny trigram index over relative paths only.
+
+    This borrows the useful short-CJK/path fallback behavior without forcing
+    a full content-index rebuild on every existing large repository cache.
+    """
+
+    database = Path(f"{destination}.fts.paths.v{PATH_FTS_SCHEMA_VERSION}.sqlite3")
+    if database.exists():
+        return database
+    temporary = Path(tempfile.mkdtemp(prefix="fts-paths-", dir=destination.parent)) / database.name
+    try:
+        connection = sqlite3.connect(temporary)
+        try:
+            connection.execute("CREATE TABLE paths(rowid INTEGER PRIMARY KEY, path TEXT NOT NULL)")
+            connection.execute("CREATE VIRTUAL TABLE documents USING fts5(text, tokenize='trigram', content='')")
+            rows = [(rowid, str(item.get("path") or "")) for rowid, item in enumerate(documents, 1) if item.get("path")]
+            connection.executemany("INSERT INTO paths(rowid, path) VALUES (?, ?)", rows)
+            connection.executemany("INSERT INTO documents(rowid, text) VALUES (?, ?)", rows)
             connection.commit()
         finally:
             connection.close()
@@ -179,6 +204,7 @@ def build(view: SourceView, deep: bool = False) -> dict[str, Any]:
         Path(temporary).unlink(missing_ok=True)
     if len(documents) >= 5000:
         value["fts_path"] = str(_ensure_fts(destination, documents))
+        value["fts_path_paths"] = str(_ensure_path_fts(destination, documents))
     return value
 
 
@@ -192,6 +218,7 @@ def ensure(view: SourceView, deep: bool = False) -> dict[str, Any]:
     if value and value.get("commit") == view.commit and bool(value.get("deep")) == deep:
         if len(value.get("documents", [])) >= 5000:
             value["fts_path"] = str(_ensure_fts(destination, value["documents"]))
+            value["fts_path_paths"] = str(_ensure_path_fts(destination, value["documents"]))
         return value
     return build(view, deep)
 
