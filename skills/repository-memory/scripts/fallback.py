@@ -320,6 +320,33 @@ def _fts_candidates(indexed: dict[str, Any] | None, terms: list[str], limit: int
     return paths or None
 
 
+def _document_cache(source: SourceView, indexed: dict[str, Any] | None, deep: bool) -> dict[str, Any]:
+    """Reuse per-view document maps across queries in a long-lived MCP process."""
+
+    metadata = source.metadata if isinstance(source.metadata, dict) else {}
+    cached = metadata.get("_fallback_document_cache")
+    cache_key = (str(source.commit), bool(deep), id(indexed))
+    if isinstance(cached, dict) and cached.get("key") == cache_key:
+        return cached
+    indexed_documents = indexed.get("documents") if isinstance(indexed, dict) else None
+    all_documents = (
+        [(str(item.get("path")), str(item.get("text") or "")) for item in indexed_documents if isinstance(item, dict) and item.get("path")]
+        if isinstance(indexed_documents, list)
+        else [(relative, None) for relative in paths(source.path, deep)]
+    )
+    value = {
+        "key": cache_key,
+        "indexed_documents": indexed_documents,
+        "document_metadata": {str(item.get("path")): item for item in indexed_documents or [] if isinstance(item, dict) and item.get("path")},
+        "all_documents": all_documents,
+        "all_document_by_path": dict(all_documents),
+        "lower_document_by_path": {relative: f"{relative} {text}".casefold() for relative, text in all_documents if text is not None},
+    }
+    if isinstance(metadata, dict):
+        metadata["_fallback_document_cache"] = value
+    return value
+
+
 def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -> list[dict[str, Any]]:
     raw_terms = query_terms(query)
     has_compound_term = any("-" in term for term in raw_terms)
@@ -353,17 +380,10 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
     phrase_terms = [f"{left} {right}" for left, right in pairwise(raw_terms) if len(left) >= 3 and len(right) >= 3]
     hits: list[dict[str, Any]] = []
     indexed = source.metadata.get("local_index") if isinstance(source.metadata, dict) else None
-    indexed_documents = indexed.get("documents") if isinstance(indexed, dict) else None
-    document_metadata = {
-        str(item.get("path")): item
-        for item in indexed_documents or []
-        if isinstance(item, dict) and item.get("path")
-    }
-    all_documents = (
-        [(str(item.get("path")), str(item.get("text") or "")) for item in indexed_documents if isinstance(item, dict) and item.get("path")]
-        if isinstance(indexed_documents, list)
-        else [(relative, None) for relative in paths(source.path, deep)]
-    )
+    cache = _document_cache(source, indexed, deep)
+    indexed_documents = cache.get("indexed_documents")
+    document_metadata = cache["document_metadata"]
+    all_documents = cache["all_documents"]
     # Content/path FTS is an acceleration lane for genuinely large indexes.
     # Medium indexes may already have an old sidecar from an experiment, but
     # using it as a hard candidate gate can reduce semantic/temporal recall.
@@ -373,7 +393,8 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
     # A semantic rewrite can have no lexical hit. Keep the full path/text map
     # only as a cheap in-process view of the already-loaded JSON cache, then
     # narrow it to semantic candidates after scoring below.
-    all_document_by_path = dict(all_documents)
+    all_document_by_path = cache["all_document_by_path"]
+    lower_document_by_path = cache["lower_document_by_path"]
     # Keep the original semantic candidate behavior for small/non-FTS indexes:
     # without a lexical candidate set, do not discard documents solely
     # because the optional projection ranks them below its recall threshold.
@@ -442,7 +463,7 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
     # signal.  Rare query concepts (for example a named method) should beat a
     # common word such as "training" without a hand-maintained domain list.
     document_frequency = {
-        term: sum(term in f"{text.casefold()} {relative.casefold()}" for relative, text in documents)
+        term: sum(term in lower_document_by_path.get(relative, f"{relative} {text}".casefold()) for relative, text in documents)
         for term in terms
     }
     term_idf = {
@@ -474,7 +495,7 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
         anchor_paths = {
             relative
             for relative, text in all_document_by_path.items()
-            if any(term in f"{relative} {text}".casefold() for term in named_terms)
+            if any(term in lower_document_by_path.get(relative, f"{relative} {text}".casefold()) for term in named_terms)
         }
         for relative in anchor_paths:
             links = document_metadata.get(relative, {}).get("links", [])
