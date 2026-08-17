@@ -8,6 +8,9 @@ claim about leaderboard placement.
 
 - `GET /health` returns 2xx without authentication.
 - `POST /add` persists the supplied messages before returning HTTP 200.
+- The Add response contains only the declared `success`, `request_id`,
+  `user_id`, and `session_id` fields; persistence/read-back is completed before
+  the response is sent.
 - `POST /search` returns `{"data": [...]}` in relevance order.
 - `user_id` is the sole retrieval isolation boundary.
 - Message `role` is preserved as any non-empty producer role; the current

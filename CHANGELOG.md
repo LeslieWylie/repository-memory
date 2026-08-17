@@ -1,11 +1,13 @@
 # Changelog
 
-## 0.7.2
+## 0.7.3
 
 - Align the AML wrapper with the current public contract: accept any non-empty
   message role and normalize Unix-millisecond source timestamps.
 - Use source event time in `created_at` and add a bounded recency signal for
   explicit latest/recent queries.
+- Keep the public Add response to the exact declared fields while retaining
+  internal write/read-back verification.
 - Add a submission-ready code-route runbook without claiming local fixture
   scores as leaderboard results.
 

@@ -55,7 +55,6 @@ class AMLService:
             "request_id": str(request_id),
             "user_id": str(user_id),
             "session_id": str(session_id),
-            "readback": result["readback"],
         }
 
     def search(self, payload: dict[str, Any]) -> dict[str, Any]:

@@ -37,7 +37,9 @@ class AMLServerTest(unittest.TestCase):
                     connection.request("POST", "/add", body=json.dumps(add_payload), headers={"Content-Type": "application/json", "X-Api-Key": "secret"})
                     response = connection.getresponse()
                     self.assertEqual(response.status, 200)
-                    self.assertTrue(json.loads(response.read())["success"])
+                    add_result = json.loads(response.read())
+                    self.assertEqual(set(add_result), {"success", "request_id", "user_id", "session_id"})
+                    self.assertTrue(add_result["success"])
 
                     search_payload = {"query": "What report style do I prefer?", "user_id": "user-a", "top_k": 100}
                     connection.request("POST", "/search", body=json.dumps(search_payload), headers={"Content-Type": "application/json", "X-Api-Key": "secret"})
