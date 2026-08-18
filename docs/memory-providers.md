@@ -2,8 +2,9 @@
 
 `repository-memory` is an independent local product. Its built-in SQLite
 runtime owns the durable four-layer conversation memory plane and its local
-vector projection. TencentDB MemoryCore and Memmy are optional compatibility
-references only; neither is required to run the default CLI/MCP. Scores are
+vector projection. MemOS Local can be selected as the native OpenClaw
+conversation-memory slot; TencentDB MemoryCore and Memmy remain optional
+compatibility lanes. None is required for the default CLI/MCP. Scores are
 never fused across external provider lanes.
 
 ## Built-in standalone runtime
@@ -21,11 +22,11 @@ The built-in vector projection is `builtin-char-ngram-v1`. It requires no model
 download and is reported as `local-hybrid`; it must not be described as a
 neural embedding model.
 
-## MemOS Local lifecycle ideas incorporated
+## MemOS Local integration and lifecycle ideas
 
-The public repository does not depend on the MemOS Node package, but the
-standalone runtime now incorporates the useful local-plugin mechanics in
-`memos_lifecycle.py`:
+The standalone runtime incorporates the useful local-plugin mechanics in
+`memos_lifecycle.py`, and the public repository also provides a real optional
+MemOS Local OpenClaw integration:
 
 - real episode/turn identifiers on L0/L1 records;
 - conservative revision/follow-up/new-task boundaries;
@@ -34,13 +35,12 @@ standalone runtime now incorporates the useful local-plugin mechanics in
   episodes and keeps the supporting record IDs;
 - a read-only timeline and dashboard over the same SQLite runtime.
 
-These are deliberately ported into the Python runtime so installation remains
-one-command and dependency-free. Provider daemons, OpenClaw-specific bridges,
-and MemOS's Node dependency tree are not required. The algorithmic reference is
-the Apache-2.0 MemOS Local Plugin source, read from a local checkout of its
-upstream repository
-[MemOS Local Plugin](https://github.com/MemTensor/MemOS/tree/main/apps/memos-local-plugin).
-The reference checkout is not part of the production runtime.
+The native OpenClaw lane uses the upstream `apps/memos-local-openclaw` plugin.
+It is MIT licensed and is installed only through a revision-pinned user-data
+staging copy; the discovered checkout is not edited. See
+[MemOS Local integration](memos-local-integration.md) for bootstrap, rollback,
+and verification. MemOS owns conversation memory; repository-memory still owns
+Git citation retrieval.
 
 ## Optional TencentDB compatibility backend
 

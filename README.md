@@ -24,13 +24,14 @@ The important idea is simple:
 
 > An answer is a fact only when the runtime can show where it came from.
 
-It ships as one generic Skill with a shared Python runtime and a pinned,
-source-only upstream component reference snapshot:
+It ships as one generic Skill with a shared Python runtime and isolated,
+optional upstream integrations:
 
 - a citation-first repository index and CLI;
 - a local stdio MCP server for Claude, Codex, OpenClaw, and other hosts;
 - an in-process L0-L3 conversation memory runtime, with vendor backends only as
   explicit compatibility options;
+- an optional native MemOS Local OpenClaw memory plane managed by the same CLI;
 - an OpenClaw lifecycle extension for before-prompt recall and conservative post-turn capture;
 - a metadata-only audit proxy and an advisory guard that validates evidence
   receipts without blocking normal coding, shell, Git, or debugging tools.
@@ -44,6 +45,35 @@ The repository itself is the source of truth. Indexes, snapshots, audit logs,
 conversation data, and credentials stay in user-level data/config/cache
 directories and are never written back to the source repository by search or
 sync.
+
+## MemOS Local and Git evidence in one host
+
+The unified installation keeps provenance explicit while giving OpenClaw one
+memory slot:
+
+```text
+OpenClaw native memory_search/get/timeline
+  -> MemOS Local conversation memory, task summaries, skills and viewer
+
+repository-memory__memory_search/get
+  -> Git-backed repository facts with commit/path/line citations
+```
+
+From a MemOS checkout, run:
+
+```bash
+export MEMOS_SOURCE_ROOT=/path/to/MemOS
+repository-memory memos doctor --json
+repository-memory memos install --json
+openclaw gateway restart --safe --json
+openclaw plugins inspect memos-local-openclaw-plugin --runtime --json
+```
+
+The installer builds a revision-pinned staging copy, selects
+`plugins.slots.memory=memos-local-openclaw-plugin`, disables OpenClaw's builtin
+memory search to avoid duplicate recall, and preserves the repository-memory
+MCP. It never places an embedding key, provider URL, or absolute checkout path
+in the Skill. See [docs/memos-local-integration.md](docs/memos-local-integration.md).
 
 ## What happens on one question?
 

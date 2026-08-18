@@ -49,6 +49,10 @@ from fallback import search as fallback_search
 from local_index import ensure as ensure_local_index
 from local_index import status as local_index_status
 from memmy import MemmyError, configure_memmy, memmy_memory_client
+from memos_integration import configure as configure_memos
+from memos_integration import disable as disable_memos
+from memos_integration import doctor as doctor_memos
+from memos_integration import install as install_memos
 from mcp_server import serve
 from memorycore import (
     _lifecycle_status as _native_lifecycle_status,
@@ -1961,6 +1965,15 @@ def build_parser() -> argparse.ArgumentParser:
     memmy.add_argument("--query")
     memmy.add_argument("--limit", type=int, default=5)
     memmy.add_argument("--json", action="store_true")
+    memos = sub.add_parser("memos", help="Manage the optional MemOS Local OpenClaw memory plane")
+    memos.add_argument("action", choices=("doctor", "configure", "install", "disable"))
+    memos.add_argument("--source", dest="memos_source", help="MemOS checkout; otherwise discover from user config/environment")
+    memos.add_argument("--openclaw-config")
+    memos.add_argument("--openclaw-agent", action="append", dest="memos_agents", help="Limit the native memory tools to selected agent ids")
+    memos.add_argument("--no-build", action="store_true")
+    memos.add_argument("--no-install-dependencies", action="store_true")
+    memos.add_argument("--timeout", type=int, default=900)
+    memos.add_argument("--json", action="store_true")
     gui = sub.add_parser("gui")
     gui.add_argument("--open", action="store_true", help="Open the configured optional provider UI")
     gui.add_argument("--serve", action="store_true", help="Start the built-in zero-dependency local dashboard")
@@ -2070,7 +2083,7 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
                 return _mcp_dispatch(name, arguments)
             return serve(dispatch)
         gate_failed = False
-        root = None if args.command in {"init", "source", "doctor", "sync", "search", "get", "explain", "feedback", "promote", "publish", "team-activate", "team-export", "team-import", "team-evaluate", "team-compact", "supervise", "benchmark", "context", "supersede", "memory-timeline", "memory-observe", "memory-reflect", "memory-retain", "ingest-session", "capture-turn", "knowledge", "memmy", "gui", "semantic", "memory", "memorycore"} else resolve_root(root_arg)
+        root = None if args.command in {"init", "source", "doctor", "sync", "search", "get", "explain", "feedback", "promote", "publish", "team-activate", "team-export", "team-import", "team-evaluate", "team-compact", "supervise", "benchmark", "context", "supersede", "memory-timeline", "memory-observe", "memory-reflect", "memory-retain", "ingest-session", "capture-turn", "knowledge", "memmy", "memos", "gui", "semantic", "memory", "memorycore"} else resolve_root(root_arg)
         if args.command in {"init", "source"} and root_arg:
             root = resolve_root(root_arg)
         if args.command == "doctor":
@@ -2236,6 +2249,22 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
                     "results": client.search(args.query, args.limit),
                     "canonical_repo_changed": False,
                 }
+        elif args.command == "memos":
+            if args.action == "doctor":
+                value = doctor_memos(source=args.memos_source, openclaw_config=args.openclaw_config)
+            elif args.action == "configure":
+                value = configure_memos(source=args.memos_source, openclaw_config=args.openclaw_config)
+            elif args.action == "disable":
+                value = disable_memos(openclaw_config=args.openclaw_config)
+            else:
+                value = install_memos(
+                    source=args.memos_source,
+                    openclaw_config=args.openclaw_config,
+                    agent_ids=args.memos_agents,
+                    build=not args.no_build,
+                    install_dependencies=not args.no_install_dependencies,
+                    timeout=args.timeout,
+                )
         elif args.command == "gui":
             if args.serve:
                 from dashboard import serve_dashboard

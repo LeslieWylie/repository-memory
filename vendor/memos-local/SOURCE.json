@@ -1,0 +1,17 @@
+{
+  "name": "MemOS Local OpenClaw integration",
+  "upstream": "https://github.com/MemTensor/MemOS",
+  "component": "apps/memos-local-openclaw",
+  "license": "MIT",
+  "integration": "managed-staging-install",
+  "source_discovery": [
+    "MEMOS_SOURCE_ROOT",
+    "repository-memory config memos.source_root",
+    "current directory and parents"
+  ],
+  "runtime_boundary": {
+    "repository_memory": "Git evidence, citation, freshness, repository MCP",
+    "memos_local": "local conversation memory, task summaries, skills, viewer"
+  },
+  "upstream_checkout_policy": "never modify the discovered checkout; stage a revision-pinned copy before build/install"
+}

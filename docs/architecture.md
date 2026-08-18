@@ -17,9 +17,10 @@ Repository Memory has four deliberately separate boundaries:
    candidate, active, stale, and superseded states.
 5. **Host integration** is a thin MCP registration and optional lifecycle
    extension. It does not contain a second ranking or storage implementation.
-6. **Vendored upstream components** are a pinned source snapshot inside the
-   Skill package. They document and support the native L0-L3 lifecycle, but do
-   not create a second public API, index, or score-fusion path.
+6. **Upstream integrations** are isolated from the core. Optional MemOS Local
+   is installed from a revision-pinned user-data staging copy for native
+   OpenClaw conversation memory; provider components do not create a second
+   Git citation API, index, or score-fusion path.
 
 ## Request path
 
