@@ -55,6 +55,12 @@ def test_team_repository_export_is_idempotent_and_hydrates(tmp_path, monkeypatch
     assert result["ok"] is True
     assert result["imported"] == 1
     assert fresh.search("reusable failure", include_candidates=False)["active"]
+    # A hydrated central record must export back to the same filename.  This
+    # guards against creating a duplicate active memory after a pull.
+    round_trip = sync_team_memory(str(repository), pull=False)
+    assert round_trip["ok"] is True
+    assert round_trip["created"] == 0
+    assert len(list((repository / "knowledge/team-memory/l1/active").glob("*.md"))) == 1
     health = team_repository_health(str(repository))
     assert health["configured"] is True
     assert health["reachable"] is True

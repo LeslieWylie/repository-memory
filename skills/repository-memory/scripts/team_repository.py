@@ -102,6 +102,15 @@ def _safe(value: str, fallback: str = "unknown") -> str:
 
 
 def _central_id(memory_id: str, layer: str = "L1") -> str:
+    # Records hydrated from the canonical repository keep the central ID in
+    # their local source ID.  Reusing it is what makes export/import
+    # idempotent across processes and machines; hashing the wrapper would
+    # create a second active file for the same memory.
+    value = str(memory_id or "")
+    if value.startswith("team:central:"):
+        value = value.split("team:central:", 1)[1]
+    if re.fullmatch(r"team_l[123]_[a-f0-9]{24}", value):
+        return value
     digest = hashlib.sha256(memory_id.encode("utf-8")).hexdigest()[:24]
     return f"team_{layer.lower()}_{digest}"
 
@@ -170,7 +179,7 @@ def _evidence_lines(record: dict[str, Any]) -> list[str]:
 def _markdown(record: dict[str, Any], *, central_id: str, layer: str, status: str, agent: str) -> str:
     provenance = _provenance(record)
     scope = _scope(record)
-    source_id = str(record.get("id") or "")
+    source_id = str(provenance.get("source_memory_id") or record.get("id") or "")
     lines = [
         "---",
         f"id: {central_id}",
@@ -271,7 +280,18 @@ def export_team_memory(repository: str | None = None, *, agent_id: str | None = 
     created = skipped = conflicts = moved = 0
     files: list[str] = []
     bundle = team_memory_store().export_bundle()
-    for record in bundle.get("records", []):
+    # A pull hydrates the same central memory into the local store.  Keep the
+    # original local record when both forms are present; otherwise two local
+    # rows would alternately rewrite the same canonical file on every sync.
+    records_by_central_id: dict[str, dict[str, Any]] = {}
+    for candidate in bundle.get("records", []):
+        if not isinstance(candidate, dict):
+            continue
+        candidate_id = _central_id(str(candidate.get("id") or ""), _layer(candidate))
+        current = records_by_central_id.get(candidate_id)
+        if current is None or "central_id" in _provenance(current):
+            records_by_central_id[candidate_id] = candidate
+    for record in records_by_central_id.values():
         if not isinstance(record, dict):
             continue
         provenance = _provenance(record)
@@ -349,8 +369,9 @@ def _frontmatter(text: str) -> tuple[dict[str, str], str]:
         # Keep the small provenance fields needed for hydration.  Other
         # nested YAML remains human-readable in the canonical file and is not
         # interpreted as executable configuration.
-        if normalized in {"id", "layer", "status", "kind", "confidence", "valid_until", "accepted_at", "agent_id", "source_memory_id", "observed_at"}:
-            fields[normalized] = value.strip().strip('"')
+        if normalized in {"id", "layer", "status", "kind", "confidence", "valid_until", "accepted_at", "reviewed_by", "agent_id", "source_memory_id", "observed_at", "run_id", "session_id", "scope"}:
+            cleaned = value.strip().strip('"')
+            fields[normalized] = "" if cleaned.lower() == "null" else cleaned
     return fields, parts[2].strip()
 
 
@@ -383,17 +404,53 @@ def import_team_memory(repository: str | None = None, *, include_candidates: boo
             continue
         title_match = re.search(r"^#\s+(.+)$", body, re.MULTILINE)
         title = title_match.group(1).strip() if title_match else central_id
-        source_memory_id = fields.get("source_memory_id") or f"team:central:{central_id}"
+        summary_match = re.search(r"^## Summary\s*\n\s*(.*?)(?=\n## Content\s*\n|\Z)", body, re.MULTILINE | re.DOTALL)
+        content_match = re.search(r"^## Content\s*\n\s*(.*?)(?=\n## Evidence\s*\n|\Z)", body, re.MULTILINE | re.DOTALL)
+        summary = summary_match.group(1).strip() if summary_match else ""
+        content = content_match.group(1).strip() if content_match else body[:12000]
+        evidence: list[dict[str, str]] = []
+        evidence_match = re.search(r"^evidence:\s*\n(?P<items>(?:\s*- .*\n?)*)", path.read_text(encoding="utf-8"), re.MULTILINE)
+        for item in (evidence_match.group("items").splitlines() if evidence_match else []):
+            raw = item.strip()
+            if not raw.startswith("-"):
+                continue
+            parsed: dict[str, str] = {}
+            for part in raw[1:].strip().split("; "):
+                if "=" in part:
+                    key, value = part.split("=", 1)
+                    parsed[key.strip()] = value.strip()
+            if parsed:
+                evidence.append(parsed)
+        source_memory_id = fields.get("source_memory_id")
+        scope = _parse_json(fields.get("scope"), {})
+        provenance = {
+            "source": "team-knowledge-data",
+            "canonical_path": str(path.relative_to(root)),
+            "layer": fields.get("layer", "L1"),
+            "agent_id": fields.get("agent_id"),
+            "central_id": central_id,
+            "source_memory_id": source_memory_id,
+            "observed_at": fields.get("observed_at"),
+            "run_id": fields.get("run_id"),
+            "session_id": fields.get("session_id"),
+            "evidence": evidence,
+        }
         payload = {
-            "id": source_memory_id if source_memory_id.startswith("team:") else f"team:{source_memory_id}",
+            # The canonical ID is the identity shared across local stores.
+            # Keep the original local ID only as provenance; otherwise a
+            # hydrated record would hash to a second central filename when it
+            # is exported again.
+            "id": f"team:central:{central_id}",
             "type": fields.get("kind", "discovery"),
             "title": title,
-            "content": body[:12000],
-            "summary": body[:400],
+            "content": content[:12000],
+            "summary": summary or content[:400],
             "status": local_status,
             "confidence": float(fields.get("confidence") or 0.5),
-            "scope": {"team_repository": str(root)},
-            "provenance": {"source": "team-knowledge-data", "canonical_path": str(path.relative_to(root)), "layer": fields.get("layer", "L1"), "agent_id": fields.get("agent_id"), "central_id": central_id},
+            "scope": scope,
+            "provenance": provenance,
+            "reviewed_by": fields.get("reviewed_by"),
+            "activated_at": fields.get("accepted_at"),
             "idempotency_key": f"central:{central_id}",
         }
         try:

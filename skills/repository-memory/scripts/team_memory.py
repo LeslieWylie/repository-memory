@@ -455,6 +455,8 @@ class SQLiteTeamMemoryBackend:
         if not memory_id.startswith("team:"):
             memory_id = "team:" + memory_id
         author_agent = str(payload.get("author_agent") or provenance.get("agent") or provenance.get("agent_id") or "").strip() or None
+        reviewed_by = str(payload.get("reviewed_by") or "").strip() or None
+        activated_at = str(payload.get("activated_at") or payload.get("accepted_at") or "").strip() or None
         supersedes = str(payload.get("supersedes") or "").strip() or None
         valid_from = str(payload.get("valid_from") or now)
         valid_until = str(payload.get("valid_until") or "") or None
@@ -469,8 +471,8 @@ class SQLiteTeamMemoryBackend:
                 (id, memory_type, title, content, summary, scope, provenance, confidence, status,
                  supersedes, superseded_by, valid_from, valid_until, author_agent, reviewed_by, activated_at, idempotency_key,
                 created_at, updated_at, revision, origin_node, parent_revision)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?)""",
-                (memory_id, memory_type, title, content, summary, _json(scope), _json(provenance), confidence, status, supersedes, valid_from, valid_until, author_agent, idempotency, now, now, 1, self.node_id, parent_revision),
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (memory_id, memory_type, title, content, summary, _json(scope), _json(provenance), confidence, status, supersedes, valid_from, valid_until, author_agent, reviewed_by, activated_at, idempotency, now, now, 1, self.node_id, parent_revision),
             )
             if superseded_row and superseded_row["status"] != "superseded":
                 revision, origin_node, parent = self._next_revision(superseded_row, self.node_id)
