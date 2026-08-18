@@ -285,7 +285,7 @@ def export_team_memory(repository: str | None = None, *, agent_id: str | None = 
     if root is None:
         return {"ok": False, "status": "not_configured", "reason": "team repository is not configured", "canonical_repo_changed": False}
     existing = _existing_by_id(root)
-    created = skipped = conflicts = moved = 0
+    created = skipped = preserved = conflicts = moved = 0
     files: list[str] = []
     bundle = team_memory_store().export_bundle()
     # A pull hydrates the same central memory into the local store.  Keep the
@@ -338,6 +338,22 @@ def export_team_memory(repository: str | None = None, *, agent_id: str | None = 
                 conflicts += 1
                 files.append(str(conflict.relative_to(root)))
             continue
+        if prior == target and prior.is_file():
+            prior_content = prior.read_text(encoding="utf-8")
+            if prior_content == content:
+                skipped += 1
+                continue
+            # Canonical records are append/review controlled.  A local
+            # hydrated wrapper may have less provenance than the canonical
+            # Markdown (for example after a pull/read-back), so an automatic
+            # sync must never replace an existing file in-place.  This is
+            # especially important for active/accepted records, whose review
+            # evidence is not reproducible from the local SQLite projection.
+            # Keep the canonical file and make the discrepancy visible to the
+            # caller instead of silently downgrading it.
+            preserved += 1
+            skipped += 1
+            continue
         if _write_if_changed(target, content):
             created += 1
             files.append(str(target.relative_to(root)))
@@ -352,6 +368,7 @@ def export_team_memory(repository: str | None = None, *, agent_id: str | None = 
         "repository_root": str(root),
         "created": created,
         "skipped": skipped,
+        "preserved": preserved,
         "moved": moved,
         "conflicts": conflicts,
         "catalog_changed": catalog_changed,

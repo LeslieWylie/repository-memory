@@ -44,7 +44,13 @@ def test_team_repository_export_is_idempotent_and_hydrates(tmp_path, monkeypatch
     active = backend.activate(published["memory"]["id"], reviewer="reviewer")
     assert active["status"] == "active"
     sync_team_memory()
-    assert list((repository / "knowledge/team-memory/l1/active").glob("*.md"))
+    active_path = next((repository / "knowledge/team-memory/l1/active").glob("*.md"))
+    assert active_path.is_file()
+    canonical_marker = "reviewed canonical evidence must survive local hydration"
+    active_path.write_text(active_path.read_text(encoding="utf-8") + f"\n{canonical_marker}\n", encoding="utf-8")
+    protected = sync_team_memory()
+    assert protected["preserved"] >= 1
+    assert canonical_marker in active_path.read_text(encoding="utf-8")
 
     # A fresh local node can hydrate the shared record without reading raw
     # conversations or depending on a network service.
