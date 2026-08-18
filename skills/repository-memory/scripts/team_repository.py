@@ -1,0 +1,431 @@
+#!/usr/bin/env python3
+"""Git-backed Team Memory bridge.
+
+The local SQLite store is the fast, private runtime.  This module is the
+small, explicit bridge to a user-owned canonical team repository.  It writes
+only reviewable Markdown candidates/records, never raw conversations, and it
+never commits or pushes on the caller's behalf.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import tempfile
+from pathlib import Path
+from typing import Any
+
+from discovery import config_path, data_root, read_config
+from team_memory import team_memory_store
+
+
+TEAM_REPO_ENV = "REPOSITORY_MEMORY_TEAM_REPOSITORY"
+TEAM_AUTO_SYNC_ENV = "REPOSITORY_MEMORY_TEAM_AUTO_SYNC"
+TEAM_DIR = Path("knowledge/team-memory")
+_SAFE = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+def _truthy(value: Any) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _team_config() -> dict[str, Any]:
+    value = read_config().get("team_memory")
+    return value if isinstance(value, dict) else {}
+
+
+def configured_team_repository(explicit: str | None = None) -> Path | None:
+    value = explicit or os.environ.get(TEAM_REPO_ENV) or _team_config().get("repository_root")
+    if not value:
+        return None
+    root = Path(str(value)).expanduser().resolve()
+    if not (root / TEAM_DIR / "README.md").is_file():
+        raise RuntimeError(f"team repository is not a supported Git Team Memory source: {root}")
+    return root
+
+
+def _write_config(value: dict[str, Any]) -> Path:
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return path
+
+
+def configure_team_repository(repository: str, *, auto_sync: bool = True, agent_id: str | None = None) -> dict[str, Any]:
+    root = configured_team_repository(repository)
+    if root is None:
+        raise RuntimeError("team repository path is required")
+    config = read_config()
+    current = _team_config()
+    updated = {**current, "repository_root": str(root), "auto_sync": bool(auto_sync)}
+    if agent_id:
+        updated["agent_id"] = str(agent_id)
+    config["team_memory"] = updated
+    path = _write_config(config)
+    return {
+        "ok": True,
+        "repository_root": str(root),
+        "auto_sync": bool(auto_sync),
+        "config": str(path),
+        "canonical_repo_changed": False,
+    }
+
+
+def auto_sync_enabled() -> bool:
+    configured = _team_config().get("auto_sync")
+    if configured is not None:
+        return bool(configured)
+    return _truthy(os.environ.get(TEAM_AUTO_SYNC_ENV, "0"))
+
+
+def _parse_json(value: Any, default: Any) -> Any:
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, json.JSONDecodeError):
+        return default
+    return parsed
+
+
+def _safe(value: str, fallback: str = "unknown") -> str:
+    result = _SAFE.sub("-", str(value or "").strip()).strip("-.")
+    return result[:80] or fallback
+
+
+def _central_id(memory_id: str, layer: str = "L1") -> str:
+    digest = hashlib.sha256(memory_id.encode("utf-8")).hexdigest()[:24]
+    return f"team_{layer.lower()}_{digest}"
+
+
+def _yaml(value: Any) -> str:
+    if value in (None, ""):
+        return "null"
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def _provenance(record: dict[str, Any]) -> dict[str, Any]:
+    return _parse_json(record.get("provenance"), {}) if record.get("provenance") else {}
+
+
+def _scope(record: dict[str, Any]) -> dict[str, Any]:
+    return _parse_json(record.get("scope"), {}) if record.get("scope") else {}
+
+
+def _layer(record: dict[str, Any]) -> str:
+    provenance = _provenance(record)
+    value = str(record.get("layer") or provenance.get("layer") or "L1").upper()
+    return value if value in {"L1", "L2", "L3"} else "L1"
+
+
+def _status_path(root: Path, record: dict[str, Any]) -> Path:
+    layer = _layer(record)
+    status = str(record.get("status") or "candidate").lower()
+    provenance = _provenance(record)
+    agent = _safe(str(record.get("author_agent") or provenance.get("agent_id") or provenance.get("agent") or "unknown"))
+    central_id = _central_id(str(record.get("id") or ""), layer)
+    if layer == "L1":
+        if status == "candidate":
+            return root / TEAM_DIR / "inbox" / agent / f"{central_id}.md"
+        bucket = status if status in {"active", "stale", "superseded"} else "candidate"
+        return root / TEAM_DIR / "l1" / bucket / f"{central_id}.md"
+    bucket = "accepted" if status in {"accepted", "active"} else "candidate"
+    return root / TEAM_DIR / layer.lower() / bucket / f"{central_id}.md"
+
+
+def _evidence_lines(record: dict[str, Any]) -> list[str]:
+    provenance = _provenance(record)
+    evidence = provenance.get("evidence") or provenance.get("citations") or []
+    if isinstance(evidence, dict):
+        evidence = [evidence]
+    if not isinstance(evidence, list):
+        evidence = []
+    lines: list[str] = []
+    for item in evidence:
+        if not isinstance(item, dict):
+            continue
+        parts = []
+        for key in ("repository", "commit", "path", "line_start", "line_end", "locator"):
+            if item.get(key) not in (None, ""):
+                parts.append(f"{key}={item[key]}")
+        if parts:
+            lines.append("- " + "; ".join(parts))
+    return lines
+
+
+def _markdown(record: dict[str, Any], *, central_id: str, layer: str, status: str, agent: str) -> str:
+    provenance = _provenance(record)
+    scope = _scope(record)
+    source_id = str(record.get("id") or "")
+    lines = [
+        "---",
+        f"id: {central_id}",
+        "schema_version: 1",
+        f"layer: {layer}",
+        f"kind: {record.get('memory_type') or 'discovery'}",
+        f"status: {status}",
+        "content_type: team_memory",
+        f"scope: {_yaml(scope)}",
+        "provenance:",
+        f"  agent_id: {_yaml(agent)}",
+        f"  observed_at: {_yaml(provenance.get('observed_at') or record.get('created_at'))}",
+        f"  run_id: {_yaml(provenance.get('run_id'))}",
+        f"  session_id: {_yaml(provenance.get('session_id'))}",
+        f"  source_memory_id: {_yaml(source_id)}",
+        "  source_type: local_team_memory",
+        f"confidence: {_yaml(record.get('confidence', 0.0))}",
+        f"valid_until: {_yaml(record.get('valid_until'))}",
+    ]
+    reviewer = record.get("reviewed_by")
+    if reviewer:
+        lines.append(f"reviewed_by: {_yaml(reviewer)}")
+    if record.get("activated_at"):
+        lines.append(f"accepted_at: {_yaml(record.get('activated_at'))}")
+    lines.extend(["evidence:"])
+    evidence = _evidence_lines(record)
+    lines.extend(evidence or ["  - citation_status: pending_git_link"])
+    lines.extend(["---", "", f"# {record.get('title') or 'Team memory'}", ""])
+    summary = str(record.get("summary") or "").strip()
+    content = str(record.get("content") or "").strip()
+    if summary and summary != content:
+        lines.extend(["## Summary", "", summary, ""])
+    lines.extend(["## Content", "", content, ""])
+    if evidence:
+        lines.extend(["## Evidence", "", *evidence, ""])
+    return "\n".join(lines)
+
+
+def _existing_by_id(root: Path) -> dict[str, Path]:
+    result: dict[str, Path] = {}
+    base = root / TEAM_DIR
+    if not base.is_dir():
+        return result
+    for path in base.rglob("*.md"):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        match = re.search(r"^id:\s*([^\n]+)", text, re.MULTILINE)
+        if match:
+            result[match.group(1).strip().strip('"')] = path
+    return result
+
+
+def _catalog(root: Path) -> str:
+    rows = [
+        "# Team Memory Catalog", "", "Generated from `knowledge/team-memory`; candidates are not default facts.", "",
+        "| ID | Layer | Status | Kind | Origin |", "|---|---|---|---|---|",
+    ]
+    entries: list[tuple[str, str, str, str, str]] = []
+    for path in sorted((root / TEAM_DIR).rglob("*.md")):
+        if path.name in {"README.md", "CATALOG.md"}:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        fields = {}
+        for key in ("id", "layer", "status", "kind"):
+            match = re.search(rf"^{key}:\s*(.+)$", text, re.MULTILINE)
+            fields[key] = match.group(1).strip().strip('"') if match else ""
+        origin = re.search(r"^\s*agent_id:\s*(.+)$", text, re.MULTILINE)
+        entries.append((fields["id"], fields["layer"], fields["status"], fields["kind"], origin.group(1).strip().strip('"') if origin else ""))
+    for row in entries:
+        rows.append("| " + " | ".join(f"`{item}`" if index == 0 else item for index, item in enumerate(row)) + " |")
+    return "\n".join(rows) + "\n"
+
+
+def _write_if_changed(path: Path, content: str) -> bool:
+    if path.is_file() and path.read_text(encoding="utf-8") == content:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))[1])
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return True
+
+
+def export_team_memory(repository: str | None = None, *, agent_id: str | None = None) -> dict[str, Any]:
+    root = configured_team_repository(repository)
+    if root is None:
+        return {"ok": False, "status": "not_configured", "reason": "team repository is not configured", "canonical_repo_changed": False}
+    existing = _existing_by_id(root)
+    created = skipped = conflicts = moved = 0
+    files: list[str] = []
+    bundle = team_memory_store().export_bundle()
+    for record in bundle.get("records", []):
+        if not isinstance(record, dict):
+            continue
+        provenance = _provenance(record)
+        origin = str(record.get("author_agent") or provenance.get("agent_id") or provenance.get("agent") or "unknown")
+        if agent_id and origin != agent_id:
+            continue
+        layer = _layer(record)
+        status = str(record.get("status") or "candidate")
+        central_id = _central_id(str(record.get("id") or ""), layer)
+        content = _markdown(record, central_id=central_id, layer=layer, status=status, agent=origin)
+        target = _status_path(root, record)
+        prior = existing.get(central_id)
+        if prior and prior != target:
+            prior_content = prior.read_text(encoding="utf-8")
+            if prior_content == content:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if not target.exists() and "inbox" in prior.parts:
+                    prior.replace(target)
+                    moved += 1
+                    files.append(str(target.relative_to(root)))
+                else:
+                    skipped += 1
+                continue
+            # A lifecycle transition is a move, not a second memory.  Only
+            # move files that are already inside this repository's inbox; an
+            # unrelated existing file is preserved and reported as a conflict.
+            if "inbox" in prior.parts and not target.exists():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                prior.replace(target)
+                _write_if_changed(target, content)
+                moved += 1
+                files.append(str(target.relative_to(root)))
+                continue
+            conflict = root / TEAM_DIR / "conflicts" / f"{central_id}-{hashlib.sha256(content.encode()).hexdigest()[:10]}.md"
+            if _write_if_changed(conflict, content):
+                conflicts += 1
+                files.append(str(conflict.relative_to(root)))
+            continue
+        if _write_if_changed(target, content):
+            created += 1
+            files.append(str(target.relative_to(root)))
+        else:
+            skipped += 1
+    catalog = root / TEAM_DIR / "CATALOG.md"
+    catalog_changed = _write_if_changed(catalog, _catalog(root))
+    changed = bool(created or moved or conflicts or catalog_changed)
+    return {
+        "ok": True,
+        "status": "synced",
+        "repository_root": str(root),
+        "created": created,
+        "skipped": skipped,
+        "moved": moved,
+        "conflicts": conflicts,
+        "catalog_changed": catalog_changed,
+        "files": files,
+        "push_required": changed,
+        "canonical_repo_changed": changed,
+        "note": "Files were written locally; no git commit or push was performed.",
+    }
+
+
+def _frontmatter(text: str) -> tuple[dict[str, str], str]:
+    if not text.startswith("---"):
+        return {}, text
+    parts = text.split("---", 2)
+    if len(parts) != 3:
+        return {}, text
+    fields: dict[str, str] = {}
+    for line in parts[1].splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        normalized = key.strip()
+        # Keep the small provenance fields needed for hydration.  Other
+        # nested YAML remains human-readable in the canonical file and is not
+        # interpreted as executable configuration.
+        if normalized in {"id", "layer", "status", "kind", "confidence", "valid_until", "accepted_at", "agent_id", "source_memory_id", "observed_at"}:
+            fields[normalized] = value.strip().strip('"')
+    return fields, parts[2].strip()
+
+
+def import_team_memory(repository: str | None = None, *, include_candidates: bool = True) -> dict[str, Any]:
+    root = configured_team_repository(repository)
+    if root is None:
+        return {"ok": False, "status": "not_configured", "reason": "team repository is not configured", "canonical_repo_changed": False}
+    paths: list[Path] = []
+    base = root / TEAM_DIR
+    for relative in ("l1/active", "l1/stale", "l2/accepted", "l3/accepted"):
+        paths.extend((base / relative).glob("*.md"))
+    if include_candidates:
+        paths.extend((base / "inbox").glob("*/*.md"))
+        paths.extend((base / "l1/candidate").glob("*.md"))
+        paths.extend((base / "l2/candidate").glob("*.md"))
+        paths.extend((base / "l3/candidate").glob("*.md"))
+    imported = skipped = 0
+    store = team_memory_store()
+    for path in sorted(paths):
+        fields, body = _frontmatter(path.read_text(encoding="utf-8"))
+        central_id = fields.get("id")
+        if not central_id:
+            continue
+        status = fields.get("status", "candidate")
+        if status == "accepted":
+            local_status = "active"
+        elif status in {"active", "candidate", "stale", "superseded"}:
+            local_status = status
+        else:
+            continue
+        title_match = re.search(r"^#\s+(.+)$", body, re.MULTILINE)
+        title = title_match.group(1).strip() if title_match else central_id
+        source_memory_id = fields.get("source_memory_id") or f"team:central:{central_id}"
+        payload = {
+            "id": source_memory_id if source_memory_id.startswith("team:") else f"team:{source_memory_id}",
+            "type": fields.get("kind", "discovery"),
+            "title": title,
+            "content": body[:12000],
+            "summary": body[:400],
+            "status": local_status,
+            "confidence": float(fields.get("confidence") or 0.5),
+            "scope": {"team_repository": str(root)},
+            "provenance": {"source": "team-knowledge-data", "canonical_path": str(path.relative_to(root)), "layer": fields.get("layer", "L1"), "agent_id": fields.get("agent_id"), "central_id": central_id},
+            "idempotency_key": f"central:{central_id}",
+        }
+        try:
+            result = store.publish(payload, default_status=local_status if local_status in {"candidate", "active"} else "candidate")
+        except (OSError, RuntimeError, TypeError, ValueError):
+            continue
+        if result.get("duplicate"):
+            skipped += 1
+        else:
+            imported += 1
+    return {"ok": True, "status": "hydrated", "repository_root": str(root), "imported": imported, "skipped": skipped, "canonical_repo_changed": False}
+
+
+def sync_team_memory(repository: str | None = None, *, agent_id: str | None = None, pull: bool = True) -> dict[str, Any]:
+    exported = export_team_memory(repository, agent_id=agent_id)
+    if not exported.get("ok"):
+        return exported
+    imported = import_team_memory(repository, include_candidates=True) if pull else {"ok": True, "status": "skipped", "imported": 0, "skipped": 0}
+    return {**exported, "pull": imported, "status": "synced", "canonical_repo_changed": bool(exported.get("canonical_repo_changed"))}
+
+
+def team_repository_health(repository: str | None = None) -> dict[str, Any]:
+    root = configured_team_repository(repository)
+    if root is None:
+        return {"configured": False, "reachable": False, "status": "not_configured", "canonical_repo_changed": False}
+    files = list((root / TEAM_DIR).rglob("*.md"))
+    return {
+        "configured": True,
+        "reachable": True,
+        "status": "ready",
+        "repository_root": str(root),
+        "file_count": len(files),
+        "auto_sync": auto_sync_enabled(),
+        "canonical_repo_changed": False,
+    }

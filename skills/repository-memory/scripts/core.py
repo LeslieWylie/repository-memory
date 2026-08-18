@@ -67,6 +67,13 @@ from semantic_repository import configure as configure_semantic
 from semantic_repository import model_status as semantic_model_status
 from semantic_repository import summary as semantic_summary
 from team_memory import team_memory_store
+from team_repository import (
+    configure_team_repository,
+    export_team_memory as export_team_repository,
+    import_team_memory as import_team_repository,
+    sync_team_memory,
+    team_repository_health,
+)
 from vendor_components import report as vendor_components_report
 
 from models import SourceSpec, SourceView
@@ -1190,6 +1197,20 @@ def capture_turn(root: Path | None, payload: Any, source_id: str | None = None) 
         except (OSError, RuntimeError, TypeError, ValueError) as exc:
             team_candidate = {"created": False, "status": "error", "reason": str(exc)[:240]}
 
+    # The local candidate is useful only if the team can review it.  When the
+    # user explicitly enables a canonical team repository, mirror the
+    # candidate into its inbox and hydrate accepted records back into this
+    # runtime.  This is still a candidate-only write: no commit, push, or
+    # lifecycle promotion happens here.
+    team_sync: dict[str, Any] = {"status": "not_configured", "created": False}
+    try:
+        from team_repository import auto_sync_enabled
+
+        if auto_sync_enabled():
+            team_sync = sync_team_memory(agent_id=turn.get("agent_id"), pull=True)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        team_sync = {"status": "error", "created": False, "reason": str(exc)[:240]}
+
     result = {
         "schema_version": SCHEMA_VERSION,
         "ok": bool(l0_result.get("ok")) and l0["l0_verified"],
@@ -1201,6 +1222,7 @@ def capture_turn(root: Path | None, payload: Any, source_id: str | None = None) 
         "l1": l1,
         "l2": candidate,
         "team_memory": team_candidate,
+        "team_repository": team_sync,
         "l3": {"written": False, "status": "explicit_promotion_only"},
         "memory": native.health(refresh=True, probe_layers=True) if native.configured else l0_result.get("memory"),
         "canonical_repo_changed": False,
@@ -1685,7 +1707,7 @@ def doctor(root: Path | None = None, source_id: str | None = None, *, local: boo
     healthy = all(report.get("healthy", True) for report in reports)
     routing = _openclaw_routing()
     active_values = unique_values(active)
-    return {"schema_version": SCHEMA_VERSION, "ok": healthy, "status": "ready" if healthy else "degraded", "active_adapter": active_values[0] if len(active_values) == 1 else active_values, "capabilities": capabilities, "memory": memory[0] if len(memory) == 1 else memory, "team_memory": team_memory_store().health(), "repository": {"status": "ready" if reports else "not_configured", "source_count": len(reports)}, "knowledge_service": {"required": False, **KnowledgeClient().health()}, "semantic": semantic[0] if len(semantic) == 1 else ({"available": False, "strategy": "keyword-only"} if native_ready else semantic), "routing": routing, "agents": routing.get("agents", {"configured": [], "covered": []}), "sources": reports, "config": config_summary(), "upstream_components": vendor_components_report(), "actions": actions}
+    return {"schema_version": SCHEMA_VERSION, "ok": healthy, "status": "ready" if healthy else "degraded", "active_adapter": active_values[0] if len(active_values) == 1 else active_values, "capabilities": capabilities, "memory": memory[0] if len(memory) == 1 else memory, "team_memory": team_memory_store().health(), "team_repository": team_repository_health(), "repository": {"status": "ready" if reports else "not_configured", "source_count": len(reports)}, "knowledge_service": {"required": False, **KnowledgeClient().health()}, "semantic": semantic[0] if len(semantic) == 1 else ({"available": False, "strategy": "keyword-only"} if native_ready else semantic), "routing": routing, "agents": routing.get("agents", {"configured": [], "covered": []}), "sources": reports, "config": config_summary(), "upstream_components": vendor_components_report(), "actions": actions}
 
 
 def feedback(root: Path | None, result_id: str, note: str, rating: str | None = None, feedback_id: str | None = None) -> dict[str, Any]:
@@ -1791,6 +1813,14 @@ def import_team_memory(input_path: str) -> dict[str, Any]:
     result = team_memory_store().import_bundle(bundle)
     result.update({"operation": "team-memory-import", "path": str(source)})
     return result
+
+
+def configure_team_repo(repository: str, *, auto_sync: bool = True, agent_id: str | None = None) -> dict[str, Any]:
+    return {"schema_version": SCHEMA_VERSION, **configure_team_repository(repository, auto_sync=auto_sync, agent_id=agent_id)}
+
+
+def sync_team_repo(repository: str | None = None, *, agent_id: str | None = None, pull: bool = True) -> dict[str, Any]:
+    return {"schema_version": SCHEMA_VERSION, **sync_team_memory(repository, agent_id=agent_id, pull=pull)}
 
 
 def supersede_memory(memory_id: str, input_path: str) -> dict[str, Any]:
@@ -1899,6 +1929,9 @@ def build_parser() -> argparse.ArgumentParser:
     activate_parser = common("team-activate"); activate_parser.add_argument("--id", required=True); activate_parser.add_argument("--reviewer"); activate_parser.add_argument("--json", action="store_true")
     export_parser = common("team-export"); export_parser.add_argument("--output", required=True); export_parser.add_argument("--json", action="store_true")
     import_parser = common("team-import"); import_parser.add_argument("--input", required=True); import_parser.add_argument("--json", action="store_true")
+    team_config_parser = common("team-configure"); team_config_parser.add_argument("--repository", required=True); team_config_parser.add_argument("--agent-id"); team_config_parser.add_argument("--no-auto-sync", action="store_true"); team_config_parser.add_argument("--json", action="store_true")
+    team_sync_parser = common("team-sync"); team_sync_parser.add_argument("--repository"); team_sync_parser.add_argument("--agent-id"); team_sync_parser.add_argument("--no-pull", action="store_true"); team_sync_parser.add_argument("--json", action="store_true")
+    team_status_parser = common("team-status"); team_status_parser.add_argument("--repository"); team_status_parser.add_argument("--json", action="store_true")
     context_parser = common("context"); context_parser.add_argument("query"); context_parser.add_argument("--limit", type=int, default=5); context_parser.add_argument("--repo"); context_parser.add_argument("--issue"); context_parser.add_argument("--branch"); context_parser.add_argument("--agent"); context_parser.add_argument("--local", action="store_true"); context_parser.add_argument("--json", action="store_true")
     supersede_parser = common("supersede"); supersede_parser.add_argument("--id", required=True); supersede_parser.add_argument("--input", required=True); supersede_parser.add_argument("--json", action="store_true")
     timeline_parser = common("memory-timeline"); timeline_parser.add_argument("--session-id"); timeline_parser.add_argument("--limit", type=int, default=50); timeline_parser.add_argument("--json", action="store_true")
@@ -2083,7 +2116,7 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
                 return _mcp_dispatch(name, arguments)
             return serve(dispatch)
         gate_failed = False
-        root = None if args.command in {"init", "source", "doctor", "sync", "search", "get", "explain", "feedback", "promote", "publish", "team-activate", "team-export", "team-import", "team-evaluate", "team-compact", "supervise", "benchmark", "context", "supersede", "memory-timeline", "memory-observe", "memory-reflect", "memory-retain", "ingest-session", "capture-turn", "knowledge", "memmy", "memos", "gui", "semantic", "memory", "memorycore"} else resolve_root(root_arg)
+        root = None if args.command in {"init", "source", "doctor", "sync", "search", "get", "explain", "feedback", "promote", "publish", "team-activate", "team-export", "team-import", "team-configure", "team-sync", "team-status", "team-evaluate", "team-compact", "supervise", "benchmark", "context", "supersede", "memory-timeline", "memory-observe", "memory-reflect", "memory-retain", "ingest-session", "capture-turn", "knowledge", "memmy", "memos", "gui", "semantic", "memory", "memorycore"} else resolve_root(root_arg)
         if args.command in {"init", "source"} and root_arg:
             root = resolve_root(root_arg)
         if args.command == "doctor":
@@ -2108,6 +2141,12 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
             value = export_team_memory(args.output)
         elif args.command == "team-import":
             value = import_team_memory(args.input)
+        elif args.command == "team-configure":
+            value = configure_team_repo(args.repository, auto_sync=not bool(args.no_auto_sync), agent_id=args.agent_id)
+        elif args.command == "team-sync":
+            value = sync_team_repo(args.repository, agent_id=args.agent_id, pull=not bool(args.no_pull))
+        elif args.command == "team-status":
+            value = {"schema_version": SCHEMA_VERSION, "team_memory": team_memory_store().health(), "team_repository": team_repository_health(args.repository), "canonical_repo_changed": False}
         elif args.command == "team-evaluate":
             from team_memory_eval import evaluate_team_memory
 

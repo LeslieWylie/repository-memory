@@ -115,6 +115,14 @@ when no user-configured supervisor command is available. Only explicit
 `--apply`, with a valid model decision and read-back, changes user-level L2 or
 Team Memory state. L3 still requires an explicit promotion operation.
 
+For multi-agent reuse, a host may configure a user-owned Git Team Memory
+repository. L0 remains local; an enabled post-turn capture exports only a
+sanitized L1 candidate to `knowledge/team-memory/inbox/<agent>/`, and
+`team-sync` hydrates reviewed active/accepted records back into the local
+runtime. Team sync is an explicit configured write: it never commits or pushes
+and it never promotes a candidate. Keep repository evidence, team memory, and
+local memory labelled as separate result groups.
+
 For reproducible measurements, run `benchmark --suite public` or provide a
 user-owned external benchmark manifest. The runtime does not download or
 silently reshape third-party datasets, and it does not claim leaderboard
@@ -138,3 +146,4 @@ Read the references only when needed:
 - `references/write-policy.md` — explicit writes and promotion;
 - `references/automatic-capture.md` — optional host lifecycle capture;
 - `references/team-memory.md` — shared decisions and handoffs.
+- `docs/team-memory-git-sync.md` — Git-backed multi-agent sync and review flow.

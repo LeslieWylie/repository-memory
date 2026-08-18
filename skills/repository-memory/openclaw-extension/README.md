@@ -58,6 +58,33 @@ expose a write MCP tool to the model. Configure `agentIds` when only selected
 agents should capture turns. Set `nativeTools: false` only for hosts without
 native tool registration; the namespaced stdio MCP remains available.
 
+## Shared team-memory sync
+
+Local capture is private by default. To make reusable L1 candidates visible to
+the team without publishing raw conversations, configure a user-owned Git
+Team Memory repository:
+
+```bash
+repository-memory team-configure \
+  --repository /path/to/team-knowledge-data \
+  --agent-id <agent-id> --json
+repository-memory team-sync --json
+```
+
+With `auto_sync=true`, the `agent_end` hook performs the same bounded sync
+after it writes and reads back L0/L1: candidates go to
+`knowledge/team-memory/inbox/<agent>/`, while active/accepted records are
+hydrated into the local Team Memory index. The hook never commits, pushes, or
+promotes a candidate. A reviewer can then run the configured supervisor and
+explicitly activate/promote records. Other agents run `team-sync` (or their
+configured hook) to pull the accepted shared plane.
+
+This is intentionally a Git-backed Hub/Client boundary inspired by MemOS
+Team Sharing: local L0 remains private, the shared inbox is reviewable, and
+the central repository remains the recoverable source of truth. The runtime
+does not start a network Hub and does not mix team-memory scores with Git
+evidence scores.
+
 ## Verify the OpenClaw path
 
 After installation, inspect the plugin and MCP registration, then run one

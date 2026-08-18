@@ -75,6 +75,24 @@ memory search to avoid duplicate recall, and preserves the repository-memory
 MCP. It never places an embedding key, provider URL, or absolute checkout path
 in the Skill. See [docs/memos-local-integration.md](docs/memos-local-integration.md).
 
+### Shared Team Memory
+
+For multi-agent reuse, configure a Git-backed team-memory repository. The
+OpenClaw post-turn hook then exports only bounded L1 candidates to the
+repository inbox and hydrates reviewed records back into the local runtime:
+
+```bash
+repository-memory team-configure \
+  --repository /path/to/team-knowledge-data \
+  --agent-id <agent-id> --json
+repository-memory team-sync --json
+repository-memory team-status --json
+```
+
+L0 stays local; candidate L1 goes to `knowledge/team-memory/inbox/`; active
+L1 and accepted L2/L3 are shared after review. Sync is idempotent and never
+commits or pushes. See [docs/team-memory-git-sync.md](docs/team-memory-git-sync.md).
+
 ## What happens on one question?
 
 ```mermaid
