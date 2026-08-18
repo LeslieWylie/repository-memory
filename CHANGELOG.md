@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.15
+
+- Protect existing canonical Team Memory Markdown during automatic hydration
+  and sync; local projections can no longer overwrite reviewed provenance,
+  citations, or lifecycle metadata.
+- Align the OpenClaw extension and AML submission documentation with the
+  packaged runtime version.
+
 ## 0.7.14
 
 - Add an explicit `default_source` routing boundary for multi-repository
