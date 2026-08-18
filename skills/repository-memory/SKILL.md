@@ -36,6 +36,9 @@ Before the first query, or after the environment changes:
    mode, and memory-layer population. `ready` means usable, not populated.
 3. If the source is missing or stale, call `memory_sync`, then run doctor
    again. Do not claim a stale or dirty checkout is fresh.
+   Do not set `local=true` merely because the worktree is dirty. The default
+   is the clean remote snapshot; use local mode only when the user explicitly
+   asks for an offline/local-worktree inspection.
 4. For a new installation, run one real positive query and one fabricated
    negative query before reporting the setup as working.
 
@@ -49,6 +52,10 @@ For ordinary project questions, preserve the user's wording and call:
 ```text
 memory_search(query=<user's original question>, scope="repository")
 ```
+
+Do not add `local=true` to this call unless the user explicitly requested the
+local checkout. A dirty local worktree is not an acceptable default source for
+project facts.
 
 Do not manually turn a natural-language question into a filename. The runtime
 handles conservative lexical, structural, date, and local semantic routing.

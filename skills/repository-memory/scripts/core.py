@@ -60,7 +60,7 @@ from memorycore import (
     native_memory_client,
 )
 from knowledge import KnowledgeClient
-from snapshot import prepare_view
+from snapshot import local_view, prepare_view
 from semantic_repository import ensure as ensure_semantic_index
 from semantic_repository import status as semantic_index_status
 from semantic_repository import configure as configure_semantic
@@ -1484,8 +1484,17 @@ def get_result(
         view = prepare_view(spec, local=False)
         adapter = discover_adapter(view)
         if expected_commit and view.commit != expected_commit:
-            errors.append({"source": spec.id, "adapter": adapter.name, "error": "source commit changed since search", "expected_commit": expected_commit, "current_commit": view.commit, "freshness": view.freshness})
-            continue
+            # Search may have been explicitly requested against a local
+            # checkout.  Reuse that exact revision for get/explain so the
+            # two-step protocol is consistent; dirty local evidence remains
+            # stale and cannot become verified.
+            local_candidate = local_view(spec)
+            if local_candidate.commit == expected_commit:
+                view = local_candidate
+                adapter = discover_adapter(view)
+            else:
+                errors.append({"source": spec.id, "adapter": adapter.name, "error": "source commit changed since search", "expected_commit": expected_commit, "current_commit": view.commit, "freshness": view.freshness})
+                continue
         canonical_prefix = f"{spec.id}:"
         if result_id.startswith(canonical_prefix):
             relative = normalize_path(result_id.removeprefix(canonical_prefix))
