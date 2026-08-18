@@ -233,10 +233,17 @@ def discover_sources(explicit_root: str | None = None, source_id: str | None = N
         if fallback is None:
             raise RuntimeError("no knowledge source configured; run init --path <directory> or source add --path <directory>")
         sources.append(_source_from_item({"id": os.environ.get(SOURCE_ID_ENV) or fallback.name, "root": str(fallback)}, fallback))
-    if source_id:
-        sources = [source for source in sources if source.id == source_id]
+    # Multiple sources are supported, but an unspecified query must not search
+    # all of them and silently mix unrelated corpora.  A configured default is
+    # the stable routing boundary for CLI, MCP, and host plugins; explicit
+    # ``--source``/``--root`` still wins for multi-repository workflows.
+    preferred = source_id
+    if preferred is None and explicit_root is None and not os.environ.get(ROOT_ENV):
+        preferred = str(config.get("default_source") or os.environ.get(SOURCE_ID_ENV) or "") or None
+    if preferred:
+        sources = [source for source in sources if source.id == preferred]
         if not sources:
-            raise RuntimeError(f"source not found: {source_id}")
+            raise RuntimeError(f"source not found: {preferred}")
     return sources
 
 
@@ -406,4 +413,11 @@ def fingerprint(spec: SourceSpec) -> str:
 
 
 def config_summary() -> dict[str, Any]:
-    return {"path": str(config_path()), "exists": config_path().exists(), "data_root": str(data_root()), "cache_root": str(cache_root())}
+    config = read_config()
+    return {
+        "path": str(config_path()),
+        "exists": config_path().exists(),
+        "data_root": str(data_root()),
+        "cache_root": str(cache_root()),
+        "default_source": str(config.get("default_source") or os.environ.get(SOURCE_ID_ENV) or "") or None,
+    }

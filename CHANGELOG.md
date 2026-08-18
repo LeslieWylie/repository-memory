@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.14
+
+- Add an explicit `default_source` routing boundary for multi-repository
+  configurations. Unqualified CLI, MCP, and plugin queries now use the
+  configured source instead of silently mixing every registered repository;
+  explicit `--source` and `--root` continue to support multi-repository work.
+- Surface the selected default source in `source list` and doctor config
+  diagnostics.
+
 ## 0.7.13
 
 - Add explicit read-only `observe` and candidate-labelled `reflect` operations

@@ -136,7 +136,7 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(value["document_count"], len(value["documents"]))
         self.assertGreaterEqual(value["text_bytes"], 0)
         self.assertGreater(value["index_bytes"], 0)
-        self.assertEqual(VERSION, "0.7.13")
+        self.assertEqual(VERSION, "0.7.14")
 
     def test_multisource_search_has_verified_and_candidates(self):
         result = core.search(None, "Atlas evidence", limit=5)
@@ -154,6 +154,19 @@ class RepositoryMemoryTest(unittest.TestCase):
     def test_multisource_search_routes_explicit_anchor_to_matching_source(self):
         result = core.search(None, "alpha", limit=5)
         self.assertEqual(result["verified"][0]["source"], "alpha")
+
+    def test_configured_default_source_prevents_silent_cross_repository_mix(self):
+        self.write_config({
+            "default_source": "beta",
+            "sources": [
+                {"id": "alpha", "root": str(self.alpha), "adapter": str(self.adapter)},
+                {"id": "beta", "root": str(self.beta), "adapter": str(self.adapter)},
+            ],
+        })
+        result = core.search(None, "Atlas evidence", limit=5)
+        self.assertEqual({item["source"] for item in result["verified"]}, {"beta"})
+        explicit = core.search(None, "Atlas evidence", source_id="alpha", limit=5)
+        self.assertEqual({item["source"] for item in explicit["verified"]}, {"alpha"})
 
     def test_negative_and_local_structured_backend_are_conservative(self):
         negative = core.search(None, "fictional benchmark ZZZQWE")
