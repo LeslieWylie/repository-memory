@@ -115,6 +115,14 @@ def _central_id(memory_id: str, layer: str = "L1") -> str:
     return f"team_{layer.lower()}_{digest}"
 
 
+def _record_central_id(record: dict[str, Any], layer: str | None = None) -> str:
+    provenance = _provenance(record)
+    central_id = str(provenance.get("central_id") or "")
+    if re.fullmatch(r"team_l[123]_[a-f0-9]{24}", central_id):
+        return central_id
+    return _central_id(str(record.get("id") or ""), layer or _layer(record))
+
+
 def _yaml(value: Any) -> str:
     if value in (None, ""):
         return "null"
@@ -146,7 +154,7 @@ def _status_path(root: Path, record: dict[str, Any]) -> Path:
     status = str(record.get("status") or "candidate").lower()
     provenance = _provenance(record)
     agent = _safe(str(record.get("author_agent") or provenance.get("agent_id") or provenance.get("agent") or "unknown"))
-    central_id = _central_id(str(record.get("id") or ""), layer)
+    central_id = _record_central_id(record, layer)
     if layer == "L1":
         if status == "candidate":
             return root / TEAM_DIR / "inbox" / agent / f"{central_id}.md"
@@ -287,7 +295,7 @@ def export_team_memory(repository: str | None = None, *, agent_id: str | None = 
     for candidate in bundle.get("records", []):
         if not isinstance(candidate, dict):
             continue
-        candidate_id = _central_id(str(candidate.get("id") or ""), _layer(candidate))
+        candidate_id = _record_central_id(candidate, _layer(candidate))
         current = records_by_central_id.get(candidate_id)
         if current is None or "central_id" in _provenance(current):
             records_by_central_id[candidate_id] = candidate
@@ -300,7 +308,7 @@ def export_team_memory(repository: str | None = None, *, agent_id: str | None = 
             continue
         layer = _layer(record)
         status = str(record.get("status") or "candidate")
-        central_id = _central_id(str(record.get("id") or ""), layer)
+        central_id = _record_central_id(record, layer)
         content = _markdown(record, central_id=central_id, layer=layer, status=status, agent=origin)
         target = _status_path(root, record)
         prior = existing.get(central_id)
