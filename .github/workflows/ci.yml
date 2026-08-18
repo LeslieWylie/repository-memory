@@ -16,8 +16,26 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # `requires-python = ">=3.10"` is a promise pip enforces at install
+        # time, so both ends of it have to be exercised somewhere. The previous
+        # matrix ran 3.10/3.12/3.13 everywhere and tested neither 3.11 nor 3.14
+        # on any runner — the newest supported interpreter, the one most new
+        # users are on, was covered by nothing but the claim itself.
+        #
+        # Both boundary versions now run on every OS, and the interpreters in
+        # between run on Linux. Same nine jobs as before: OS-specific breakage
+        # here is path and process handling, which tracks the runner far more
+        # than the minor version, and the boundaries are where a version-driven
+        # break actually shows up.
         os: [ubuntu-latest, macos-latest, windows-latest]
-        python: ["3.10", "3.12", "3.13"]
+        python: ["3.10", "3.14"]
+        include:
+          - os: ubuntu-latest
+            python: "3.11"
+          - os: ubuntu-latest
+            python: "3.12"
+          - os: ubuntu-latest
+            python: "3.13"
     env:
       # A public checkout must never inherit a developer's private adapter.
       REPOSITORY_MEMORY_DISABLE_ADAPTER: "1"

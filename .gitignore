@@ -14,6 +14,9 @@ tmp/
 dist/
 build/
 .cache/
+.coverage
+.coverage.*
+htmlcov/
 .local/
 audit.jsonl
 *.audit.jsonl
