@@ -67,6 +67,36 @@ class DeliveryContractTest(unittest.TestCase):
         self.assertEqual(applied["accepted"], 1)
         self.assertEqual(team_memory_store().get(candidate["id"])["result"]["status"], "active")
 
+    def test_supervisor_accepts_memory_lineage_and_holds_untraceable(self) -> None:
+        # Auto-captured team candidates carry a memory lineage, not a Git
+        # citation.  Traceability is what the provenance gate is for, so the
+        # lineage must be reviewable -- and a record with neither a citation
+        # nor a lineage must hold even when the model says accept.
+        store = team_memory_store()
+        lineage = store.publish({
+            "type": "discovery",
+            "title": "A reusable discovery captured from a turn",
+            "content": "A concrete discovery another agent can act on, extracted from a bounded turn.",
+            "provenance": {"agent_id": "yaole", "source_memory_id": "l1-0001", "observed_at": "2026-08-19T00:00:00+00:00", "run_id": "run-1"},
+            "confidence": 0.8,
+        })["memory"]
+        untraceable = store.publish({
+            "type": "discovery",
+            "title": "A record that cannot say where it came from",
+            "content": "Plausible text with no citation and no memory lineage behind it.",
+            "provenance": {"agent_id": "yaole"},
+            "confidence": 0.8,
+        })["memory"]
+        command = [sys.executable, "-c", "import json,sys; json.load(sys.stdin); print(json.dumps({'decision':'accept','confidence':0.95,'model':'fixture-supervisor'}))"]
+        applied = supervise(lane="team", apply=True, reviewer="reviewer", command=command)
+        by_id = {receipt["id"]: receipt for receipt in applied["receipts"]}
+        self.assertEqual(by_id[lineage["id"]]["decision"], "accept")
+        self.assertEqual(by_id[lineage["id"]]["checks"]["provenance_kind"], "memory-lineage")
+        self.assertEqual(store.get(lineage["id"])["result"]["status"], "active")
+        self.assertEqual(by_id[untraceable["id"]]["decision"], "hold")
+        self.assertEqual(by_id[untraceable["id"]]["checks"]["provenance_kind"], "none")
+        self.assertEqual(store.get(untraceable["id"])["result"]["status"], "candidate")
+
     def test_public_benchmark_uses_supplied_qrels(self) -> None:
         queries = Path(__file__).resolve().parents[3] / "eval" / "public" / "queries.jsonl"
         qrels = Path(__file__).resolve().parents[3] / "eval" / "public" / "qrels.jsonl"

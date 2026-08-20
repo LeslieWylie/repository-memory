@@ -16,6 +16,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -2384,6 +2385,17 @@ def _mcp_dispatch(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 def main(argv: list[str] | None = None, forced_command: str | None = None) -> int:
+    # Every command answers in JSON that may carry CJK content, and on Windows
+    # a piped stdout defaults to a legacy code page.  The final ``print`` then
+    # raises UnicodeEncodeError -- a ValueError, so the generic handler below
+    # swallowed it into a silent exit 2: the team gate "failed" on Windows CI
+    # with an empty stderr while the same evaluation passed in-process.  The
+    # answer's encoding must not depend on the console it happens to cross.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except (AttributeError, OSError, ValueError):
+            pass
     args = build_parser().parse_args(argv)
     if forced_command:
         args.command = forced_command

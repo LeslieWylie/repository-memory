@@ -119,6 +119,28 @@
   server for Claude Code and Codex, the native tools for OpenClaw, the stdio
   MCP or the bundled CLI for anything else — because a host deciding *whether*
   to call the tool never read the references where those facts lived.
+- Let the supervisor's provenance gate accept a memory lineage, not only a Git
+  citation. Team records are experience provenance by contract, and the
+  auto-capture path writes `source_memory_id`/`observed_at`/`run_id` rather
+  than citations — so the citations-only hard check held every captured
+  candidate forever regardless of the model's verdict; measured on the live
+  store, 284 of 289 records were unactivatable by construction. The gate now
+  checks what it was always for — that the record can say where it came from —
+  and reports `provenance_kind` (`citation`, `memory-lineage`, `none`) in the
+  receipt. A record with neither still holds even when the model says accept,
+  and nothing else about review changes: secret and content checks, mandatory
+  model review, the confidence floor, and explicit `--apply` all remain.
+- Force UTF-8 on the CLI's stdout/stderr. On Windows a piped stdout defaults to
+  a legacy code page, so printing a JSON answer that carries CJK content raised
+  UnicodeEncodeError — which is a ValueError, so the generic error handler
+  swallowed it into a silent exit 2. Windows CI reported the team gate as
+  failed with an empty stderr while the identical evaluation passed in-process;
+  with Chinese now in the team evaluation set, every such command on Windows
+  was affected.
+- Close the descriptor `mkstemp` returns before renaming the exported Team
+  Memory file over its destination. The leaked open handle made `os.replace`
+  fail on Windows with WinError 32, so `team-export` there died on its first
+  record — on every platform it also leaked one descriptor per exported file.
 
 ## 0.7.15
 

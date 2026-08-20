@@ -62,10 +62,19 @@ def _checks(item: dict[str, Any]) -> dict[str, Any]:
     content = "\n".join(str(item.get(key) or "") for key in ("title", "summary", "content"))
     provenance = item.get("provenance") if isinstance(item.get("provenance"), dict) else {}
     citations = provenance.get("citations") or provenance.get("commits")
+    # Team records are experience provenance, never Git citations, so a
+    # citations-only gate held every auto-captured candidate forever no matter
+    # what the reviewer said -- measured on the live store, 284 of 289 records
+    # were unactivatable by construction.  What the gate is really for is
+    # traceability: the record must say where it came from.  A memory lineage
+    # (which source memory, observed when) satisfies that; memory_timeline can
+    # walk it.  A record with neither a citation nor a lineage still holds.
+    lineage = bool(provenance.get("source_memory_id") and (provenance.get("observed_at") or provenance.get("run_id")))
     return {
         "secret_free": not bool(SECRET_CONTENT.search(content)),
         "content_present": len(str(item.get("content") or "").strip()) >= 20,
-        "provenance_present": bool(citations),
+        "provenance_present": bool(citations) or lineage,
+        "provenance_kind": "citation" if citations else ("memory-lineage" if lineage else "none"),
         "status_candidate": str(item.get("status") or "") == "candidate",
         "confidence": float(item.get("confidence") or 0.0),
     }

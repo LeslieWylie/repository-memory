@@ -271,13 +271,18 @@ def _write_if_changed(path: Path, content: str) -> bool:
     if path.is_file() and path.read_text(encoding="utf-8") == content:
         return False
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = Path(tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))[1])
+    # ``mkstemp`` returns an *open* descriptor.  Taking only the name leaked
+    # that descriptor, and on Windows an open handle makes ``os.replace`` fail
+    # with WinError 32 -- every export there died on its first record.  Write
+    # through the descriptor and close it before the rename.
+    handle_fd, temporary_name = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
+    temporary = Path(temporary_name)
     try:
-        temporary.write_text(content, encoding="utf-8")
+        with os.fdopen(handle_fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(content)
         os.replace(temporary, path)
     finally:
-        if temporary.exists():
-            temporary.unlink()
+        temporary.unlink(missing_ok=True)
     return True
 
 
