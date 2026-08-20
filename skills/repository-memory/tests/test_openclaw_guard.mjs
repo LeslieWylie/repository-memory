@@ -589,33 +589,40 @@ assert.match(noReceiptWarned[0].reason, /receipt/);
 // exactly why this went unnoticed: in the live replay the audit recorded
 // `outcome: "injected"` alongside `answerable: 0`, and the finalize guard was
 // told recall had found nothing.  Pin the shape the hook actually receives.
-const planeRuntime = join(auditDir, "fake-repository-memory-plane");
-const PLANE_PAYLOAD = JSON.stringify({
-  groups: null,
-  verified: [{ id: "local:L1:a", status: "verified" }],
-  answerable: [
-    { id: "local:L1:a", memory_layer: "L1", status: "verified", content: "octo-daemon 升级到 0.5.0，commit fcec9177", citation: { valid: true } },
-    { id: "local:L1:b", memory_layer: "L1", status: "verified", content: "验证方式是跑真实 issue/autopilot", citation: { valid: true } },
-  ],
-});
-await writeFile(planeRuntime, `#!/bin/sh\nprintf '%s' '${PLANE_PAYLOAD}'\n`, { encoding: "utf8" });
-await chmod(planeRuntime, 0o700);
+//
+// POSIX-only, like the other fixtures that exercise the real spawn(): Windows
+// has no shebang dispatch and spawn() without shell refuses .cmd files, so a
+// script fixture cannot run there.  Both POSIX CI legs execute this; Windows
+// covers the payload-shape guards through the non-spawn fixtures above.
+if (process.platform !== "win32") {
+  const planeRuntime = join(auditDir, "fake-repository-memory-plane");
+  const PLANE_PAYLOAD = JSON.stringify({
+    groups: null,
+    verified: [{ id: "local:L1:a", status: "verified" }],
+    answerable: [
+      { id: "local:L1:a", memory_layer: "L1", status: "verified", content: "octo-daemon 升级到 0.5.0，commit fcec9177", citation: { valid: true } },
+      { id: "local:L1:b", memory_layer: "L1", status: "verified", content: "验证方式是跑真实 issue/autopilot", citation: { valid: true } },
+    ],
+  });
+  await writeFile(planeRuntime, `#!/bin/sh\nprintf '%s' '${PLANE_PAYLOAD}'\n`, { encoding: "utf8" });
+  await chmod(planeRuntime, 0o700);
 
-const planeHooks = new Map();
-const planeAudit = join(auditDir, "plane.jsonl");
-plugin.register({
-  pluginConfig: { enabled: true, guardEnabled: true, agentIds: ["yaole"], runtime: planeRuntime, auditPath: planeAudit },
-  logger: { info() {}, warn() {} },
-  on(name, handler) { planeHooks.set(name, handler); },
-});
-const planeCtx = { agentId: "yaole", sessionKey: "recall-plane-1", runId: "recall-plane-run" };
-const planeInjected = await planeHooks.get("before_prompt_build")({ prompt: "octo-daemon 升级到哪个版本了？" }, planeCtx);
-assert.ok(planeInjected?.prependContext, "a top-level-shaped recall payload must still inject");
-const planeRows = (await readFile(planeAudit, "utf8")).split("\n").filter(Boolean).map((line) => JSON.parse(line));
-const planeRecall = planeRows.find((row) => row.event === "memory_recall");
-assert.equal(planeRecall.outcome, "injected");
-assert.equal(planeRecall.answerable, 2, "the audit must count what was injected, not read a key this scope leaves empty");
-assert.equal(planeRecall.verified, 1);
+  const planeHooks = new Map();
+  const planeAudit = join(auditDir, "plane.jsonl");
+  plugin.register({
+    pluginConfig: { enabled: true, guardEnabled: true, agentIds: ["yaole"], runtime: planeRuntime, auditPath: planeAudit },
+    logger: { info() {}, warn() {} },
+    on(name, handler) { planeHooks.set(name, handler); },
+  });
+  const planeCtx = { agentId: "yaole", sessionKey: "recall-plane-1", runId: "recall-plane-run" };
+  const planeInjected = await planeHooks.get("before_prompt_build")({ prompt: "octo-daemon 升级到哪个版本了？" }, planeCtx);
+  assert.ok(planeInjected?.prependContext, "a top-level-shaped recall payload must still inject");
+  const planeRows = (await readFile(planeAudit, "utf8")).split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  const planeRecall = planeRows.find((row) => row.event === "memory_recall");
+  assert.equal(planeRecall.outcome, "injected");
+  assert.equal(planeRecall.answerable, 2, "the audit must count what was injected, not read a key this scope leaves empty");
+  assert.equal(planeRecall.verified, 1);
+}
 
 // An answer drawn from conversation memory has no Git receipt to give, and
 // demanding one made the live guard flag a correct answer: the turn searched
