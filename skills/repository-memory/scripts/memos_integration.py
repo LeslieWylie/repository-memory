@@ -37,7 +37,7 @@ def _command(name: str) -> str | None:
 
 def _run(command: list[str], *, cwd: Path | None = None, timeout: int = 30) -> dict[str, Any]:
     try:
-        result = subprocess.run(command, cwd=str(cwd) if cwd else None, text=True, capture_output=True, timeout=timeout, check=False)
+        result = subprocess.run(command, cwd=str(cwd) if cwd else None, text=True, encoding="utf-8", capture_output=True, timeout=timeout, check=False)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"ok": False, "command": command, "error": str(exc)}
     output = (result.stdout or result.stderr or "").strip()

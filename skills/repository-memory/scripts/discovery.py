@@ -53,7 +53,7 @@ def read_config() -> dict[str, Any]:
 
 def git(root: Path, *args: str, check: bool = False) -> str | None:
     try:
-        return subprocess.check_output(["git", "-C", str(root), *args], text=True, stderr=subprocess.DEVNULL).strip()
+        return subprocess.check_output(["git", "-C", str(root), *args], text=True, encoding="utf-8", stderr=subprocess.DEVNULL).strip()
     except (OSError, subprocess.CalledProcessError):
         if check:
             raise

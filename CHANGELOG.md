@@ -141,6 +141,13 @@
   Memory file over its destination. The leaked open handle made `os.replace`
   fail on Windows with WinError 32, so `team-export` there died on its first
   record — on every platform it also leaked one descriptor per exported file.
+- Give every text-mode subprocess call an explicit UTF-8 encoding. The child
+  processes already answer in UTF-8, but a text-mode pipe decodes with the
+  locale code page, and on Windows the pipe is drained by a reader thread — a
+  decode error kills that thread silently and `communicate()` returns `None`
+  for the stream, so a successful `git`/CLI call with CJK output looked like a
+  process that produced nothing. The gate test failed exactly this way on
+  Windows CI while the child exited 0.
 
 ## 0.7.15
 

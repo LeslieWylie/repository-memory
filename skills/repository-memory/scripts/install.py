@@ -178,7 +178,7 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 def _run(command: list[str], env: dict[str, str] | None = None) -> tuple[bool, str]:
     try:
-        result = subprocess.run(command, text=True, capture_output=True, timeout=120, check=False, env=env)
+        result = subprocess.run(command, text=True, encoding="utf-8", capture_output=True, timeout=120, check=False, env=env)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
     output = (result.stdout or result.stderr or "").strip()
@@ -543,7 +543,7 @@ def _verify(canonical: Path, require_repository: bool) -> dict[str, Any]:
         process = subprocess.run(
             [command, *command_args],
             input="\n".join(json.dumps(item) for item in requests) + "\n",
-            text=True,
+            text=True, encoding="utf-8",
             capture_output=True,
             timeout=30,
             check=False,

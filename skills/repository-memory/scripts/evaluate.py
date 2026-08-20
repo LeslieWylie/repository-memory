@@ -188,10 +188,10 @@ def _revision_snapshot(root: Path, revision: str) -> tuple[Path, str]:
     if target.exists():
         shutil.rmtree(target)
     target.parent.mkdir(parents=True, exist_ok=True)
-    clone = subprocess.run(["git", "clone", "--no-hardlinks", "--quiet", str(root), str(target)], text=True, capture_output=True, check=False, timeout=300)
+    clone = subprocess.run(["git", "clone", "--no-hardlinks", "--quiet", str(root), str(target)], text=True, encoding="utf-8", capture_output=True, check=False, timeout=300)
     if clone.returncode:
         raise RuntimeError((clone.stderr or clone.stdout or "snapshot clone failed").strip())
-    checkout = subprocess.run(["git", "-C", str(target), "checkout", "--detach", "--quiet", commit], text=True, capture_output=True, check=False, timeout=120)
+    checkout = subprocess.run(["git", "-C", str(target), "checkout", "--detach", "--quiet", commit], text=True, encoding="utf-8", capture_output=True, check=False, timeout=120)
     if checkout.returncode:
         raise RuntimeError((checkout.stderr or checkout.stdout or "snapshot checkout failed").strip())
     subprocess.run(["git", "-C", str(target), "remote", "set-url", "origin", ""], capture_output=True, check=False, timeout=30)

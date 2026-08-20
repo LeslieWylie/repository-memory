@@ -36,7 +36,7 @@ class AdapterError(RuntimeError):
 
 def _safe_tracked_paths(root: Path, deep: bool = False) -> list[str]:
     try:
-        output = subprocess.check_output(["git", "-C", str(root), "ls-files", "-z"], text=True, stderr=subprocess.DEVNULL)
+        output = subprocess.check_output(["git", "-C", str(root), "ls-files", "-z"], text=True, encoding="utf-8", stderr=subprocess.DEVNULL)
     except (OSError, subprocess.CalledProcessError):
         return []
     selected = []
@@ -73,10 +73,10 @@ def safe_git_index(root: Path, deep: bool = False):
     try:
         subprocess.run(["git", "-C", str(root), "read-tree", "HEAD"], env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         selected = set(_safe_tracked_paths(root, deep))
-        tracked = set((subprocess.check_output(["git", "-C", str(root), "ls-files", "-z"], text=True, stderr=subprocess.DEVNULL)).split("\0"))
+        tracked = set((subprocess.check_output(["git", "-C", str(root), "ls-files", "-z"], text=True, encoding="utf-8", stderr=subprocess.DEVNULL)).split("\0"))
         removed = sorted(item for item in tracked - selected if item)
         if removed:
-            subprocess.run(["git", "-C", str(root), "update-index", "--force-remove", "-z", "--stdin"], input="\0".join(removed), text=True, env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            subprocess.run(["git", "-C", str(root), "update-index", "--force-remove", "-z", "--stdin"], input="\0".join(removed), text=True, encoding="utf-8", env=env, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         yield env
     finally:
         Path(index).unlink(missing_ok=True)
@@ -333,7 +333,7 @@ class Adapter:
         try:
             with safe_git_index(self.source.path, deep=deep) as safe_env:
                 safe_env.update(env)
-                result = subprocess.run(command + args, cwd=self.source.path, env=safe_env, capture_output=True, text=True, timeout=timeout, check=False)
+                result = subprocess.run(command + args, cwd=self.source.path, env=safe_env, capture_output=True, text=True, encoding="utf-8", timeout=timeout, check=False)
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise AdapterError(str(exc)) from exc
         finally:

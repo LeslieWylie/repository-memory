@@ -70,7 +70,7 @@ def ensure_runtime_dependencies(root: Path) -> dict[str, Any]:
         [npm, "install", "--ignore-scripts", "--no-audit", "--no-fund"],
         cwd=root,
         capture_output=True,
-        text=True,
+        text=True, encoding="utf-8",
         timeout=180,
         check=False,
     )
@@ -152,7 +152,7 @@ def _plist() -> str:
 
 def _launchctl(*args: str) -> tuple[bool, str]:
     try:
-        result = subprocess.run(["launchctl", *args], capture_output=True, text=True, timeout=15, check=False)
+        result = subprocess.run(["launchctl", *args], capture_output=True, text=True, encoding="utf-8", timeout=15, check=False)
     except (OSError, subprocess.SubprocessError) as exc:
         return False, str(exc)
     return result.returncode == 0, (result.stdout or result.stderr).strip()

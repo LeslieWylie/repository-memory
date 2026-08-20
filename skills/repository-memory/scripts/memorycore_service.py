@@ -146,7 +146,7 @@ def ensure_pipeline_patch(root: Path) -> dict[str, Any]:
     try:
         worktree = Path(subprocess.check_output(
             ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
-            text=True,
+            text=True, encoding="utf-8",
             stderr=subprocess.STDOUT,
         ).strip()).resolve()
     except (OSError, subprocess.CalledProcessError):
@@ -157,7 +157,7 @@ def ensure_pipeline_patch(root: Path) -> dict[str, Any]:
             [patch, "--dry-run", "-p1", "-i", str(RUNTIME_PATCH)],
             cwd=root,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8",
             check=False,
         )
         if check.returncode != 0:
@@ -167,7 +167,7 @@ def ensure_pipeline_patch(root: Path) -> dict[str, Any]:
             [patch, "-p1", "-i", str(RUNTIME_PATCH)],
             cwd=root,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8",
             check=False,
         )
         if applied.returncode != 0:
@@ -183,11 +183,11 @@ def ensure_pipeline_patch(root: Path) -> dict[str, Any]:
         if str(relative_root) != ".":
             command.extend(["--directory", str(relative_root)])
         command.append(str(RUNTIME_PATCH))
-        check = subprocess.run([*command[:-1], "--check", command[-1]], capture_output=True, text=True, check=False)
+        check = subprocess.run([*command[:-1], "--check", command[-1]], capture_output=True, text=True, encoding="utf-8", check=False)
         if check.returncode != 0:
             detail = (check.stderr or check.stdout).strip()
             raise RuntimeError(f"cannot apply MemoryCore runtime patch: {detail[:400]}")
-        applied = subprocess.run(command, capture_output=True, text=True, check=False)
+        applied = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", check=False)
         if applied.returncode != 0:
             detail = (applied.stderr or applied.stdout).strip()
             raise RuntimeError(f"MemoryCore runtime patch failed: {detail[:400]}")
@@ -211,7 +211,7 @@ def ensure_runtime_dependencies(root: Path) -> dict[str, Any]:
             [npm, "install", "--ignore-scripts", "--no-audit", "--no-fund"],
             cwd=root,
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8",
             timeout=180,
             check=False,
         )
@@ -404,7 +404,7 @@ def _plist() -> str:
 
 def _launchctl(*args: str) -> tuple[bool, str]:
     try:
-        result = subprocess.run(["launchctl", *args], capture_output=True, text=True, timeout=15, check=False)
+        result = subprocess.run(["launchctl", *args], capture_output=True, text=True, encoding="utf-8", timeout=15, check=False)
     except (OSError, subprocess.SubprocessError) as exc:
         return False, str(exc)
     return result.returncode == 0, (result.stdout or result.stderr).strip()

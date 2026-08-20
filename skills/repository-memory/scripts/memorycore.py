@@ -59,7 +59,7 @@ def _secret_from_keychain(service: str, account: str) -> str | None:
         result = subprocess.run(
             ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8",
             timeout=3,
             check=False,
         )
@@ -168,7 +168,7 @@ def _runtime_report() -> dict[str, Any]:
         result = subprocess.run(
             ["ps", "-axo", "pid=,command="],
             capture_output=True,
-            text=True,
+            text=True, encoding="utf-8",
             timeout=2,
             check=False,
         )

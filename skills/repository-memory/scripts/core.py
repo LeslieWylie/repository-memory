@@ -1207,7 +1207,7 @@ def memmy_gui(open_window: bool = False) -> dict[str, Any]:
             open_error = "--open is currently supported only on macOS"
         else:
             try:
-                subprocess.run(["open", url], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                subprocess.run(["open", url], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, encoding="utf-8")
                 opened = True
             except (OSError, subprocess.CalledProcessError) as exc:
                 open_error = str(exc)[:240]

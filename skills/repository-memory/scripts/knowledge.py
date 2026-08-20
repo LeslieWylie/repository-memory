@@ -255,7 +255,7 @@ def _tracked_documents(root: Path, *, deep: bool = False) -> list[Path]:
     import subprocess
 
     try:
-        raw = subprocess.check_output(["git", "-C", str(root), "ls-files", "-z"], text=True, stderr=subprocess.DEVNULL)
+        raw = subprocess.check_output(["git", "-C", str(root), "ls-files", "-z"], text=True, encoding="utf-8", stderr=subprocess.DEVNULL)
     except (OSError, subprocess.CalledProcessError):
         return []
     result: list[Path] = []

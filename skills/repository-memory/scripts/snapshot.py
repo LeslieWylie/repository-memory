@@ -34,7 +34,7 @@ from models import SourceSpec, SourceView
 
 def _run(root: Path, args: list[str], timeout: int = 180) -> tuple[bool, str]:
     try:
-        result = subprocess.run(["git", "-C", str(root), *args], text=True, capture_output=True, timeout=timeout, check=False)
+        result = subprocess.run(["git", "-C", str(root), *args], text=True, encoding="utf-8", capture_output=True, timeout=timeout, check=False)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
     if result.returncode:

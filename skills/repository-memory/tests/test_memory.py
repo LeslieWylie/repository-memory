@@ -937,7 +937,7 @@ class RepositoryMemoryTest(unittest.TestCase):
         subprocess.run(["git", "-C", str(self.alpha), "remote", "add", "origin", str(bare)], check=True)
         subprocess.run(["git", "-C", str(self.alpha), "push", "-q", "-u", "origin", "main"], check=True)
         (self.alpha / "docs" / "atlas.md").write_text("# Local uncommitted secret\n", encoding="utf-8")
-        commit = subprocess.check_output(["git", "-C", str(self.alpha), "rev-parse", "HEAD"], text=True).strip()
+        commit = subprocess.check_output(["git", "-C", str(self.alpha), "rev-parse", "HEAD"], text=True, encoding="utf-8").strip()
         view = prepare_view(SourceSpec("alpha", self.alpha, "alpha"))
         self.assertEqual(view.commit_type, "remote_snapshot")
         self.assertEqual(view.commit, commit)
@@ -1000,12 +1000,12 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(before.root, str(self.alpha))
         self.assertEqual(after.root, str(self.alpha))
 
-        before_status = subprocess.check_output(["git", "-C", str(self.alpha), "status", "--porcelain"], text=True)
+        before_status = subprocess.check_output(["git", "-C", str(self.alpha), "status", "--porcelain"], text=True, encoding="utf-8")
         feedback = core.feedback(self.alpha, "alpha:docs/atlas.md", "useful", "up")
         candidate_input = Path(self.temp.name) / "candidate.json"
         candidate_input.write_text(json.dumps({"title": "Candidate", "content": "Pending evidence"}), encoding="utf-8")
         promoted = core.promote(self.alpha, str(candidate_input))
-        after_status = subprocess.check_output(["git", "-C", str(self.alpha), "status", "--porcelain"], text=True)
+        after_status = subprocess.check_output(["git", "-C", str(self.alpha), "status", "--porcelain"], text=True, encoding="utf-8")
         self.assertTrue(feedback["written"])
         self.assertEqual(promoted["status"], "candidate")
         self.assertFalse(promoted["canonical_repo_changed"])
@@ -1278,7 +1278,7 @@ class RepositoryMemoryTest(unittest.TestCase):
             "--qrels", str(root / "eval/public/team_memory/qrels.jsonl"),
             "--gate", "--json",
         ]
-        gated = subprocess.run(command, text=True, capture_output=True, check=False)
+        gated = subprocess.run(command, text=True, encoding="utf-8", capture_output=True, check=False)
         self.assertEqual(gated.returncode, 0, gated.stderr)
         self.assertTrue(json.loads(gated.stdout)["gate"]["passed"])
 
@@ -1327,7 +1327,7 @@ class RepositoryMemoryTest(unittest.TestCase):
             {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"_meta": modern_meta, "name": "memory_search", "arguments": {"query": "Atlas evidence"}}},
             {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"_meta": modern_meta, "name": "not-a-memory-tool", "arguments": {"source": "alpha"}}},
         ]
-        process = subprocess.run(command, input="\n".join(json.dumps(item) for item in requests) + "\n", text=True, capture_output=True, check=True)
+        process = subprocess.run(command, input="\n".join(json.dumps(item) for item in requests) + "\n", text=True, encoding="utf-8", capture_output=True, check=True)
         responses = [json.loads(line) for line in process.stdout.splitlines() if line.strip()]
         self.assertIn("2026-07-28", responses[0]["result"]["supportedVersions"])
         self.assertEqual(responses[0]["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"], "repository-memory")
@@ -1351,7 +1351,7 @@ class RepositoryMemoryTest(unittest.TestCase):
             {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25"}},
             {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
         ]
-        process = subprocess.run(command, input="\n".join(json.dumps(item) for item in requests) + "\n", text=True, capture_output=True, check=True)
+        process = subprocess.run(command, input="\n".join(json.dumps(item) for item in requests) + "\n", text=True, encoding="utf-8", capture_output=True, check=True)
         responses = [json.loads(line) for line in process.stdout.splitlines() if line.strip()]
         self.assertEqual(responses[0]["result"]["protocolVersion"], "2025-11-25")
         self.assertEqual(responses[1]["result"]["resultType"], "complete")
@@ -1359,7 +1359,7 @@ class RepositoryMemoryTest(unittest.TestCase):
     def test_mcp_rejects_unknown_per_request_protocol(self):
         command = [sys.executable, str(SCRIPTS / "repository-memory.py"), "mcp", "--root", str(self.alpha)]
         request = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": "1900-01-01"}}}
-        process = subprocess.run(command, input=json.dumps(request) + "\n", text=True, capture_output=True, check=True)
+        process = subprocess.run(command, input=json.dumps(request) + "\n", text=True, encoding="utf-8", capture_output=True, check=True)
         response = json.loads(process.stdout.strip())
         self.assertEqual(response["error"]["code"], -32022)
         self.assertIn("2026-07-28", response["error"]["data"]["supported"])
@@ -1389,7 +1389,7 @@ class RepositoryMemoryTest(unittest.TestCase):
             {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"_meta": meta, "name": "memory_search", "arguments": {"query": "Atlas evidence"}}},
         ]
         environment = {**os.environ, "REPOSITORY_MEMORY_AGENT_ID": "yaole"}
-        process = subprocess.run(command, input="\n".join(json.dumps(item) for item in requests) + "\n", text=True, capture_output=True, check=True, env=environment)
+        process = subprocess.run(command, input="\n".join(json.dumps(item) for item in requests) + "\n", text=True, encoding="utf-8", capture_output=True, check=True, env=environment)
         responses = [json.loads(line) for line in process.stdout.splitlines() if line.strip()]
         self.assertEqual(len(responses), 3)
         self.assertIn("verified", responses[2]["result"]["structuredContent"])
@@ -1425,7 +1425,7 @@ class RepositoryMemoryTest(unittest.TestCase):
             {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25"}},
             {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
         ]
-        subprocess.run(command, input="\n".join(json.dumps(item) for item in requests) + "\n", text=True, capture_output=True, check=True)
+        subprocess.run(command, input="\n".join(json.dumps(item) for item in requests) + "\n", text=True, encoding="utf-8", capture_output=True, check=True)
         events = [json.loads(line) for line in audit_log.read_text(encoding="utf-8").splitlines()]
         tools_list = next(event for event in events if event["direction"] == "request" and event["method"] == "tools/list")
         tools_response = next(event for event in events if event["direction"] == "response" and event["id"] == "2")
@@ -1472,7 +1472,7 @@ class RepositoryMemoryTest(unittest.TestCase):
             ]) + "\n",
             encoding="utf-8",
         )
-        commit = subprocess.check_output(["git", "-C", str(self.alpha), "rev-parse", "HEAD"], text=True).strip()
+        commit = subprocess.check_output(["git", "-C", str(self.alpha), "rev-parse", "HEAD"], text=True, encoding="utf-8").strip()
         verified = {
             "id": "alpha:docs/atlas.md",
             "citation": {"valid": True, "source": "repository", "path": "docs/atlas.md", "line_start": 1, "line_end": 2, "commit": commit},
@@ -1773,7 +1773,7 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(normalized["candidate_reason"], "citation excerpt does not match cited lines")
 
     def test_citation_accepts_short_exact_excerpt_and_rejects_escape(self):
-        commit = subprocess.check_output(["git", "-C", str(self.alpha), "rev-parse", "HEAD"], text=True).strip()
+        commit = subprocess.check_output(["git", "-C", str(self.alpha), "rev-parse", "HEAD"], text=True, encoding="utf-8").strip()
         accepted = validate(self.alpha, "docs/atlas.md", 2, 2, "Atlas evidence from alpha", commit, commit)
         self.assertTrue(accepted["valid"])
         short = validate(self.alpha, "docs/atlas.md", 1, 1, "#", commit, commit)
@@ -1912,7 +1912,7 @@ class RepositoryMemoryTest(unittest.TestCase):
             "--openclaw-config",
             str(openclaw_config),
             "--json",
-        ], text=True, capture_output=True, env=environment)
+        ], text=True, encoding="utf-8", capture_output=True, env=environment)
         self.assertNotEqual(missing_selection.returncode, 0)
         self.assertIn("requires --openclaw-agent", missing_selection.stdout)
         installed = subprocess.run([
@@ -1928,7 +1928,7 @@ class RepositoryMemoryTest(unittest.TestCase):
             "--openclaw-agent",
             "alpha",
             "--json",
-        ], text=True, capture_output=True, check=True, env=environment)
+        ], text=True, encoding="utf-8", capture_output=True, check=True, env=environment)
         report = json.loads(installed.stdout)
         self.assertEqual(report["status"], "installed")
         self.assertEqual(report["targets"], ["claude", "codex", "openclaw"])
@@ -1976,7 +1976,7 @@ class RepositoryMemoryTest(unittest.TestCase):
             "repository",
             "--local",
             "--json",
-        ], text=True, capture_output=True, check=True, env=environment)
+        ], text=True, encoding="utf-8", capture_output=True, check=True, env=environment)
         payload = json.loads(searched.stdout)
         self.assertFalse(payload["abstain"])
         self.assertEqual(payload["verified"][0]["path"], "docs/atlas.md")
@@ -2090,7 +2090,7 @@ class RepositoryMemoryTest(unittest.TestCase):
         fetched = core.get_result(None, found["verified"][0]["id"])
         self.assertTrue(fetched["found"])
         self.assertEqual(fetched["source"], "standalone-memory")
-        self.assertFalse(subprocess.check_output(["git", "-C", str(self.alpha), "status", "--porcelain"], text=True))
+        self.assertFalse(subprocess.check_output(["git", "-C", str(self.alpha), "status", "--porcelain"], text=True, encoding="utf-8"))
 
         timeline = core._mcp_dispatch("memory_timeline", {"session_id": "local-session"})
         self.assertTrue(timeline["ok"])
@@ -2352,7 +2352,7 @@ class RepositoryMemoryTest(unittest.TestCase):
         # evaluated and catches accidental cache-name IDs in the evaluator.
         queries.write_text(json.dumps({"id": "q1", "query": "Atlas evidence", "intent": "exact", "source_scope": "canonical-alpha"}) + "\n", encoding="utf-8")
         qrels.write_text(json.dumps({"query_id": "q1", "document_id": "canonical-alpha:docs/atlas.md", "source": "canonical-alpha", "path": "docs/atlas.md", "relevance": 2}) + "\n", encoding="utf-8")
-        commit = subprocess.check_output(["git", "-C", str(self.alpha), "rev-parse", "HEAD"], text=True).strip()
+        commit = subprocess.check_output(["git", "-C", str(self.alpha), "rev-parse", "HEAD"], text=True, encoding="utf-8").strip()
         os.environ["REPOSITORY_MEMORY_DISABLE_ADAPTER"] = "1"
         report = evaluate_queries(self.alpha, queries, qrels, local=True, revision=commit)
         self.assertEqual(report["evaluated_commit"], commit)

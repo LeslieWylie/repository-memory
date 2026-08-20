@@ -85,7 +85,7 @@ def _model_review(command: list[str] | None, item: dict[str, Any], checks: dict[
         return {"decision": "hold", "reason": "supervisor command is not configured", "model_reviewed": False}
     payload = {"item": item, "checks": checks, "instructions": "Return JSON: decision accept|hold|reject, confidence 0..1, reason, unsupported_claims."}
     try:
-        result = subprocess.run(command, input=json.dumps(payload, ensure_ascii=False), text=True, capture_output=True, timeout=120, check=False)
+        result = subprocess.run(command, input=json.dumps(payload, ensure_ascii=False), text=True, encoding="utf-8", capture_output=True, timeout=120, check=False)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"decision": "hold", "reason": f"supervisor invocation failed: {exc}", "model_reviewed": False}
     if result.returncode != 0:
