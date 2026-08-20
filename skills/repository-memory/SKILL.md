@@ -62,6 +62,10 @@ CLI (`scripts/repository-memory.py search|get|doctor --json`).
    read back from the working tree and matched, but the source has uncommitted
    changes. Answer from it, and attribute it to the working tree rather than to
    a commit.
+8. An abstention on a symbol-heavy or paraphrased phrasing is evidence, not a
+   dead end: the candidates' `support.unmatched_terms` name exactly which
+   words the corpus lacks. Re-ask once in the document's own vocabulary — one
+   plain sentence — and never pad the retry with invented specifics.
 
 `verified` means a citation or memory identifier checked out — not that one
 excerpt proves every part of a compound question. `candidates` are leads:

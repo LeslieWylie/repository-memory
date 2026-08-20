@@ -157,6 +157,13 @@
   moved 3 files. `activate` now transitions the linked projections in the same
   write and reports them as `activated_siblings`.
 
+- Tell the reader what to do with an abstention. A fresh-host tester asked a
+  symbol-heavy question, got a correct abstention, and read it as phrasing
+  sensitivity — while the response had already named the missing words in
+  `support.unmatched_terms`. The Skill instructions now say to re-ask once in
+  the document's own vocabulary, guided by those terms, and still never to pad
+  a retry with invented specifics.
+
 ## 0.7.15
 
 - Protect existing canonical Team Memory Markdown during automatic hydration
