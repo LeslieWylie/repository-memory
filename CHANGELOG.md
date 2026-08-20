@@ -148,6 +148,14 @@
   for the stream, so a successful `git`/CLI call with CJK output looked like a
   process that produced nothing. The gate test failed exactly this way on
   Windows CI while the child exited 0.
+- Activate every projection of a team memory together. One memory can sit in
+  the store twice — the local original and a central wrapper hydrated from the
+  canonical repository, linked by `provenance.source_memory_id` — and review
+  activated only the row it was pointed at. The exporter prefers the original
+  for its richer provenance, so the canonical file kept saying `candidate` and
+  the activation never reached another agent: measured live, 71 activations
+  moved 3 files. `activate` now transitions the linked projections in the same
+  write and reports them as `activated_siblings`.
 
 ## 0.7.15
 

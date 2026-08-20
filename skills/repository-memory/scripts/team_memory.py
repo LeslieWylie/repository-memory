@@ -515,12 +515,37 @@ class SQLiteTeamMemoryBackend:
                 return {"schema_version": 1, "ok": True, "memory_id": memory_id, "status": "active", "duplicate": True, "canonical_repo_changed": False}
             if row["status"] != "candidate":
                 raise ValueError(f"only candidate Team Memory can be activated: {memory_id}")
-            revision, origin_node, parent = self._next_revision(row, self.node_id)
             now = _now()
-            connection.execute("UPDATE memories SET status = 'active', updated_at = ?, revision = ?, origin_node = ?, parent_revision = ?, reviewed_by = COALESCE(?, reviewed_by), activated_at = ? WHERE id = ?", (now, revision, origin_node, parent, reviewer, now, memory_id))
+            def transition(target: sqlite3.Row) -> None:
+                revision, origin_node, parent = self._next_revision(target, self.node_id)
+                connection.execute("UPDATE memories SET status = 'active', updated_at = ?, revision = ?, origin_node = ?, parent_revision = ?, reviewed_by = COALESCE(?, reviewed_by), activated_at = ? WHERE id = ?", (now, revision, origin_node, parent, reviewer, now, target["id"]))
+                self._append_revision(connection, connection.execute("SELECT * FROM memories WHERE id = ?", (target["id"],)).fetchone())
+            transition(row)
+            # One memory can sit in the store as two projections: the local
+            # original and a central wrapper hydrated from the canonical
+            # repository, linked by ``provenance.source_memory_id``.  The
+            # review activated the *memory*, so every projection transitions
+            # together -- otherwise the exporter, which prefers the original
+            # for its richer provenance, keeps publishing ``candidate`` and
+            # the activation never reaches any other agent.  Measured before
+            # this change: 71 activations moved 3 files.
+            try:
+                own_source = str((json.loads(row["provenance"] or "{}")).get("source_memory_id") or "")
+            except json.JSONDecodeError:
+                own_source = ""
+            activated_siblings: list[str] = []
+            for other in connection.execute("SELECT * FROM memories WHERE status = 'candidate'").fetchall():
+                if other["id"] == memory_id:
+                    continue
+                try:
+                    other_source = str((json.loads(other["provenance"] or "{}")).get("source_memory_id") or "")
+                except json.JSONDecodeError:
+                    continue
+                if other_source == memory_id or (own_source and own_source == other["id"]):
+                    transition(other)
+                    activated_siblings.append(str(other["id"]))
             updated = connection.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
-            self._append_revision(connection, updated)
-            return {"schema_version": 1, "ok": True, "memory_id": memory_id, "status": "active", "duplicate": False, "reviewer": reviewer, "memory": self._row(updated), "canonical_repo_changed": False}
+            return {"schema_version": 1, "ok": True, "memory_id": memory_id, "status": "active", "duplicate": False, "reviewer": reviewer, "memory": self._row(updated), "activated_siblings": activated_siblings, "canonical_repo_changed": False}
 
         return self._write(operation)
 

@@ -97,6 +97,33 @@ class DeliveryContractTest(unittest.TestCase):
         self.assertEqual(by_id[untraceable["id"]]["checks"]["provenance_kind"], "none")
         self.assertEqual(store.get(untraceable["id"])["result"]["status"], "candidate")
 
+    def test_activation_reaches_every_projection_of_the_memory(self) -> None:
+        # A pull hydrates the same memory back into the store as a central
+        # wrapper linked by provenance.source_memory_id.  Activating either
+        # projection must activate both, or the exporter -- which prefers the
+        # local original -- keeps publishing candidate state forever.
+        store = team_memory_store()
+        original = store.publish({
+            "type": "solution",
+            "title": "A reusable solution that was hydrated back",
+            "content": "A concrete reusable solution with enough content to review and act on.",
+            "provenance": {"agent_id": "yaole", "citations": ["README.md"]},
+            "confidence": 0.8,
+        })["memory"]
+        wrapper = store.publish({
+            "id": "team:central:team_l1_00000000000000000000feed",
+            "type": "solution",
+            "title": "A reusable solution that was hydrated back",
+            "content": "A concrete reusable solution with enough content to review and act on.",
+            "provenance": {"agent_id": "yaole", "central_id": "team_l1_00000000000000000000feed", "source_memory_id": original["id"]},
+            "confidence": 0.8,
+        })["memory"]
+        result = store.activate(wrapper["id"], reviewer="reviewer")
+        self.assertEqual(result["status"], "active")
+        self.assertIn(original["id"], result["activated_siblings"])
+        self.assertEqual(store.get(original["id"])["result"]["status"], "active")
+        self.assertEqual(store.get(original["id"])["result"]["reviewed_by"], "reviewer")
+
     def test_public_benchmark_uses_supplied_qrels(self) -> None:
         queries = Path(__file__).resolve().parents[3] / "eval" / "public" / "queries.jsonl"
         qrels = Path(__file__).resolve().parents[3] / "eval" / "public" / "qrels.jsonl"
