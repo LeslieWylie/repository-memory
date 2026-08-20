@@ -20,9 +20,9 @@ from typing import Any
 
 from discovery import config_path, read_config
 from local_embedding import (
+    GATEWAY_ALIASES,
     embedding_status,
-    pack,
-    vectorize_many,
+    encode_document_vectors,
 )
 from local_index import index_path
 from models import SourceView
@@ -59,6 +59,28 @@ def _atomic_bytes(destination: Path, content: bytes) -> None:
 
 def _atomic_json(destination: Path, value: dict[str, Any]) -> None:
     _atomic_bytes(destination, (json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8"))
+
+
+def _atomic_buffer(destination: Path, buffer: array.array) -> None:
+    """Write a float buffer without materializing a second copy of it.
+
+    ``tobytes()`` on a 37k-document index would allocate another 75 MB beside
+    the buffer we already hold; writing through the buffer protocol does not.
+    The file is little-endian on every platform, matching what ``load`` expects.
+    """
+
+    payload = buffer
+    if sys.byteorder != "little":
+        payload = array.array("f", buffer)
+        payload.byteswap()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    handle_fd, temporary = tempfile.mkstemp(prefix="semantic-", suffix=".tmp", dir=destination.parent)
+    try:
+        with os.fdopen(handle_fd, "wb") as handle:
+            handle.write(memoryview(payload))
+        os.replace(temporary, destination)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
 def _model_signature() -> tuple[str, str, int | None]:
@@ -127,9 +149,39 @@ def load(view: SourceView, deep: bool = False) -> dict[str, Any] | None:
     }
 
 
-def ensure(view: SourceView, local_index: dict[str, Any], deep: bool = False, *, allow_download: bool = False) -> dict[str, Any]:
-    """Build or load the semantic cache for an already-built Git index."""
+def _deferred(reason: str) -> dict[str, Any]:
+    return {
+        "configured": True,
+        "available": False,
+        "indexed": False,
+        "strategy": "lexical",
+        "deferred": True,
+        "defer_reason": reason,
+    }
 
+
+def ensure(
+    view: SourceView,
+    local_index: dict[str, Any],
+    deep: bool = False,
+    *,
+    allow_download: bool = False,
+    build: bool = True,
+) -> dict[str, Any]:
+    """Build or load the semantic cache for an already-built Git index.
+
+    ``build=False`` is the request path for a large source: loading a cache that
+    already exists costs one file read, while building one costs an encode of
+    the whole corpus.  Deferring the *build* is what keeps a first query fast;
+    deferring the *load* as well would mean a cache could be paid for once and
+    then never used.  A missing cache returns before the readiness probe so the
+    common no-cache case stays free.
+    """
+
+    if not build:
+        cached = _load_meta(_meta_path(view, deep))
+        if not cached or cached.get("commit") != view.commit or not _vectors_path(view, deep).exists():
+            return _deferred("large_repository_first_pass")
     configured = embedding_status(probe=True, allow_download=allow_download)
     if not configured.get("configured") or configured.get("available") is not True:
         # Keep the configured neural provider visible when it is unavailable,
@@ -161,6 +213,12 @@ def ensure(view: SourceView, local_index: dict[str, Any], deep: bool = False, *,
         loaded = load(view, deep)
         if loaded:
             return loaded
+    if not build:
+        # A cache exists but does not describe the provider/model/dimension in
+        # force now.  ``vectorize`` at query time uses the *current* provider,
+        # so scoring those vectors would compare two different embedding spaces.
+        # Defer instead, and let the rescue path rebuild if lexical finds nothing.
+        return _deferred("semantic_cache_signature_mismatch")
     documents = local_index.get("documents") if isinstance(local_index, dict) else []
     paths = [str(item.get("path")) for item in documents if isinstance(item, dict) and item.get("path")]
     texts = [
@@ -168,10 +226,17 @@ def ensure(view: SourceView, local_index: dict[str, Any], deep: bool = False, *,
         for item in documents
         if isinstance(item, dict) and item.get("path")
     ]
-    vectors = vectorize_many(texts, allow_download=allow_download)
-    if len(vectors) != len(paths) or not vectors:
+    vectors, dimension, effective = encode_document_vectors(texts, allow_download=allow_download)
+    del texts
+    if not dimension or len(vectors) != len(paths) * dimension:
         return {**configured, "indexed": False, "strategy": "lexical", "error": "semantic encoder returned no document vectors"}
-    dimension = len(vectors[0])
+    # Describe the vectors that were actually produced, not the ones that were
+    # requested.  An optional provider can fail after the readiness check and
+    # leave the corpus to the local projection; recording the configured triple
+    # then would claim a cache we do not hold, and the mismatch would rebuild
+    # the whole index on every later search.
+    provider = str(effective.get("provider") or provider)
+    model = str(effective.get("model") or model)
     metadata = {
         "schema_version": SCHEMA_VERSION,
         "source": view.spec.id,
@@ -180,23 +245,51 @@ def ensure(view: SourceView, local_index: dict[str, Any], deep: bool = False, *,
         "provider": provider,
         "model": model,
         "dimension": dimension,
-        "native_neural_model": bool(configured.get("native_neural_model")),
+        "native_neural_model": bool(effective.get("native_neural_model")),
         "paths": paths,
         "built_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "vectors_path": str(vectors_file),
     }
-    _atomic_bytes(vectors_file, b"".join(pack(vector) for vector in vectors))
+    _atomic_buffer(vectors_file, vectors)
     _atomic_json(_meta_path(view, deep), metadata)
-    return {**metadata, "vectors": vectors, "available": True, "indexed": True, "strategy": "local-hybrid"}
+    return {**metadata, "vector_store": vectors, "available": True, "indexed": True, "strategy": "local-hybrid"}
 
 
-def configure(*, model: str, enabled: bool = True, allow_download: bool = False) -> dict[str, Any]:
+def configure(
+    *,
+    model: str,
+    enabled: bool = True,
+    allow_download: bool = False,
+    provider: str = "huggingface",
+    endpoint: str | None = None,
+    dimensions: int | None = None,
+    api_key_env: str | None = None,
+    api_key_file: str | None = None,
+    api_key_json_path: str | None = None,
+) -> dict[str, Any]:
     path = config_path()
     value = read_config()
     semantic = value.get("semantic") if isinstance(value.get("semantic"), dict) else {}
     # Download permission is ephemeral.  It is never persisted as a default
     # for future doctor/search calls.
-    semantic.update({"enabled": bool(enabled), "provider": "huggingface", "model": str(model), "allow_download": False})
+    semantic.update({"enabled": bool(enabled), "provider": str(provider), "model": str(model), "allow_download": False})
+    if str(provider).strip().casefold() in GATEWAY_ALIASES:
+        if endpoint:
+            semantic["endpoint"] = str(endpoint).strip().rstrip("/")
+        if dimensions:
+            semantic["dimensions"] = int(dimensions)
+        # Persist the *name* of the variable holding the credential, never the
+        # credential.  A configuration file is copied, backed up and diffed;
+        # a secret written into it leaks by every one of those routes.  A file
+        # path is the same bargain: it says where the secret is, not what it is,
+        # and it survives into contexts that have no environment to read.
+        if api_key_env:
+            semantic["api_key_env"] = str(api_key_env).strip()
+        if api_key_file:
+            semantic["api_key_file"] = str(api_key_file).strip()
+        if api_key_json_path:
+            semantic["api_key_json_path"] = str(api_key_json_path).strip()
+        semantic.pop("api_key", None)
     value["semantic"] = semantic
     path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_json(path, value)

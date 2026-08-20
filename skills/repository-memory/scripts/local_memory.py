@@ -19,6 +19,7 @@ from typing import Any
 
 from discovery import data_root
 from models import MEMORY_LAYERS, memory_layer_state
+from tokenize_query import fts5_can_match, plane_terms
 
 SECRET_CONTENT = re.compile(
     r"-----BEGIN .*PRIVATE KEY-----|(?:api[_-]?key|access[_-]?token|password|secret)\s*[:=]\s*['\"]?[A-Za-z0-9_\-/.+=]{16,}|\bsk-[A-Za-z0-9_-]{16,}",
@@ -217,7 +218,13 @@ class LocalMemoryStore:
 
     @staticmethod
     def _terms(query: str) -> list[str]:
-        return [term.casefold() for term in re.findall(r"[\w一-龥./:-]{2,}", query, re.UNICODE) if term.casefold() not in STOP_WORDS]
+        """Tokenize a query the same way every other retrieval plane does.
+
+        This used to be ``[\\w一-龥./:-]{2,}`` with no segmentation, so a
+        Chinese question arrived as one clause-length token matching nothing.
+        """
+
+        return plane_terms(query, STOP_WORDS)
 
     def search(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
         terms = list(dict.fromkeys(self._terms(query)))
@@ -226,7 +233,10 @@ class LocalMemoryStore:
         connection = self._connect()
         try:
             candidates: list[sqlite3.Row]
-            if self._fts_available(connection):
+            # FTS is only a candidate pre-filter; the substring pass below is
+            # the real match.  Scan instead of pre-filtering when the index
+            # cannot see a term — see ``tokenize_query.fts5_can_match``.
+            if self._fts_available(connection) and all(fts5_can_match(term) for term in terms):
                 match = " OR ".join('"' + term.replace('"', "") + '"' for term in terms)
                 candidates = connection.execute(
                     "SELECT r.* FROM records r JOIN records_fts f ON f.id = r.id WHERE records_fts MATCH ?",

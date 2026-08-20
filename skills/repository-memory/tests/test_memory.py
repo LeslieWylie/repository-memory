@@ -19,13 +19,14 @@ sys.path.insert(0, str(SCRIPTS))
 import core
 from citation import locate, validate
 from evaluate import evaluate_queries
-from fallback import _fts_candidates, paths, query_terms
+from fallback import _claim_support, _compound_parts, _fts_candidates, carved_query_terms, paths, query_terms
 from local_index import _ensure_fts, _ensure_path_fts
 from memorycore import MemoryCoreClient, MemoryCoreConfig, MemoryCoreError
 from memmy import MemmyClient, MemmyConfig
 from mcp_server import SERVER_VERSION
 from snapshot import _snapshot_lock, prepare_view, snapshot_lock_backend
 from team_memory import TeamMemoryStore
+from tokenize_query import as_iso_date, date_aliases
 from version import VERSION
 from benchmark import _semantic_override
 from memos_lifecycle import backpropagate, classify_turn, ready_buckets
@@ -136,7 +137,7 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(value["document_count"], len(value["documents"]))
         self.assertGreaterEqual(value["text_bytes"], 0)
         self.assertGreater(value["index_bytes"], 0)
-        self.assertEqual(VERSION, "0.7.15")
+        self.assertEqual(VERSION, "0.7.16")
 
     def test_multisource_search_has_verified_and_candidates(self):
         result = core.search(None, "Atlas evidence", limit=5)
@@ -150,6 +151,389 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertTrue(pending["abstain"])
         self.assertEqual(len(pending["verified"]), 0)
         self.assertEqual(pending["candidates"][0]["evidence_status"], "pending")
+
+    def test_a_recalled_question_is_never_its_own_answer(self):
+        """Conversation capture stores the question; retrieval must not cite it.
+
+        Found live: asking a question twice retrieved the first asking as an
+        accepted L1 memory.  Its excerpt matched every query term by
+        construction, so ``claim_support`` was ``direct`` and it was reported
+        as answerable — the system citing the question as its own evidence.
+        """
+
+        query = "octo-daemon 升级到哪个版本了?当时是怎么验证的?"
+        echo = {"excerpt": query, "support": {"claim_support": "direct"}}
+        punctuated = {"excerpt": "octo-daemon 升级到哪个版本了？当时是怎么验证的？ ", "support": {"claim_support": "direct"}}
+        fragment = {"excerpt": "octo-daemon 升级到哪个版本了", "support": {"claim_support": "direct"}}
+        real = {
+            "excerpt": f"{query} 答:升级到 0.5.0，commit fcec9177，三项验收全绿，回退路径已备好未用。",
+            "support": {"claim_support": "direct"},
+        }
+
+        answerable = core._answerable_items([echo, punctuated, fragment, real], query)
+        self.assertEqual(answerable, [real], "only the excerpt that adds an answer may be answerable")
+
+        # Without a query the filter must not fire — the claim-support gate is
+        # still the contract for every existing caller.
+        self.assertEqual(len(core._answerable_items([echo, real])), 2)
+
+        # An unrelated excerpt is untouched by echo detection.
+        unrelated = {"excerpt": "回退路径都备好未用", "support": {"claim_support": "direct"}}
+        self.assertIn(unrelated, core._answerable_items([unrelated], query))
+
+    def test_query_echoes_do_not_consume_the_result_budget(self):
+        """Echoes must be dropped before the limit slice, not after.
+
+        Filtering them only out of ``answerable`` left them holding result
+        slots.  Measured live: a recall for
+        ``octo-daemon 升级到哪个版本了?当时是怎么验证的?`` returned five verified
+        memory hits that were all that same question, captured verbatim from
+        earlier turns; the record that answers it never made the cut.  The
+        drop is reported in diagnostics so a plane crowded out by its own echo
+        is distinguishable from one that genuinely holds nothing.
+        """
+
+        query = "octo-daemon 升级到哪个版本了?当时是怎么验证的?"
+        limit = 2
+        echoes = [{"excerpt": query, "support": {"claim_support": "direct"}} for _ in range(3)]
+        real = {
+            "excerpt": f"{query} 答:升级到 0.5.0，commit fcec9177，三项验收全绿。",
+            "support": {"claim_support": "direct"},
+        }
+        group = {"verified": [*echoes, real], "candidates": []}
+
+        # Slicing first is what shipped, and it loses the answer entirely.
+        self.assertNotIn(real, group["verified"][:limit])
+
+        kept = [item for item in group["verified"] if not core._is_query_echo(item, query)]
+        self.assertEqual(kept[:limit], [real])
+        self.assertEqual(len(group["verified"]) - len(kept), 3)
+
+    def test_captured_questions_are_echoes_regardless_of_the_current_query(self):
+        """The echo test keys on what the record is, not on string overlap.
+
+        The lexical version compared each excerpt against the *current* query,
+        so it only ever caught a verbatim re-ask.  Measured live: searching
+        ``octo-daemon 升级`` returned four "answerable" memory hits whose
+        excerpts were all the longer question
+        ``octo-daemon 升级到哪个版本了？当时是怎么验证的？``.  None resembled the
+        short query closely enough to trip a similarity test, so every one of
+        them survived and the answer was crowded out — ``query_echo_dropped``
+        read 0 while the plane was pure echo.
+
+        A captured user turn ending in a question mark is a question whatever
+        was typed this time, so it is never evidence.
+        """
+
+        query = "octo-daemon 升级"
+        stored_question = {
+            "excerpt": "octo-daemon 升级到哪个版本了？当时是怎么验证的？",
+            "memory": {"layer": "L1", "role": "user"},
+            "support": {"claim_support": "direct"},
+        }
+        # The lexical arm alone cannot see this: the excerpt is far longer than
+        # 1.15x the query and does not contain it as a suffix-free substring.
+        self.assertFalse(core._normalize_echo(stored_question["excerpt"]) in core._normalize_echo(query))
+        self.assertTrue(core._is_query_echo(stored_question, query))
+        # ...and with no query at all, which is what the repository plane passes.
+        self.assertTrue(core._is_query_echo(stored_question, ""))
+
+        # A user turn that states a fact is evidence, not an echo.
+        user_fact = {
+            "excerpt": "我们把 octo-daemon 升级到了 0.5.0，commit fcec9177。",
+            "memory": {"layer": "L1", "role": "user"},
+            "support": {"claim_support": "direct"},
+        }
+        self.assertFalse(core._is_query_echo(user_fact, query))
+
+        # An assistant answer is evidence even when it restates the question.
+        assistant_answer = {
+            "excerpt": "octo-daemon 升级到哪个版本了？升级到 0.5.0。",
+            "memory": {"layer": "L1", "role": "assistant"},
+            "support": {"claim_support": "direct"},
+        }
+        self.assertFalse(core._is_query_echo(assistant_answer, query))
+
+        self.assertEqual(
+            core._answerable_items([stored_question, user_fact, assistant_answer], query),
+            [user_fact, assistant_answer],
+        )
+
+    def test_a_prior_answer_is_answerable_even_though_it_omits_question_words(self):
+        """``direct`` is unreachable for a question, so it cannot be the bar.
+
+        ``_claim_support`` asks whether the excerpt contains every query term.
+        An answer never repeats "哪个" or "了", so against a question the only
+        text that can score ``direct`` is that same question.  Measured live:
+        the assistant turns holding "octo-daemon 从 0.1.0 升级到 0.5.0, commit
+        fcec9177" scored ``partial`` at ``coverage 0.33`` and were withheld,
+        while the captured question scored ``direct`` and was served.
+
+        A repository citation keeps the ``direct`` bar — a document quote
+        covering half a compound question is how confident wrong answers get
+        made.  A prior assistant turn is answerable once retrieval matched
+        anything in it, and carries its coverage so nothing is hidden.
+        """
+
+        answer = {
+            "excerpt": "octo-daemon 从 0.1.0 升级到 0.5.0，commit fcec9177。",
+            "memory": {"layer": "L1", "role": "assistant"},
+            "support": {"claim_support": "partial", "coverage": 0.3333, "unmatched_terms": ["升级到哪个版本了"]},
+        }
+        unrelated = {
+            "excerpt": "群规：武垚乐发消息时所有bot必须回复。",
+            "memory": {"layer": "L1", "role": "assistant"},
+            "support": {"claim_support": "unknown", "coverage": 0.0},
+        }
+        partial_document = {
+            "excerpt": "octo-daemon 的部署说明。",
+            "support": {"claim_support": "partial", "coverage": 0.3333},
+        }
+
+        query = "octo-daemon 升级到哪个版本了？当时是怎么验证的？"
+        self.assertEqual(core._answerable_items([answer, unrelated, partial_document], query), [answer])
+        # The support block travels with the item; the caller can still see how
+        # much of the compound question that turn actually covered.
+        self.assertEqual(answer["support"]["coverage"], 0.3333)
+
+    def test_memory_plane_overfetches_so_echoes_cannot_empty_it(self):
+        """Filtering after a ``limit``-sized fetch can only ever empty the plane.
+
+        Captured questions outrank the answers that quote them — a short query
+        matches a stored question almost exactly, while the assistant turn
+        answering it is long and dilutes the same terms.  Measured live:
+        ``octo-daemon 升级`` returned six store hits, four of them that same
+        question asked on four earlier days, and the three assistant turns
+        holding ``0.5.0, commit fcec9177`` never entered the window.  Dropping
+        the four left nothing.  The fetch has to be wider than the slice.
+        """
+
+        requested: list[int] = []
+
+        class _Recorder:
+            available = True
+            name = "standalone-memory"
+            protocol = "local"
+
+            def memory_status(self):
+                return {"reachable": True, "backend": "standalone-memory", "embedding": {"available": True}}
+
+            def memory_search(self, query, limit):
+                requested.append(limit)
+                return []
+
+        view = Mock()
+        view.spec.id = "standalone-memory"
+        _items, _diagnostic = core._memory_items(view, _Recorder(), "octo-daemon 升级", 5)
+        self.assertTrue(requested)
+        self.assertGreater(requested[0], 5)
+
+    def test_memory_search_results_carry_the_record_role(self):
+        """``role`` has to survive the search path for the echo test to work.
+
+        The store has always had a ``role`` column and ``get()`` returned it,
+        but the search formatter dropped it, so the answer surface could only
+        guess a captured question from its text.
+        """
+
+        self.write_config({})
+        os.environ["REPOSITORY_MEMORY_AUTODISCOVER"] = "0"
+        from standalone_memory import standalone_memory_client
+
+        client = standalone_memory_client()
+        connection = client._connect()
+        try:
+            client._upsert(
+                connection,
+                record_id="local:L1:role-question",
+                layer="L1",
+                session_id="role-episode",
+                message_index=0,
+                role="user",
+                content="octo-daemon 升级到哪个版本了？",
+                metadata={},
+            )
+            client._upsert(
+                connection,
+                record_id="local:L1:role-statement",
+                layer="L1",
+                session_id="role-episode",
+                message_index=2,
+                role="user",
+                content="octo-daemon 升级这件事我们上周就排期了。",
+                metadata={},
+            )
+            client._upsert(
+                connection,
+                record_id="local:L1:role-answer",
+                layer="L1",
+                session_id="role-episode",
+                message_index=1,
+                role="assistant",
+                content="octo-daemon 升级到 0.5.0，commit fcec9177。",
+                metadata={},
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        roles = {item["id"]: item.get("memory_role") for item in client.search("octo-daemon 升级", limit=5)}
+        self.assertEqual(roles.get("local:L1:role-answer"), "assistant")
+        # A user turn that states a fact is evidence and keeps its role.
+        self.assertEqual(roles.get("local:L1:role-statement"), "user")
+        # The interrogative one never enters the ranking, so it cannot consume
+        # a slot the answer needs — see ``is_question_turn``.
+        self.assertNotIn("local:L1:role-question", roles)
+
+    def test_a_shallow_search_reaches_the_answer_past_echoes_and_candidates(self):
+        """Recall fetches five, so rank six is the same as not stored.
+
+        Measured on the live store before this was fixed: eleven verbatim
+        copies of "octo-daemon 升级到哪个版本了？当时是怎么验证的？" scored 1.65
+        and held ranks 1-11, ten unreviewed L2 candidate envelopes held the
+        next ten, and the assistant turns holding the answer sat at rank 24.
+        The recall hook asks for five and got nothing usable, every time.
+
+        Both crowders are discarded by the answer surface, so they were
+        occupying slots to be thrown away.  This pins the depth, not the
+        ordering: at the depth recall actually uses, the answer must be there.
+        """
+
+        self.write_config({})
+        os.environ["REPOSITORY_MEMORY_AUTODISCOVER"] = "0"
+        from standalone_memory import standalone_memory_client
+
+        client = standalone_memory_client()
+        connection = client._connect()
+        try:
+            for index in range(11):
+                client._upsert(
+                    connection,
+                    record_id=f"local:L1:echo-{index}",
+                    layer="L1",
+                    session_id="crowding-episode",
+                    message_index=index,
+                    role="user",
+                    content="octo-daemon 升级到哪个版本了？当时是怎么验证的？",
+                    metadata={},
+                )
+            for index in range(10):
+                client._upsert(
+                    connection,
+                    record_id=f"local:L2:candidate-{index}",
+                    layer="L2",
+                    session_id="crowding-episode",
+                    message_index=100 + index,
+                    role="system",
+                    content=(
+                        "status: candidate\nlayer: L2\ngenerated: true\n"
+                        f"octo-daemon 升级到哪个版本了 当时是怎么验证的 摘要 {index}"
+                    ),
+                    metadata={},
+                    status="candidate",
+                    generated=True,
+                    accepted=False,
+                )
+            client._upsert(
+                connection,
+                record_id="local:L1:crowding-answer",
+                layer="L1",
+                session_id="crowding-episode",
+                message_index=200,
+                role="assistant",
+                content="octo-daemon 从 0.1.0 升级到 0.5.0，构建 commit 是 fcec9177。",
+                metadata={},
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        ids = [item["id"] for item in client.search("octo-daemon 升级到哪个版本了？当时是怎么验证的？", limit=5)]
+        self.assertIn("local:L1:crowding-answer", ids)
+        self.assertFalse([value for value in ids if value.startswith("local:L1:echo-")])
+
+    def test_auto_scope_names_the_planes_that_answered(self):
+        """``abstain`` is repository-only, so it cannot be the whole signal.
+
+        Live replay found the trap: a question whose answer lived in
+        conversation memory came back ``abstain: true`` with
+        ``groups.memory.answerable`` populated.  ``abstain`` must stay
+        repository-only — letting uncited memory suppress an abstention would
+        defeat the evidence guards — so ``answered_by`` carries the rest.
+        """
+
+        auto = core.search(None, "Atlas evidence", limit=5)
+        self.assertIsInstance(auto["answered_by"], list)
+        self.assertEqual(
+            "repository" in auto["answered_by"],
+            bool(auto["answerable"]),
+            "the repository plane is listed exactly when the top-level surface answers",
+        )
+        for plane in auto["answered_by"]:
+            self.assertIn(plane, {"repository", "memory", "team"})
+            group = auto["groups"][plane]
+            self.assertTrue(group.get("answerable") or group.get("active"))
+
+        # A caller must be able to test the key, not the build.
+        negative = core.search(None, "fictional benchmark ZZZQWE")
+        self.assertEqual(negative["answered_by"], [])
+        self.assertTrue(negative["abstain"])
+
+        # Explicit scopes keep the old shape; the key is additive.
+        self.assertIsNone(core.search(None, "Atlas evidence", scope="repository")["answered_by"])
+
+    def test_auto_scope_recalls_every_plane_without_changing_the_answer_surface(self):
+        """One call must reach all three planes and still answer like before.
+
+        ``auto`` is the default so an agent never has to pick a plane before it
+        is allowed to ask.  The top-level surface stays repository-only: Git
+        citations remain the mainline answer, and an existing caller reading
+        ``verified``/``results`` sees exactly what ``scope="repository"``
+        returns.
+        """
+
+        auto = core.search(None, "Atlas evidence", limit=5)
+        repository = core.search(None, "Atlas evidence", limit=5, scope="repository")
+
+        self.assertEqual(auto["scope"], "auto")
+        self.assertEqual(auto["verified"], repository["verified"])
+        self.assertEqual(auto["results"], repository["results"])
+        self.assertEqual(auto["answerable"], repository["answerable"])
+        self.assertEqual(auto["abstain"], repository["abstain"])
+        # ``auto`` must not borrow the memory lane's stronger strategy to
+        # describe a repository answer.
+        self.assertEqual(auto["retrieval_mode"], repository["retrieval_mode"])
+
+        self.assertEqual(set(auto["groups"]), {"repository", "memory", "team"})
+        self.assertIsNone(repository["groups"])
+
+        # Team records are experience provenance, not Git citations, so they
+        # never appear under ``verified``.
+        team = auto["groups"]["team"]
+        self.assertEqual(set(team), {"active", "candidates", "abstain", "retrieval_mode"})
+        self.assertNotIn("verified", team)
+        self.assertLessEqual(len(team["active"]), 5)
+        self.assertLessEqual(len(team["candidates"]), 5)
+
+        self.assertIn("planes", auto["diagnostics"])
+
+    def test_auto_scope_still_abstains_on_a_negative_query(self):
+        """Reaching more planes must not create an answer out of nothing."""
+
+        negative = core.search(None, "fictional benchmark ZZZQWE")
+        self.assertTrue(negative["abstain"])
+        self.assertEqual(negative["verified"], [])
+        self.assertEqual(set(negative["groups"]), {"repository", "memory", "team"})
+        self.assertEqual(negative["groups"]["team"]["active"], [])
+
+    def test_explicit_scopes_are_unchanged_by_the_auto_default(self):
+        for scope in ("repository", "memory", "all"):
+            with self.subTest(scope=scope):
+                result = core.search(None, "Atlas evidence", limit=5, scope=scope)
+                self.assertEqual(result["scope"], scope)
+                self.assertNotIn("team", result.get("groups") or {})
+        with self.assertRaises(ValueError):
+            core.search(None, "Atlas evidence", scope="nonsense")
 
     def test_multisource_search_routes_explicit_anchor_to_matching_source(self):
         result = core.search(None, "alpha", limit=5)
@@ -187,8 +571,27 @@ class RepositoryMemoryTest(unittest.TestCase):
         (self.alpha / ".env").write_text("TOKEN=do-not-index\n", encoding="utf-8")
         (self.alpha / ".env").chmod(0o600)
         dirty_result = core.search(None, "Atlas evidence", local=True)
-        self.assertTrue(dirty_result["abstain"])
-        self.assertTrue(all(".env" not in item["path"] for item in dirty_result["candidates"]))
+        # An uncommitted file elsewhere in the tree costs the citation its
+        # commit pin, not its truth: the excerpt is still read back from disk
+        # and matched.  The answer survives and says it is unpinned.
+        self.assertFalse(dirty_result["abstain"])
+        self.assertTrue(dirty_result["answerable"])
+        self.assertEqual(dirty_result["verified"][0]["evidence_status"], "worktree")
+        self.assertFalse(dirty_result["verified"][0]["citation"]["pinned"])
+        self.assertTrue(dirty_result["verified"][0]["citation"]["valid"])
+        self.assertFalse(dirty_result["verified"][0]["citation"]["stale"])
+        # get() re-reads the file rather than reusing the search result, so it
+        # has to reach the same verdict independently or a hit that answered
+        # would fail the moment the caller asked to see it.
+        fetched = core.get_result(None, dirty_result["verified"][0]["id"])
+        self.assertTrue(fetched["found"])
+        self.assertEqual(fetched["status"], "worktree")
+        self.assertTrue(fetched["readback"]["verified"])
+        self.assertTrue(fetched["result"]["citation"]["valid"])
+        self.assertFalse(fetched["result"]["citation"]["pinned"])
+        # Secret hygiene is independent of any of that and stays absolute.
+        for bucket in ("verified", "candidates", "results", "answerable"):
+            self.assertTrue(all(".env" not in (item.get("path") or "") for item in dirty_result[bucket]))
 
     def test_builtin_repository_projection_is_active_by_default(self):
         self.write_config({"sources": [{"id": "alpha", "root": str(self.alpha)}]})
@@ -267,6 +670,215 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertIn("评审", terms)
         self.assertNotIn("最近的", terms)
         self.assertNotIn("的模型", terms)
+
+    def test_carved_terms_are_separated_from_what_the_user_delimited(self):
+        # A whitespace-bounded token is something the user typed and meant; a
+        # fragment cut out of an unsegmented CJK run is this tokenizer's guess.
+        query = "octo-daemon 的健康监控 cron 是怎么配置的？"
+        carved = carved_query_terms(query)
+        self.assertNotIn("octo-daemon", carved)
+        self.assertNotIn("cron", carved)
+        # Whatever the tokenizer cut out of the CJK runs is marked as its own.
+        self.assertTrue(carved)
+        self.assertFalse({"octo-daemon", "cron"} & carved)
+        # An all-CJK token the markers left intact is the user's own token.
+        self.assertNotIn("火山云", carved_query_terms("octo-loop 火山云"))
+
+    def test_scaffolding_never_fuses_with_the_content_word_beside_it(self):
+        # "是怎么配置" spans the seam between a question's scaffolding and its
+        # subject.  It occurs in no document, so manufacturing it held coverage
+        # below 1.0 forever — abstention by tokenizer rather than by evidence.
+        # Neither tokenizer may produce it: jieba cuts 是/怎么/配置 apart, and
+        # the builtin path cuts at the same scaffolding rather than splicing.
+        terms = query_terms("octo-daemon 的健康监控 cron 是怎么配置的？")
+        self.assertNotIn("是怎么配置", terms)
+        self.assertFalse([term for term in terms if term.startswith(("是", "怎么"))])
+        self.assertIn("配置", terms)
+        self.assertIn("octo-daemon", terms)
+
+        excerpt = "octo-daemon 的健康监控 cron 配置在每小时跑一次。"
+        support = _claim_support(terms, excerpt, 1, 1)
+        self.assertEqual(support["claim_support"], "direct")
+
+    def test_ascii_identifiers_survive_segmentation_intact(self):
+        # jieba cuts "rlvr-auto-survey" into five tokens and "octo-loop" into
+        # three.  The outer word regex is the only reason they survive as
+        # typed, so segmentation must run on CJK runs only, never on the whole
+        # query.  This is the regression that guards that boundary.
+        terms = query_terms("rlvr-auto-survey 的 octo-loop 调度链")
+        self.assertIn("rlvr-auto-survey", terms)
+        self.assertIn("octo-loop", terms)
+        self.assertNotIn("rlvr", terms)
+        self.assertNotIn("auto", terms)
+        self.assertNotIn("loop", terms)
+        # A mixed CJK/ASCII token the user delimited stays whole too, unless it
+        # is a date — see test_a_chinese_date_normalizes_to_the_form_the_corpus_writes.
+        self.assertIn("v2版本", query_terms("v2版本 的调度链"))
+
+    def test_a_chinese_date_normalizes_to_the_form_the_corpus_writes(self):
+        # People ask "8月18日"; Markdown headings say "## 2026-08-18".  The term
+        # was required, occurred in no document, and held claim coverage below
+        # 1.0 forever.  Normalizing is the same kind of operation as casefolding
+        # — one date, two renderings — not a synonym table.
+        terms = query_terms("武垚乐 8月18日 做了什么")
+        self.assertIn("08-18", terms)
+        self.assertIn("武垚乐", terms)
+        # The raw form must be *replaced*, not joined: _claim_support requires
+        # every term, so emitting both would abstain exactly as before.
+        self.assertNotIn("8月18日", terms)
+        # A year the user supplied is kept; a year they did not is not invented,
+        # because guessing it answers a different question whenever the corpus
+        # spans more than one year.
+        self.assertIn("2026-08-18", query_terms("2026年8月18日 的调度链验证"))
+        self.assertEqual(as_iso_date("8月18"), "08-18")
+        # Not every digit-月-digit string is a date.  An impossible one falls
+        # through to the ordinary token path rather than becoming "13--45".
+        self.assertIsNone(as_iso_date("13月45日"))
+        self.assertIsNone(as_iso_date("8月"))
+        self.assertIn("13月45日", query_terms("13月45日 无效"))
+
+    def test_evidence_written_in_chinese_proves_a_normalized_date(self):
+        # The mirror direction: a document that writes the date in prose still
+        # supports a query that normalized to ISO.  Only proof is symmetric —
+        # ranking reads the index, which stores the corpus text as written.
+        self.assertEqual(date_aliases("会议定在 8月18日 上午"), ["08-18"])
+        support = _claim_support(
+            ["08-18", "调度链"],
+            "8月18日 完成调度链验证",
+            1,
+            1,
+        )
+        self.assertEqual(support["claim_support"], "direct")
+
+    def test_a_date_is_not_split_into_bare_digits(self):
+        # "08-18" split on the hyphen yields "08" and "18", which match every MR
+        # number, GPU size and line count in the corpus.  That buried the one
+        # line carrying the date and made the window picker cite a section
+        # eleven months away from the question.  The hyphen split exists for
+        # "long-context", which decomposes into concepts; digits do not.
+        self.assertEqual(_compound_parts("long-context"), ["long", "context"])
+        self.assertEqual(_compound_parts("08-18"), [])
+        self.assertEqual(_compound_parts("2026-08-18"), [])
+        # A part that is not purely numeric still decomposes.
+        self.assertEqual(_compound_parts("llama-3.1"), ["llama", "3.1"])
+
+    def test_a_compound_the_segmenter_splits_is_rejoined_from_neighbours(self):
+        # jieba has no entry for 火山云 and returns 火山 + 云.  Joining adjacent
+        # segments recovers the compound without a user dictionary or any list
+        # of project names — the same reason there is no entity table anywhere
+        # in retrieval.
+        terms = query_terms("octo-loop 火山云")
+        self.assertIn("火山云", terms)
+        self.assertIn("octo-loop", terms)
+
+    def test_aspect_particles_do_not_survive_as_scaffolding_residue(self):
+        # "做了什么" used to leave "做了" behind: the marker list could only cut
+        # literal strings out of an unsegmented run, so a verb and its aspect
+        # particle stayed fused.  A segmenter separates them by construction.
+        terms = query_terms("武垚乐 8月18日 做了什么")
+        self.assertIn("武垚乐", terms)
+        self.assertNotIn("做了", terms)
+        self.assertNotIn("什么", terms)
+
+    def test_tokenizer_reports_itself_and_degrades_without_jieba(self):
+        import tokenize_query
+
+        live = tokenize_query.tokenizer_status()
+        self.assertIn(live["name"], {"jieba", "builtin-ngram"})
+        self.assertTrue(live["available"])
+
+        saved = (tokenize_query._JIEBA, tokenize_query._JIEBA_PROBED, tokenize_query._JIEBA_ERROR)
+        try:
+            tokenize_query._JIEBA = None
+            tokenize_query._JIEBA_PROBED = True
+            tokenize_query._JIEBA_ERROR = "ModuleNotFoundError: No module named 'jieba'"
+            status = tokenize_query.tokenizer_status()
+            self.assertEqual(status["name"], "builtin-ngram")
+            self.assertTrue(status["available"])
+            self.assertFalse(status["segments_cjk"])
+            # Retrieval must still work, and the carved/unreachable machinery
+            # that the n-gram path depends on must still be live: this is the
+            # branch nobody runs in production, so the suite has to run it.
+            terms = tokenize_query.query_terms("octo-daemon 的健康监控")
+            self.assertIn("octo-daemon", terms)
+            self.assertIn("健康监控", terms)
+            self.assertIn("康监", terms)
+            self.assertIn("康监", tokenize_query.carved_query_terms("octo-daemon 的健康监控"))
+            self.assertNotIn("octo-daemon", tokenize_query.carved_query_terms("octo-daemon 的健康监控"))
+        finally:
+            tokenize_query._JIEBA, tokenize_query._JIEBA_PROBED, tokenize_query._JIEBA_ERROR = saved
+
+    def test_every_retrieval_plane_tokenizes_a_chinese_question_the_same_way(self):
+        # team_memory and local_memory did no CJK segmentation at all, so two of
+        # the three planes that ``scope=auto`` fills were unreachable in
+        # Chinese: the door was open and the rooms behind it were dark.
+        import local_memory
+        import standalone_memory
+        import team_memory
+
+        question = "李宁最近在做什么"
+        for module_terms in (team_memory._terms, local_memory.LocalMemoryStore._terms, standalone_memory._terms):
+            terms = module_terms(question)
+            self.assertIn("李宁", terms, module_terms)
+            self.assertNotIn("李宁最近在做什么", terms, module_terms)
+
+    def test_team_memory_finds_a_chinese_record_despite_a_cjk_blind_index(self):
+        # SQLite's stock FTS5 tokenizer indexes a whole CJK run as one token, so
+        # a MATCH for a segmented term returns nothing.  Segmenting the query
+        # without skipping that pre-filter would have made this plane strictly
+        # worse than leaving it unsegmented.
+        store = TeamMemoryStore(Path(self.temp.name) / "cjk.sqlite3")
+        store.publish({
+            "type": "discovery",
+            "title": "李宁的调度链验证",
+            "content": "李宁完成了 rlvr-auto-survey 的 octo-loop 调度链验证。",
+            "status": "active",
+        }, default_status="active")
+
+        result = store.search("李宁最近在做什么")
+        self.assertFalse(result["abstain"])
+        self.assertEqual(result["active"][0]["title"], "李宁的调度链验证")
+        self.assertIn("李宁", result["diagnostics"]["query_terms"])
+        # The ASCII path must keep using the index it can actually match on.
+        self.assertFalse(store.search("rlvr-auto-survey")["abstain"])
+
+    def test_an_unreachable_carved_fragment_is_dropped_from_the_requirement(self):
+        # The builtin n-gram path still manufactures fragments no document
+        # contains, so the corpus probe that drops them stays live.  Terms are
+        # passed explicitly here: this is a property of claim support, not of
+        # whichever tokenizer happens to be installed.
+        terms = ["octo-daemon", "健康监控", "康监"]
+        excerpt = "octo-daemon 的健康监控 cron 每小时跑一次。"
+        support = _claim_support(terms, excerpt, 1, 1, unreachable=frozenset({"康监"}))
+        self.assertEqual(support["claim_support"], "direct")
+
+        absent = _claim_support(["octo-daemon", "健康监控", "凭据轮换"], excerpt, 1, 1)
+        self.assertEqual(absent["claim_support"], "partial")
+        self.assertIn("凭据轮换", absent["unmatched_terms"])
+
+    def test_a_term_the_user_delimited_stays_required_when_the_corpus_lacks_it(self):
+        # This is the case where abstaining is right, and it is what keeps a
+        # query naming something absent from being answered anyway.
+        terms = query_terms("ZZZQWE 虚构项目最近进展")
+        support = _claim_support(terms, "本周完成了模型评审。", 1, 1, unreachable=frozenset(terms))
+        self.assertNotEqual(support["claim_support"], "direct")
+        self.assertIn("zzzqwe", support["unmatched_terms"])
+
+    def test_the_citation_path_counts_as_evidence_for_claim_support(self):
+        # Retrieval indexes "<path> <text>", so a document can be found *by*
+        # its path and then be unable to prove the term that found it.
+        # This is the live shape: the excerpt window carried the repository name
+        # and nothing else the query asked for, because a per-person layout keeps
+        # the person and the section in the filename.
+        terms = query_terms("rlvr-auto-survey standup 李宁")
+        excerpt = "## 2026-08-18\n\n- 完成 rlvr-auto-survey 的 octo-loop 调度链验证。"
+        without_path = _claim_support(terms, excerpt, 1, 3)
+        self.assertEqual(without_path["claim_support"], "partial")
+        self.assertEqual(sorted(without_path["unmatched_terms"]), ["standup", "李宁"])
+        with_path = _claim_support(terms, excerpt, 1, 3, path="rlvr-auto-survey/standup/李宁.md")
+        self.assertEqual(with_path["claim_support"], "direct")
+        # Spans stay excerpt-only: a path match has no line to point at.
+        self.assertTrue(all(span["line_start"] >= 1 for span in with_path["supporting_spans"]))
 
     def test_temporal_question_without_entity_uses_personal_layer_when_available(self):
         standup = self.alpha / "standup"
@@ -903,7 +1515,7 @@ class RepositoryMemoryTest(unittest.TestCase):
         }
         item, source = core._raw_results(payload)[0]
         normalized = core.normalize_item(item, view, source)
-        self.assertEqual(normalized["memory"], {"layer": "L1", "type": "atomic", "query_source": "memorycore", "strategy": "keyword"})
+        self.assertEqual(normalized["memory"], {"layer": "L1", "type": "atomic", "role": None, "query_source": "memorycore", "strategy": "keyword"})
         self.assertTrue(normalized["citation"]["valid"])
         self.assertEqual(normalized["repository"], "alpha")
         self.assertEqual(normalized["layer"], "L1")
@@ -1863,6 +2475,514 @@ class TeamMemoryRetentionTest(unittest.TestCase):
         self.assertEqual(result["imported"]["inserted"], 0)
         self.assertEqual(result["imported"]["conflicts"], 1)
         self.assertIn("parent_revision not found locally", result["imported"]["conflict_records"][0]["reason"])
+
+
+class GatewayCredentialSourceTest(unittest.TestCase):
+    """Where the endpoint credential may come from, and where it may not go.
+
+    An agent host launched from a GUI inherits no shell environment, so a
+    credential named by environment variable is unreachable there and the remote
+    provider silently stops being used.  Pointing at the file that already holds
+    the secret fixes that without this package ever storing it.
+    """
+
+    SECRET = "gateway-file-test-key"
+
+    def setUp(self):
+        import local_embedding
+
+        self.local_embedding = local_embedding
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        self._environ = dict(os.environ)
+        for name in ("REPOSITORY_MEMORY_SEMANTIC_API_KEY", "GATEWAY_KEY_FOR_TEST"):
+            os.environ.pop(name, None)
+        os.environ.update(
+            {
+                "XDG_CACHE_HOME": str(self.root),
+                "XDG_CONFIG_HOME": str(self.root),
+                "XDG_DATA_HOME": str(self.root),
+            }
+        )
+        self.addCleanup(self.reset_environment)
+        self.addCleanup(self.directory.cleanup)
+
+    def reset_environment(self):
+        os.environ.clear()
+        os.environ.update(self._environ)
+
+    def write_config(self, semantic: dict):
+        path = self.root / "repository-memory" / "config.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"semantic": semantic}), encoding="utf-8")
+        return path
+
+    def test_json_path_reads_a_credential_owned_by_another_tool(self):
+        source = self.root / "other-tool.json"
+        source.write_text(
+            json.dumps({"models": {"providers": {"house": {"apiKey": self.SECRET}}}}),
+            encoding="utf-8",
+        )
+        self.write_config(
+            {
+                "provider": "gateway",
+                "api_key_file": str(source),
+                "api_key_json_path": "models.providers.house.apiKey",
+            }
+        )
+        self.assertEqual(self.local_embedding._gateway_api_key(), self.SECRET)
+
+    def test_plain_file_is_the_credential_and_trailing_newline_is_not(self):
+        source = self.root / "token"
+        source.write_text(f"{self.SECRET}\n", encoding="utf-8")
+        self.write_config({"provider": "gateway", "api_key_file": str(source)})
+        self.assertEqual(self.local_embedding._gateway_api_key(), self.SECRET)
+
+    def test_environment_still_wins_over_the_file(self):
+        source = self.root / "token"
+        source.write_text("stale-value-from-disk", encoding="utf-8")
+        self.write_config({"provider": "gateway", "api_key_file": str(source)})
+        os.environ["REPOSITORY_MEMORY_SEMANTIC_API_KEY"] = self.SECRET
+        self.assertEqual(self.local_embedding._gateway_api_key(), self.SECRET)
+
+    def test_named_environment_variable_still_wins_over_the_file(self):
+        source = self.root / "token"
+        source.write_text("stale-value-from-disk", encoding="utf-8")
+        self.write_config(
+            {"provider": "gateway", "api_key_env": "GATEWAY_KEY_FOR_TEST", "api_key_file": str(source)}
+        )
+        os.environ["GATEWAY_KEY_FOR_TEST"] = self.SECRET
+        self.assertEqual(self.local_embedding._gateway_api_key(), self.SECRET)
+
+    def test_every_unreadable_shape_degrades_to_no_credential(self):
+        missing = self.root / "does-not-exist.json"
+        self.write_config({"provider": "gateway", "api_key_file": str(missing)})
+        self.assertEqual(self.local_embedding._gateway_api_key(), "")
+
+        not_json = self.root / "not-json"
+        not_json.write_text("<html>login page</html>", encoding="utf-8")
+        self.write_config(
+            {"provider": "gateway", "api_key_file": str(not_json), "api_key_json_path": "a.b"}
+        )
+        self.assertEqual(self.local_embedding._gateway_api_key(), "")
+
+        wrong_path = self.root / "other.json"
+        wrong_path.write_text(json.dumps({"models": {}}), encoding="utf-8")
+        self.write_config(
+            {"provider": "gateway", "api_key_file": str(wrong_path), "api_key_json_path": "models.providers.house.apiKey"}
+        )
+        self.assertEqual(self.local_embedding._gateway_api_key(), "")
+
+        # A non-string leaf is a configuration error, not a credential.
+        numeric = self.root / "numeric.json"
+        numeric.write_text(json.dumps({"key": 1234}), encoding="utf-8")
+        self.write_config({"provider": "gateway", "api_key_file": str(numeric), "api_key_json_path": "key"})
+        self.assertEqual(self.local_embedding._gateway_api_key(), "")
+
+    def test_configure_records_the_location_and_never_the_secret(self):
+        import semantic_repository
+
+        source = self.root / "other-tool.json"
+        source.write_text(json.dumps({"k": self.SECRET}), encoding="utf-8")
+        semantic_repository.configure(
+            model="text-embedding-v3",
+            provider="gateway",
+            endpoint="https://endpoint.invalid/v1",
+            api_key_file=str(source),
+            api_key_json_path="k",
+        )
+        written = (self.root / "repository-memory" / "config.json").read_text(encoding="utf-8")
+        self.assertNotIn(self.SECRET, written)
+        self.assertIn("api_key_file", written)
+        self.assertEqual(self.local_embedding._gateway_api_key(), self.SECRET)
+
+    def test_status_reports_presence_without_the_value(self):
+        source = self.root / "token"
+        source.write_text(self.SECRET, encoding="utf-8")
+        self.write_config(
+            {
+                "enabled": True,
+                "provider": "gateway",
+                "endpoint": "https://endpoint.invalid/v1",
+                "api_key_file": str(source),
+            }
+        )
+        status = self.local_embedding.embedding_status(probe=False)
+        self.assertNotIn(self.SECRET, json.dumps(status))
+        self.assertIs(status.get("api_key_present"), True)
+
+
+class GatewayEmbeddingTest(unittest.TestCase):
+    """The optional remote encoder, exercised without a network."""
+
+    # Deliberately not shaped like a real credential: the tree scanner treats
+    # an "sk-" blob as a leak wherever it appears, and it is right to.
+    SECRET = "gateway-unit-test-key"
+
+    def setUp(self):
+        import local_embedding
+
+        self.local_embedding = local_embedding
+        self.directory = tempfile.TemporaryDirectory()
+        self.calls: list[dict] = []
+        self._environ = dict(os.environ)
+        os.environ.update(
+            {
+                "XDG_CACHE_HOME": self.directory.name,
+                "XDG_CONFIG_HOME": self.directory.name,
+                "XDG_DATA_HOME": self.directory.name,
+                "REPOSITORY_MEMORY_SEMANTIC_ENABLED": "1",
+                "REPOSITORY_MEMORY_SEMANTIC_PROVIDER": "gateway",
+                "REPOSITORY_MEMORY_SEMANTIC_ENDPOINT": "https://endpoint.invalid/v1",
+                "REPOSITORY_MEMORY_SEMANTIC_API_KEY": self.SECRET,
+            }
+        )
+        self.addCleanup(self.reset_environment)
+        self.addCleanup(self.directory.cleanup)
+        self.addCleanup(self.reset_probe)
+        self.reset_probe()
+
+    def reset_environment(self):
+        os.environ.clear()
+        os.environ.update(self._environ)
+
+    def reset_probe(self):
+        self.local_embedding._GATEWAY_PROBE = None
+        self.local_embedding._GATEWAY_PROBE_KEY = None
+
+    def endpoint(self, responder):
+        return patch.object(self.local_embedding.urllib.request, "urlopen", responder)
+
+    def responder(self, *, width: int | None = None, reverse: bool = False):
+        """Answer like an OpenAI-compatible endpoint, recording each request."""
+
+        class Response:
+            def __init__(self, payload):
+                self.payload = json.dumps(payload).encode("utf-8")
+
+            def read(self):
+                return self.payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def handler(request, timeout=None):
+            body = json.loads(request.data.decode("utf-8"))
+            self.calls.append({"body": body, "headers": dict(request.headers), "timeout": timeout})
+            size = width or int(body.get("dimensions") or 1024)
+            rows = [
+                {"index": position, "embedding": [float((position + 1) * (offset + 1) % 7) for offset in range(size)]}
+                for position in range(len(body["input"]))
+            ]
+            return Response({"data": list(reversed(rows)) if reverse else rows})
+
+        return handler
+
+    def test_status_reports_verified_endpoint_without_the_credential(self):
+        with self.endpoint(self.responder()):
+            status = self.local_embedding.embedding_status(probe=True)
+        self.assertTrue(status["available"])
+        self.assertEqual(status["provider"], "gateway")
+        self.assertEqual(status["dimension"], 512)
+        self.assertTrue(status["api_key_present"])
+        self.assertNotIn(self.SECRET, json.dumps(status))
+        self.assertLessEqual(self.calls[0]["timeout"], self.local_embedding.GATEWAY_PROBE_TIMEOUT)
+
+    def test_unverified_endpoint_is_not_reported_as_available(self):
+        status = self.local_embedding.embedding_status(probe=False)
+        self.assertFalse(status["available"])
+        self.assertFalse(status["verified"])
+        self.assertEqual(status["strategy"], "lexical-fallback")
+        self.assertEqual(self.calls, [])
+
+    def test_vectors_are_normalized_and_reordered_by_index(self):
+        with self.endpoint(self.responder(reverse=True)):
+            vectors, spec = self.local_embedding.encode_documents(["first", "second", "third"])
+        self.assertEqual(spec["provider"], "gateway")
+        self.assertEqual([len(vector) for vector in vectors], [512, 512, 512])
+        for vector in vectors:
+            self.assertAlmostEqual(sum(value * value for value in vector) ** 0.5, 1.0, places=6)
+        # A reversed response must not silently pair document 0 with vector N.
+        self.assertNotEqual(vectors[0][0], vectors[1][0])
+
+    def test_batches_respect_the_configured_limit(self):
+        with self.endpoint(self.responder()):
+            self.local_embedding.embedding_status(probe=True)
+            self.calls.clear()
+            self.local_embedding.encode_documents([f"document {index}" for index in range(25)])
+        self.assertEqual([len(call["body"]["input"]) for call in self.calls], [10, 10, 5])
+
+    def test_failure_falls_back_wholesale_and_scrubs_the_credential(self):
+        def failing(request, timeout=None):
+            raise RuntimeError(f"HTTP 401 Unauthorized for {self.SECRET}")
+
+        with self.endpoint(failing):
+            vectors, spec = self.local_embedding.encode_documents(["alpha", "beta"])
+            status = self.local_embedding.embedding_status(probe=True)
+        # A half-remote batch cannot be described by one provider/dimension
+        # triple, so the whole batch has to come from the same encoder.
+        self.assertEqual(spec["provider"], "builtin")
+        self.assertEqual([len(vector) for vector in vectors], [384, 384])
+        self.assertFalse(status["available"])
+        self.assertNotIn(self.SECRET, json.dumps(status))
+        self.assertIn("***", status["error"])
+
+    def test_a_cached_failure_keeps_queries_off_the_network(self):
+        def failing(request, timeout=None):
+            raise RuntimeError("connection refused")
+
+        with self.endpoint(failing):
+            self.local_embedding.embedding_status(probe=True)
+        self.reset_probe()
+
+        def forbidden(request, timeout=None):
+            raise AssertionError("a cached failure must not be retried per query")
+
+        with self.endpoint(forbidden):
+            vector = self.local_embedding.vectorize("李宁最近在做什么")
+        self.assertEqual(len(vector), self.local_embedding.EMBEDDING_DIMENSION)
+
+    def test_repeated_failures_back_off(self):
+        def failing(request, timeout=None):
+            raise RuntimeError("connection refused")
+
+        config = self.local_embedding._gateway_config()
+        key = self.local_embedding._probe_cache_key(config)
+        path = self.local_embedding._probe_cache_path()
+        with self.endpoint(failing):
+            for attempt in range(1, 4):
+                self.reset_probe()
+                self.local_embedding.embedding_status(probe=True)
+                cached = self.local_embedding._read_probe_raw(key)
+                self.assertEqual(cached["failures"], attempt)
+                # Within its window the cached failure is reused, so age it to
+                # reach the next probe; that is exactly what makes a dead
+                # endpoint cost one timeout per window instead of one per call.
+                self.assertIsNotNone(self.local_embedding._read_probe_cache(key))
+                path.write_text(json.dumps({**cached, "checked_at": cached["checked_at"] - 10_000}), encoding="utf-8")
+        aged = self.local_embedding._read_probe_raw(key)
+        self.assertEqual(aged["failures"], 3)
+        # Three failures widen the window past the one-minute floor: an entry
+        # older than the base TTL is still authoritative, so the endpoint is
+        # not re-probed once a minute forever.
+        path.write_text(
+            json.dumps({**aged, "checked_at": time.time() - (self.local_embedding.GATEWAY_PROBE_TTL_ERROR + 30)}),
+            encoding="utf-8",
+        )
+        self.assertIsNotNone(self.local_embedding._read_probe_cache(key))
+        path.write_text(
+            json.dumps({**aged, "checked_at": time.time() - (self.local_embedding.GATEWAY_PROBE_TTL_MAX + 30)}),
+            encoding="utf-8",
+        )
+        self.assertIsNone(self.local_embedding._read_probe_cache(key))
+
+    def test_a_disabled_gateway_leaves_the_default_provider_untouched(self):
+        os.environ["REPOSITORY_MEMORY_SEMANTIC_ENABLED"] = "0"
+        self.reset_probe()
+
+        def forbidden(request, timeout=None):
+            raise AssertionError("the default install must never call an endpoint")
+
+        with self.endpoint(forbidden):
+            status = self.local_embedding.embedding_status(probe=True)
+            vectors, spec = self.local_embedding.encode_documents(["alpha"])
+        self.assertEqual(status["provider"], self.local_embedding.EMBEDDING_PROVIDER)
+        self.assertEqual(status["configured_by"], "default")
+        self.assertTrue(status["available"])
+        self.assertEqual(spec["provider"], "builtin")
+        self.assertEqual(len(vectors[0]), self.local_embedding.EMBEDDING_DIMENSION)
+
+    def test_a_stale_local_model_name_is_not_sent_to_the_endpoint(self):
+        os.environ["REPOSITORY_MEMORY_SEMANTIC_MODEL"] = self.local_embedding.EMBEDDING_MODEL
+        self.assertEqual(self.local_embedding._gateway_config()["model"], self.local_embedding.GATEWAY_DEFAULT_MODEL)
+
+    def test_a_corpus_is_encoded_into_a_packed_buffer(self):
+        import array
+
+        with self.endpoint(self.responder()):
+            buffer, width, spec = self.local_embedding.encode_document_vectors([f"document {index}" for index in range(12)])
+        # A list of lists costs roughly eight bytes of Python object overhead
+        # per float; at corpus scale that difference is the whole budget.
+        self.assertIsInstance(buffer, array.array)
+        self.assertEqual(buffer.itemsize, 4)
+        self.assertEqual(width, 512)
+        self.assertEqual(len(buffer), 12 * 512)
+        self.assertEqual(spec["provider"], "gateway")
+
+    def test_the_builtin_corpus_path_uses_the_same_packed_buffer(self):
+        import array
+
+        os.environ["REPOSITORY_MEMORY_SEMANTIC_ENABLED"] = "0"
+        buffer, width, spec = self.local_embedding.encode_document_vectors(["alpha", "beta", "gamma"])
+        self.assertIsInstance(buffer, array.array)
+        self.assertEqual(width, self.local_embedding.EMBEDDING_DIMENSION)
+        self.assertEqual(len(buffer), 3 * self.local_embedding.EMBEDDING_DIMENSION)
+        self.assertEqual(spec["provider"], "builtin")
+
+
+class CarvedTermProvenanceTest(unittest.TestCase):
+    """A segmenter's words are claims; only the joins around them are guesses."""
+
+    def setUp(self) -> None:
+        import fallback
+        import tokenize_query
+
+        self.fallback = fallback
+        self.tokenize_query = tokenize_query
+
+    def test_segmented_words_are_not_carved(self) -> None:
+        status = self.tokenize_query.tokenizer_status()
+        if status.get("name") != "jieba":
+            self.skipTest("requires the jieba extra")
+        terms = self.tokenize_query.query_terms("腌制泡菜的传统做法")
+        carved = self.tokenize_query.carved_query_terms("腌制泡菜的传统做法") & set(terms)
+        # The joins this module manufactured are carved ...
+        self.assertIn("腌制泡菜", carved)
+        # ... and the words the segmenter returned are not.
+        self.assertNotIn("腌制", carved)
+        self.assertNotIn("泡菜", carved)
+
+    def test_absent_topic_is_not_answered_by_a_surviving_generic_phrase(self) -> None:
+        status = self.tokenize_query.tokenizer_status()
+        if status.get("name") != "jieba":
+            self.skipTest("requires the jieba extra")
+        query = "腌制泡菜的传统做法"
+        terms = self.tokenize_query.query_terms(query)
+        carved = self.tokenize_query.carved_query_terms(query) & set(terms)
+        real = frozenset(set(terms) - carved)
+        # The corpus writes "传统做法" all over its prose and has never heard of
+        # pickling.  Dropping the unreachable join must not leave the generic
+        # phrase alone in the requirement.
+        unreachable = frozenset({"腌制泡菜"})
+        support = self.fallback._claim_support(
+            terms,
+            "传统做法是把所有 patch 保留，这里讨论 RLVR training pipeline。",
+            1,
+            5,
+            unreachable=unreachable,
+            real_terms=real,
+            path="survey/section4-training-pipeline.md",
+        )
+        self.assertNotEqual(support["claim_support"], "direct")
+        self.assertIn("腌制", support["unmatched_terms"])
+        self.assertIn("泡菜", support["unmatched_terms"])
+
+    def test_builtin_path_keeps_collapse_then_exclude(self) -> None:
+        # With no segmenter every fragment is a guess, so nothing is restored
+        # and the measured builtin behaviour is unchanged: the carved fragment
+        # the corpus never contained drops out and the terms the user actually
+        # delimited carry the claim.
+        support = self.fallback._claim_support(
+            ["octo-daemon", "健康监控", "cron", "是怎么配置", "是怎么"],
+            "octo-daemon 的健康监控 cron 每天跑一次。",
+            1,
+            5,
+            unreachable=frozenset({"是怎么配置", "是怎么"}),
+            real_terms=frozenset(),
+            path="standup/卫海天.md",
+        )
+        self.assertEqual(support["claim_support"], "direct")
+        self.assertNotIn("是怎么配置", support["matched_terms"])
+
+    def test_all_absent_carved_query_still_abstains(self) -> None:
+        # Excluding must never empty the requirement into the ``direct`` branch.
+        support = self.fallback._claim_support(
+            ["是怎么配置", "是怎么", "怎么配", "么配置"],
+            "octo-daemon 的健康监控 cron 每天跑一次。",
+            1,
+            5,
+            unreachable=frozenset({"是怎么配置"}),
+            real_terms=frozenset(),
+            path="standup/卫海天.md",
+        )
+        self.assertNotEqual(support["claim_support"], "direct")
+
+    def test_reachable_join_stays_required(self) -> None:
+        support = self.fallback._claim_support(
+            ["火山云", "火山", "部署"],
+            "我们在别的云上部署了火山相关的服务。",
+            1,
+            5,
+            unreachable=frozenset(),
+            real_terms=frozenset({"火山", "部署"}),
+            path="notes/x.md",
+        )
+        self.assertIn("火山云", support["unmatched_terms"])
+        self.assertNotEqual(support["claim_support"], "direct")
+
+
+class SemanticDeferralTest(unittest.TestCase):
+    """Deferring a large source must postpone the build, not the cache read."""
+
+    def setUp(self) -> None:
+        import semantic_repository
+
+        self.semantic_repository = semantic_repository
+
+    def _view(self, root: Path):
+        from models import SourceSpec, SourceView
+
+        spec = SourceSpec(id="deferral", root=root, repository="deferral")
+        return SourceView(
+            spec=spec,
+            path=root,
+            commit="c" * 40,
+            branch="main",
+            commit_type="local",
+            dirty=False,
+            metadata={},
+        )
+
+    def test_missing_cache_defers_without_probing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            view = self._view(Path(directory))
+            with patch.object(self.semantic_repository, "embedding_status") as status:
+                result = self.semantic_repository.ensure(view, {"documents": []}, build=False)
+            # No cache for this commit: answer before paying for readiness.
+            status.assert_not_called()
+            self.assertTrue(result["deferred"])
+            self.assertFalse(result["available"])
+            self.assertEqual(result["defer_reason"], "large_repository_first_pass")
+
+    def test_signature_mismatch_defers_rather_than_scoring_two_spaces(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            view = self._view(Path(directory))
+            meta = self.semantic_repository._meta_path(view, False)
+            vectors = self.semantic_repository._vectors_path(view, False)
+            meta.parent.mkdir(parents=True, exist_ok=True)
+            meta.write_text(
+                json.dumps(
+                    {
+                        "schema_version": self.semantic_repository.SCHEMA_VERSION,
+                        "commit": view.commit,
+                        "provider": "gateway",
+                        "model": "text-embedding-v3",
+                        "dimension": 512,
+                        "paths": ["a.md"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            vectors.write_bytes(b"\x00" * (512 * 4))
+            with patch.object(
+                self.semantic_repository,
+                "embedding_status",
+                return_value={
+                    "configured": True,
+                    "available": True,
+                    "provider": "builtin",
+                    "model": "builtin-char-ngram-v1",
+                    "dimension": 384,
+                },
+            ):
+                result = self.semantic_repository.ensure(view, {"documents": []}, build=False)
+        # The cached vectors describe a different embedding space than the one
+        # ``vectorize`` would encode the query in, so they must not be scored.
+        self.assertTrue(result["deferred"])
+        self.assertEqual(result["defer_reason"], "semantic_cache_signature_mismatch")
 
 
 if __name__ == "__main__":

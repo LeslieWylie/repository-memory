@@ -70,3 +70,112 @@ def test_team_repository_export_is_idempotent_and_hydrates(tmp_path, monkeypatch
     health = team_repository_health(str(repository))
     assert health["configured"] is True
     assert health["reachable"] is True
+
+
+def test_publish_matches_existing_idempotency_key_under_a_changed_id_scheme(tmp_path):
+    """A re-publish must return a duplicate receipt, not an IntegrityError.
+
+    ``idempotency_key`` is UNIQUE.  Records written under an earlier id scheme
+    still own their key, so matching on the id alone raised
+    ``sqlite3.IntegrityError`` out of ``publish`` and aborted the caller's whole
+    turn capture.
+    """
+
+    backend = SQLiteTeamMemoryBackend(tmp_path / "team.sqlite3", node_id="test-node")
+    legacy = backend.publish(
+        {
+            # The legacy id scheme hashed type/title/content instead of
+            # carrying the canonical central id.
+            "id": "team:discovery:legacyhash0000",
+            "type": "discovery",
+            "title": "Legacy hydrated record",
+            "content": "Imported before the canonical id scheme changed.",
+            "status": "candidate",
+            "idempotency_key": "central:team_l1_collision",
+        }
+    )
+    assert legacy["ok"] is True
+    assert legacy["duplicate"] is False
+
+    rehydrated = backend.publish(
+        {
+            "id": "team:central:team_l1_collision",
+            "type": "discovery",
+            "title": "Legacy hydrated record",
+            "content": "Imported before the canonical id scheme changed.",
+            "status": "candidate",
+            "idempotency_key": "central:team_l1_collision",
+        }
+    )
+    assert rehydrated["ok"] is True
+    assert rehydrated["duplicate"] is True
+    assert rehydrated["memory"]["id"] == "team:discovery:legacyhash0000"
+
+
+def test_import_counts_rejected_records_instead_of_aborting(tmp_path, monkeypatch):
+    """One unusable canonical file must not stop the rest of the hydration."""
+
+    repository = tmp_path / "team-data"
+    active = repository / "knowledge/team-memory/l1/active"
+    active.mkdir(parents=True)
+    (repository / "knowledge/team-memory/README.md").write_text("# Shared Team Memory\n", encoding="utf-8")
+    monkeypatch.setenv("REPOSITORY_MEMORY_TEAM_DB", str(tmp_path / "team.sqlite3"))
+    monkeypatch.setenv("REPOSITORY_MEMORY_CONFIG", str(tmp_path / "config.json"))
+
+    def write(name: str, central_id: str, kind: str) -> None:
+        (active / name).write_text(
+            "---\n"
+            f"id: {central_id}\n"
+            f"kind: {kind}\n"
+            "status: active\n"
+            "confidence: 0.5\n"
+            "---\n\n"
+            f"# {central_id}\n\n"
+            "## Summary\n\nSummary line.\n\n"
+            "## Content\n\nReusable content body.\n",
+            encoding="utf-8",
+        )
+
+    # ``scenario`` is not part of the team memory type vocabulary.
+    write("bad.md", "team_l2_unsupported", "scenario")
+    write("good.md", "team_l1_supported", "discovery")
+    configure_team_repository(str(repository), auto_sync=True, agent_id="yaole")
+
+    result = import_team_memory(include_candidates=False)
+    assert result["ok"] is True
+    assert result["imported"] == 1
+    assert result["failed"] == 1
+
+
+def test_import_hydrates_stale_canonical_records_as_candidates(tmp_path, monkeypatch):
+    """Canonical ``stale`` records are reviewable candidates, not hard errors."""
+
+    repository = tmp_path / "team-data"
+    stale = repository / "knowledge/team-memory/l1/stale"
+    stale.mkdir(parents=True)
+    (repository / "knowledge/team-memory/README.md").write_text("# Shared Team Memory\n", encoding="utf-8")
+    monkeypatch.setenv("REPOSITORY_MEMORY_TEAM_DB", str(tmp_path / "team.sqlite3"))
+    monkeypatch.setenv("REPOSITORY_MEMORY_CONFIG", str(tmp_path / "config.json"))
+    (stale / "stale.md").write_text(
+        "---\n"
+        "id: team_l1_stale\n"
+        "kind: discovery\n"
+        "status: stale\n"
+        "confidence: 0.5\n"
+        "---\n\n"
+        "# team_l1_stale\n\n"
+        "## Summary\n\nSummary line.\n\n"
+        "## Content\n\nReusable content body.\n",
+        encoding="utf-8",
+    )
+    configure_team_repository(str(repository), auto_sync=True, agent_id="yaole")
+
+    result = import_team_memory(include_candidates=False)
+    assert result["ok"] is True
+    assert result["imported"] == 1
+    assert result["failed"] == 0
+
+    backend = SQLiteTeamMemoryBackend(tmp_path / "team.sqlite3", node_id="test-node")
+    record = backend.get("team:central:team_l1_stale")["result"]
+    assert record["status"] == "candidate"
+    assert record["provenance"]["canonical_status"] == "stale"

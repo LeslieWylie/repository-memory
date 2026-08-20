@@ -27,8 +27,15 @@ class DeliveryContractTest(unittest.TestCase):
         os.environ["REPOSITORY_MEMORY_CONFIG"] = str(root / "config.json")
         self.repo = root / "knowledge"
         (self.repo / "docs").mkdir(parents=True)
-        (self.repo / "README.md").write_text("citation-first repository memory\n", encoding="utf-8")
+        # Every path the public qrels cite has to exist here: the audit this
+        # test asserts on resolves gold paths against the repository it is
+        # given, so the fixture's file set is a function of the gold set, not
+        # of what any single query needs to retrieve.
+        (self.repo / "README.md").write_text("citation-first repository memory\nmemory_publish and memory_supersede lifecycle\n", encoding="utf-8")
         (self.repo / "docs" / "architecture.md").write_text("MCP transport and separate memory groups\n", encoding="utf-8")
+        (self.repo / "docs" / "quickstart.md").write_text("publish reusable team knowledge and supersede an outdated record\n", encoding="utf-8")
+        (self.repo / "CHANGELOG.md").write_text("guard audit is the default and enforce is opt-in\nsemantic configure --provider and --dimensions\nGitHub Actions coverage for Python 3.10, 3.12, and 3.13\n", encoding="utf-8")
+        (self.repo / "SECURITY.md").write_text("the OpenClaw guard is audit-first by default\n", encoding="utf-8")
         subprocess.run(["git", "init", "-q", "-b", "main", str(self.repo)], check=True)
         subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
         subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "fixture"], check=True)

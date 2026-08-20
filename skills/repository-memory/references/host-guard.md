@@ -7,8 +7,14 @@ tool with a similar name.
 For a repository-fact request, the preferred sequence is:
 
 ```text
-memory_doctor → memory_context (or memory_search(scope=repository)) → memory_get
+memory_search → memory_get
 ```
+
+`memory_search` defaults to `scope="auto"`, which recalls repository evidence,
+conversation memory, and Team Memory in their own planes and returns them as
+separate groups. A `memory_doctor` call is not a required preamble: ask first,
+and call doctor/sync only when the response reports the source as
+`not_configured` or stale.
 
 When the host adds a namespace to MCP names, use that namespaced name. A bare
 `memory_search` is not interchangeable with the repository-memory server.

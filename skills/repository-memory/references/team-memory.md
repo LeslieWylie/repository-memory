@@ -78,9 +78,14 @@ original `author_agent`.
 
 ## Context hydration
 
-Call `memory_context` at task start when prior agent work may matter. It runs
-repository retrieval and Team Memory retrieval in their own ranking planes and
-returns a single package with these sections:
+Team Memory is recalled automatically: `memory_search` defaults to
+`scope="auto"` and returns a `team` group alongside `repository` and `memory`.
+That group holds `active` and `candidates` separately, each bounded by `limit`.
+Team records are experience provenance, not Git citations, so they are
+deliberately absent from `verified` — never present one as a source citation.
+
+The lower-level `memory_context` remains available in the CLI (`context`) for
+callers that want the Team Memory sections split by type:
 
 - `repository_evidence`: source-backed, commit/path/line citations;
 - `decisions`, `failures`, `solutions`, `discoveries`, `handoffs`:

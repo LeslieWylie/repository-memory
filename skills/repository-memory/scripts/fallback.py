@@ -13,6 +13,7 @@ from typing import Any
 
 from citation import locate
 from local_embedding import cosine, vectorize
+from tokenize_query import carved_query_terms, date_aliases, query_terms
 
 from models import SourceView
 
@@ -23,12 +24,14 @@ EXTENSIONS = {".md", ".mdx", ".txt", ".rst", ".yaml", ".yml", ".json"}
 SECRET_NAME = re.compile(r"(^|/)(\.env(?:\.|$)|.*\.(?:pem|key|p12|pfx|secret|secrets?))$", re.IGNORECASE)
 SECRET_CONTENT = re.compile(r"-----BEGIN .*PRIVATE KEY-----|(?:api[_-]?key|access[_-]?token|password|secret)\s*[:=]\s*['\"]?[A-Za-z0-9_\-/.+=]{16,}|\bsk-[A-Za-z0-9_-]{16,}", re.IGNORECASE)
 DATE_RE = re.compile(r"20\d{2}[-/]\d{1,2}(?:[-/]\d{1,2})?|20\d{2}-W\d{1,2}", re.IGNORECASE)
-GENERIC_SUPPORT_TERMS = {"note", "report", "weekly", "paper", "model", "card", "update", "result"}
-QUERY_BOUNDARY = re.compile(r"最近|最新|上次|之前|以前|历史|目前|当前|本周|本月|今天|昨天|正在|在做|在干|做什么|干什么|干啥|干嘛|进展|情况")
-QUERY_STOP_TERMS = {
-    "最近", "最新", "上次", "之前", "以前", "历史", "目前", "当前", "本周", "本月", "今天", "昨天", "正在", "在做", "在干",
-    "做什么", "干什么", "干啥", "干嘛", "啥", "嘛", "在", "进展", "情况", "什么", "哪些", "如何", "吗", "呢",
+GENERIC_SUPPORT_TERMS = {
+    "note", "report", "weekly", "paper", "model", "card", "update", "result",
+    # CJK pronouns/connectives carry no claim of their own.  They are excluded
+    # here rather than in ``tokenize_query.STOP_TERMS`` so retrieval and layer
+    # routing keep seeing them; only claim coverage ignores them.
+    "我们", "你们", "他们", "咱们", "关于", "以及", "还有", "这个", "那个", "一下", "现在",
 }
+QUERY_BOUNDARY = re.compile(r"最近|最新|上次|之前|以前|历史|目前|当前|本周|本月|今天|昨天|正在|在做|在干|做什么|干什么|干啥|干嘛|进展|情况")
 GENERIC_LAYER_ALIASES = {
     "paper": {"paper", "papers", "publication", "publications", "research"},
     "model": {"model", "models", "system", "systems"},
@@ -38,6 +41,20 @@ GENERIC_LAYER_ALIASES = {
     "report": {"report", "reports", "summary", "summaries", "finding", "findings", "conclusion", "conclusions", "status"},
     "survey": {"survey", "surveys", "overview", "overviews", "guide", "guides", "section", "sections"},
 }
+
+
+def _compound_parts(term: str) -> list[str]:
+    """Split a hyphenated compound into the concepts it is made of.
+
+    Repository cards write "long context" where users write "long-context", so
+    keeping both forms improves recall without a synonym table.  A purely
+    numeric part is not a concept the compound decomposes into, though: ``08-18``
+    split into ``08`` and ``18`` matched every MR number, GPU size and line count
+    in the corpus and buried the one line that actually carried the date, so the
+    window picker cited a section eleven months away from the question.
+    """
+
+    return [part for part in re.split(r"[-/]", term) if len(part) >= 2 and not part.isdigit()]
 
 
 def _term_forms(term: str) -> list[str]:
@@ -62,40 +79,6 @@ def _term_forms(term: str) -> list[str]:
     if len(value) > 4 and value.endswith("ed"):
         forms.append(value[:-2])
     return list(dict.fromkeys(form for form in forms if len(form) >= 2))
-
-
-def query_terms(query: str) -> list[str]:
-    r"""Expand a query into conservative lexical terms.
-
-    ``re`` treats a contiguous CJK sentence as one ``\w`` token.  That made
-    a natural question such as ``李小明最近在干啥`` impossible to match against
-    ``standup/李小明.md``.  We retain normal ASCII/path tokens and add short
-    CJK fragments, while excluding temporal/question fragments.  This is a
-    tokenizer, not a synonym model: it never invents domain vocabulary.
-    """
-
-    expanded: list[str] = []
-    markers = sorted((*QUERY_STOP_TERMS, "的"), key=len, reverse=True)
-    for term in re.findall(r"[\w./:-]{2,}", query, re.UNICODE):
-        value = term.casefold()
-        if not any("\u3400" <= char <= "\u9fff" for char in value):
-            expanded.append(value)
-            continue
-        # Remove temporal/question scaffolding before making CJK fragments.
-        # Otherwise ``最近的模型评审`` produces accidental terms such as
-        # ``最近的`` and ``的模型`` which can outrank the dated report layer.
-        candidate = value
-        for marker in markers:
-            candidate = candidate.replace(marker, "")
-        candidate = candidate.strip()
-        if not candidate:
-            continue
-        expanded.append(candidate)
-        for width in (2, 3, 4):
-            if len(candidate) < width:
-                continue
-            expanded.extend(candidate[index:index + width] for index in range(len(candidate) - width + 1))
-    return list(dict.fromkeys(term for term in expanded if term and term not in QUERY_STOP_TERMS))
 
 
 def _layer_matches(layer: str, query_terms: set[str]) -> bool:
@@ -148,7 +131,80 @@ def _evidence_window(text: str, terms: list[str], max_lines: int = 12) -> tuple[
     return "\n".join(file_lines[start:end]), start + 1, end
 
 
-def _claim_support(query_terms: list[str], excerpt: str, line_start: int, line_end: int) -> dict[str, Any]:
+def _term_supported(term: str, excerpt_value: str) -> bool:
+    """Report whether the excerpt actually carries this query term.
+
+    Non-CJK terms keep the strict substring rule.  CJK has no word delimiter,
+    so a query phrase is often a compound of what the document wrote: a note
+    saying "记忆钩子" does support a question about "自动记忆钩子", and demanding
+    the verbatim compound made every ordinary CJK question stall at ``partial``
+    and therefore abstain.  Credit is still evidence-based — the document must
+    contain a contiguous run of the term, at least three characters long and at
+    least half of it — so scattered characters, or a bare "项目" standing in for
+    "虚构项目", do not count.
+    """
+
+    if term in excerpt_value:
+        return True
+    if not all("\u3400" <= char <= "\u9fff" for char in term):
+        return False
+    shortest = max(3, (len(term) + 1) // 2)
+    for width in range(len(term) - 1, shortest - 1, -1):
+        for index in range(len(term) - width + 1):
+            if term[index:index + width] in excerpt_value:
+                return True
+    return False
+
+
+def _claim_support(
+    query_terms: list[str],
+    excerpt: str,
+    line_start: int,
+    line_end: int,
+    *,
+    unreachable: frozenset[str] = frozenset(),
+    real_terms: frozenset[str] = frozenset(),
+    path: str = "",
+) -> dict[str, Any]:
+    """Report how much of the query this excerpt actually carries.
+
+    ``unreachable`` names terms the corpus has never contained *and* that
+    this tokenizer carved out of an unsegmented run rather than the user
+    delimiting them — the caller supplies it because only the caller holds
+    the corpus.  Such a term is not a claim the evidence can support or
+    refute; it is a guess at a word boundary that turned out wrong.
+    Requiring one holds coverage permanently below 1.0, which is abstention
+    by tokenizer rather than by evidence: measured against the live
+    1696-document source, every natural CJK question abstained, including
+    ``octo-daemon 的健康监控 cron 是怎么配置的？`` — where ``是怎么配置`` occurs
+    in no document while every term the user actually typed was present.
+
+    A term the user delimited stays required even when the corpus lacks it.
+    That is the case where abstaining is right, and it is what keeps a query
+    naming something absent from being answered anyway.  And if excluding
+    would empty the requirement, nothing is excluded: an all-carved,
+    all-absent query must abstain, not fall through the empty-set branch
+    below into ``direct``.
+
+    ``real_terms`` names the terms a word segmenter produced rather than this
+    module joining them.  They are never dropped by the probe above, and they
+    are restored when the join that absorbed them is dropped, so a question
+    whose specific words the corpus lacks abstains on those words instead of
+    on whatever generic phrase outlived them.
+
+    ``path`` is part of the citation and therefore part of the evidence.
+    Retrieval already reads it — ``lower_document_by_path`` indexes
+    ``f"{relative} {text}"`` — so a document can be retrieved *because* its
+    path matched and then be unable to prove the very term that found it.  On
+    the live source that was most of the abstentions: ``rlvr-auto-survey
+    standup 李宁`` returned ``standup/李宁.md`` first and marked both
+    ``standup`` and ``李宁`` unmatched, because they are in the filename rather
+    than in the quoted window.  A per-person or per-date layout keeps
+    attribution in the path by design; the citation the caller receives carries
+    that path, so crediting it is honest.  Spans stay excerpt-only — a path
+    match has no line to point at.
+    """
+
     raw_support_terms = list(dict.fromkeys(
         term for term in query_terms
         if (len(term) >= 3 or (len(term) >= 2 and all("\u3400" <= char <= "\u9fff" for char in term)))
@@ -158,6 +214,12 @@ def _claim_support(query_terms: list[str], excerpt: str, line_start: int, line_e
     # n-grams are not independent claims: if a longer CJK term contains one,
     # keep only the longest form for claim support so a hit on "评测结果" is
     # not downgraded merely because "评测" and "结果" were also generated.
+    #
+    # Collapse against the full set, before anything is excluded.  Excluding
+    # first orphans the fragments: dropping the unreachable "是怎么配置" left
+    # "是怎么", "怎么配" and "么配置" with no longer form to hide behind, so they
+    # were promoted into the requirement and the query abstained anyway — the
+    # same abstention, now demanded by three fragments instead of one.
     support_terms = [
         term for term in raw_support_terms
         if not (
@@ -165,9 +227,39 @@ def _claim_support(query_terms: list[str], excerpt: str, line_start: int, line_e
             and any(len(other) > len(term) and term in other for other in raw_support_terms)
         )
     ]
+    if unreachable:
+        retained = [term for term in support_terms if term not in unreachable]
+        dropped = [term for term in support_terms if term in unreachable]
+        if dropped:
+            # Collapsing to the longest form hid the segmenter's real words
+            # inside a join this module manufactured.  When that join turns out
+            # to be unreachable it is dropped as a bad word boundary — but the
+            # words it absorbed are claims the user actually made, so they come
+            # back rather than leaving the question with only whatever generic
+            # phrase happened to survive.  ``real_terms`` is empty on the
+            # builtin n-gram path, where every fragment *is* a guess, so that
+            # path keeps the collapse-then-exclude behaviour it was measured on.
+            restored = [
+                term for term in raw_support_terms
+                if term in real_terms
+                and term not in unreachable
+                and term not in retained
+                and any(len(item) > len(term) and term in item for item in dropped)
+            ]
+            retained = [term for term in raw_support_terms if term in set(retained) | set(restored)]
+        if retained:
+            support_terms = retained
     excerpt_value = excerpt.casefold()
-    matched = [term for term in support_terms if term in excerpt_value]
-    unmatched = [term for term in support_terms if term not in excerpt_value]
+    evidence_value = f"{path} {excerpt}".casefold() if path else excerpt_value
+    # A date the evidence wrote in Chinese proves a query that normalized to
+    # ISO.  Appending is safe where substituting would not be: the ISO form is
+    # added beside the original, so evidence that already writes both is
+    # unaffected and no existing term stops matching.
+    aliases = date_aliases(evidence_value)
+    if aliases:
+        evidence_value = f"{evidence_value} {' '.join(aliases)}"
+    matched = [term for term in support_terms if _term_supported(term, evidence_value)]
+    unmatched = [term for term in support_terms if not _term_supported(term, evidence_value)]
     if not support_terms or len(matched) == len(support_terms):
         status = "direct"
     elif matched:
@@ -176,7 +268,7 @@ def _claim_support(query_terms: list[str], excerpt: str, line_start: int, line_e
         status = "unknown"
     spans = []
     for offset, line in enumerate(excerpt.splitlines()):
-        line_terms = [term for term in matched if term in line.casefold()]
+        line_terms = [term for term in matched if _term_supported(term, line.casefold())]
         if line_terms:
             spans.append({"line_start": line_start + offset, "line_end": line_start + offset, "terms": line_terms})
     return {
@@ -356,7 +448,7 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
     # model- or provider-specific synonym table.
     terms = list(dict.fromkeys(
         raw_terms
-        + [part for term in raw_terms for part in re.split(r"[-/]", term) if len(part) >= 2]
+        + [part for term in raw_terms for part in _compound_parts(term)]
         + [form for term in raw_terms for form in _term_forms(term)]
     ))
     terms = [term for term in terms if term not in {"what", "latest", "recent", "最近", "最新", "什么", "source", "evidence", "citation", "definition", "and", "or", "the", "a", "an", "relationship"}]
@@ -470,6 +562,18 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
         term: max(1.0, math.log((len(documents) + 1) / (frequency + 1)))
         for term, frequency in document_frequency.items()
     }
+    # The same corpus counts answer a second question: which carved fragments
+    # does this source never contain at all?  A fragment with zero document
+    # frequency is a word boundary this tokenizer guessed wrong, not a claim
+    # the evidence could ever carry — ``_claim_support`` drops those from the
+    # requirement rather than abstaining on them forever.  Terms the user
+    # delimited are excluded from the probe: their absence is a real answer.
+    carved_terms = carved_query_terms(query) & set(terms)
+    real_terms = frozenset(set(terms) - carved_terms)
+    unreachable = frozenset(
+        term for term in carved_terms
+        if not document_frequency.get(term)
+    )
     basename_term_counts = {
         term: sum(term in Path(relative).stem.casefold() for relative, _text in documents)
         for term in raw_terms
@@ -583,8 +687,20 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
             # Do not open this exception for notes/reports that merely mention
             # the entity.
             continue
-        if date_terms and not all(term in path_text for term in date_terms):
-            continue
+        if date_terms:
+            # The index records date anchors from paths *and* headings
+            # (``local_index._document_dates``); this filter read only the path
+            # half, so a document that dates its sections in ``## 2026-08-18``
+            # was excluded outright.  That made the year-qualified question
+            # strictly worse than the bare one: ``8月18日`` reached
+            # ``standup/武垚乐.md`` while ``2026年8月18日`` could not, because only
+            # the second parses as a full ISO date.  Heading anchors are
+            # structure the indexer already derived, not a widening of the
+            # filter to arbitrary body text.
+            anchors = document_metadata.get(relative) if isinstance(document_metadata.get(relative), dict) else {}
+            anchor_text = " ".join(str(value) for value in (anchors.get("dates") or []))
+            if not all(term in path_text or term in anchor_text for term in date_terms):
+                continue
         temporal_candidate = latest and bool(preferred_layers) and layer in preferred_layers
         layer_only_candidate = bool(preferred_layers) and not specific_terms and layer in preferred_layers
         semantic_candidate = relative in semantic_candidates
@@ -622,7 +738,7 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
         # several sections of one document; report claim support separately
         # instead of discarding the document from ranking metrics.
         evidence_status = "secondary"
-        support = _claim_support(terms, excerpt, start or excerpt_start, end or excerpt_end)
+        support = _claim_support(terms, excerpt, start or excerpt_start, end or excerpt_end, unreachable=unreachable, real_terms=real_terms, path=relative)
         semantic_score = semantic_scores.get(relative, 0.0)
         graph_bonus = 900 if graph_candidate else 0
         # Keep P@1 deterministic for exact/entity queries: the builtin

@@ -7,12 +7,13 @@ Search responses use this shape:
   "schema_version": 4,
   "query": "...",
   "mode": "exact|semantic|temporal|cross-source|deep",
-  "scope": "repository|memory|all",
+  "scope": "auto|repository|memory|all",
   "verified": [],
   "answerable": [],
   "candidates": [],
   "groups": {},
   "abstain": false,
+  "answered_by": [],
   "freshness": {},
   "diagnostics": {}
 }
@@ -57,10 +58,35 @@ directly supported subclaims.
 `candidates` contains incomplete, stale, generated, inferred, pending, or
 merely related material. Agents must not silently promote candidates to facts.
 
+`citation.pinned` and `evidence_status=worktree` describe a citation whose
+excerpt was read back and matched against the file on disk, but whose source
+tree has uncommitted changes, so the excerpt cannot be pinned to a commit. Such
+a result is verified and can be answerable: the excerpt is exactly what the
+working tree says. It is not `stale` — stale means the cited commit is not the
+expected one, so the evidence may no longer say what it said. When quoting an
+unpinned citation, say the source is a working tree rather than a commit;
+`citation.commit` is still reported and `commit_type` is `local_worktree`.
+
 For `scope=all`, `groups.repository` and `groups.memory` are independent result
 sets. Top-level `verified`/`candidates` are intentionally empty; consume the
 group matching the claim type. The default `scope=repository` keeps the
 backwards-compatible top-level aliases.
+
+For the default `scope=auto`, the top-level surface is the repository plane —
+byte-for-byte what `scope=repository` returns — and `groups` carries
+`repository`, `memory`, and `team` separately. `abstain` therefore describes
+the repository plane **only**. It deliberately does not weaken when
+conversation memory or a team decision can answer: an uncited plane must never
+suppress an abstention the evidence guards depend on.
+
+`answered_by` closes the gap that creates. It lists the planes that produced
+something answerable — any of `repository`, `memory`, `team` — and is `[]` when
+nothing did, or `null` outside `auto`. A caller that reads `abstain` alone will
+give up on a question whose answer sits in `groups.memory`; read `answered_by`
+first, then answer from the named group, labelling non-repository material as
+conversation memory or a team decision rather than as a Git citation. Only
+accepted team records (`groups.team.active`) count; `groups.team.candidates`
+never do.
 
 `results` is the safe answer alias for `answerable`; use `verified` only for
 document retrieval diagnostics and evaluation.

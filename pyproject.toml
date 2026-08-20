@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "repository-memory"
-version = "0.7.15"
+version = "0.7.16"
 description = "Standalone citation-first repository memory Skill, CLI, MCP server, and local L0-L3 runtime"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -21,6 +21,9 @@ repository-memory-aml = "aml_server:main"
 test = [
   "pytest>=8,<9",
   "pytest-cov>=6,<8",
+]
+cjk = [
+  "jieba>=0.42,<1",
 ]
 semantic = [
   "sentence-transformers>=3,<6",
@@ -63,6 +66,7 @@ py-modules = [
   "team_memory",
   "team_repository",
   "team_memory_eval",
+  "tokenize_query",
   "vendor_components",
   "provider_protocol",
   "supervisor",

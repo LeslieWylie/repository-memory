@@ -1,5 +1,125 @@
 # Changelog
 
+## 0.7.16
+
+- Give every retrieval plane one query tokenizer (`tokenize_query.py`) with
+  optional jieba word segmentation behind a new `cjk` extra. Previously four
+  call sites tokenized CJK three different ways, and two of them — Team Memory
+  and the compatibility L0/L1 store — did not segment at all, so a Chinese
+  question arrived as a single clause-length token that matched nothing. Those
+  two planes were unreachable in Chinese, including under `scope=auto`.
+- Skip the SQLite FTS5 pre-filter in Team Memory and local memory search when a
+  query term contains CJK. The stock `unicode61` tokenizer indexes a whole CJK
+  run as one token, so a MATCH for a segmented term returns nothing; both call
+  sites already re-match with substrings, which is CJK-safe.
+- Stop manufacturing terms that span the seam between a question's scaffolding
+  and its subject (`是怎么配置`, `做了`). Such a term occurs in no document, so
+  requiring it held claim coverage below 1.0 and produced abstention by
+  tokenizer rather than by evidence.
+- Report the active tokenizer in search diagnostics and doctor, beside
+  `semantic_available`: whether jieba is installed changes what a Chinese query
+  retrieves, so a retrieval measurement that omits it is not attributable.
+- Count the citation path as claim-support evidence for core-normalized results
+  as well as adapter results, which already had it. Retrieval indexes
+  `"<path> <text>"`, so a document could be found *by* its path and then be
+  unable to prove the term that found it.
+- Normalize Chinese date expressions to the form the corpus writes: `8月18日`
+  becomes `08-18` and `2026年8月18日` becomes `2026-08-18`, and evidence that
+  writes a date in Chinese proves a query that normalized to ISO. People ask one
+  way and Markdown headings are written the other, so the term was required,
+  occurred in no document, and abstained. This is a grammar over digits and
+  三 characters, not a vocabulary: it does not grow when a project or a person is
+  added. An unqualified `8月18日` is not given a year, because guessing one
+  answers a different question whenever the corpus spans more than one year.
+- Stop splitting a hyphenated term into purely numeric parts. `08-18` became
+  `08` and `18`, which matched every merge-request number, GPU size and line
+  count in the source and buried the single line carrying the date — the excerpt
+  picker then cited a section eleven months away from the question. The split
+  exists for `long-context`, which decomposes into concepts; digits do not.
+- Let a date filter read the heading anchors the index already derives, not only
+  the path. `local_index._document_dates` collects dates from paths *and*
+  headings, but the filter read the path half alone, so a document dating its
+  sections as `## 2026-08-18` was excluded outright. That made the year-qualified
+  question strictly worse than the bare one.
+- jieba remains optional and is never downloaded; `dependencies` stays empty
+  and the character n-gram path is exercised by the test suite on its own.
+- Add a `gateway` embedding provider: any OpenAI-compatible `/embeddings`
+  endpoint, configured with `semantic configure --provider gateway --endpoint
+  ... --dimensions ...`. The local neural option needs 1.5–2 GB resident to load
+  its weights, which this machine does not have; a remote endpoint costs no
+  resident memory at all. The credential is read from an environment variable
+  whose *name* is what gets persisted — a config file is copied, diffed and
+  backed up, and a secret written into it leaks by every one of those routes.
+  Readiness is probed once and cached on disk with exponential backoff, because
+  the CLI is spawned per request and must not pay a network round trip to
+  discover an endpoint is still down.
+- Encode a corpus into a packed `array('f')` rather than a list of float lists.
+  On the 37k-document source the nested form costs roughly 600 MB against 75 MB
+  packed, and the write path materialized a second copy of it again to serialize.
+- Record the embedding spec the vectors were *actually* produced with, not the
+  one that was requested. An optional provider can fail after the readiness
+  check and leave the corpus to the local projection; storing the requested
+  triple then claims a cache that does not exist and rebuilds the whole index on
+  every later search.
+- Load an existing semantic cache for a large source instead of deferring it.
+  The deferral exists so a first query does not pay for encoding the corpus, but
+  it also skipped the cache that encoding had already produced, so an index
+  built once was never used: measured on the live 1697-document source, the same
+  query took 309.7 s and then 3.5 s. A cache whose provider/model/dimension no
+  longer match the configured ones is still deferred rather than scored, because
+  the query is encoded in the current embedding space and comparing two spaces
+  produces confident nonsense.
+- Treat a word the segmenter returned as a claim the user made, and only the
+  joins built around it as guesses. Every CJK term was previously marked
+  "carved", so the unreachable probe dropped any of them the corpus lacked —
+  including the only specific word in the question. Measured live: `腌制泡菜的
+  传统做法` had `腌制`, `泡菜` and `腌制泡菜` all dropped at df 0 and was answered
+  `direct` with coverage 1.0 out of five RLVR notes, on the strength of the one
+  generic phrase left standing. When an unreachable join is dropped, the
+  segmented words it absorbed are restored to the requirement. The builtin
+  n-gram path, where every fragment genuinely is a guess, is unchanged.
+- Let the endpoint credential be read from a file this configuration only points
+  at (`--api-key-file`, with `--api-key-json-path` when that file is JSON owned
+  by another tool). Naming an environment variable is the better bargain and
+  still takes precedence, but an agent host launched from a GUI inherits no
+  shell environment, so a credential-by-name scheme resolves to nothing there
+  and the remote provider silently stops being used at exactly the moment it was
+  configured. Only the path is persisted; the secret stays in the file that
+  already held it. Every unreadable shape — missing file, not JSON, wrong key
+  path, non-string leaf — yields no credential rather than an exception, because
+  the local projection still answers the query.
+- Raise the public gate's Chinese coverage from one query to five. A tokenizer
+  change cannot be verified by a set that contained a single Chinese positive.
+  The added queries vary the interrogative shape rather than the subject,
+  because the shape is what the closed stop set has to absorb, and one of them
+  carries dotted version numbers so that rule is guarded beside CJK scaffolding.
+  The queries themselves are not quoted here: three of them take this file as
+  gold, and a gate whose evidence repeats its own queries measures nothing.
+  Measured on both tokenizer paths — every gate metric stays 1.0 with jieba and
+  without it.
+- Stop discarding evidence that was proved, because the tree it came from was
+  dirty. A citation whose excerpt has just been read off disk and matched was
+  being marked invalid *and* stale whenever any file anywhere in the source had
+  uncommitted changes, which zeroed `verified`, `results` and `answerable`.
+  Measured on this repository: a question whose answer sat in three documents at
+  `claim_support=direct, coverage=1.0` returned nothing, because an unrelated
+  file was uncommitted. The two facts are now separate — claim support still
+  decides answerability, while the missing commit pin is reported as evidence
+  quality (`citation.pinned=false`, `evidence_status="worktree"`). It is
+  deliberately not called stale: stale evidence may no longer say what it said,
+  whereas this evidence is exactly what is on disk. `get` reaches the same
+  verdict independently, so a hit that answers does not fail when the caller
+  asks to see it. Nothing about the excerpt check, secret exclusion or negative
+  abstention changes, and the gate — which evaluates a clean revision — is
+  unmoved on both tokenizer paths.
+- State the capability boundary in the Skill instructions: which stores answers
+  come from, that abstention is the tool working rather than failing, and that
+  consulting memory at all is the host model's judgment call. The same section
+  names the one runtime every harness reaches — this Skill plus the audited MCP
+  server for Claude Code and Codex, the native tools for OpenClaw, the stdio
+  MCP or the bundled CLI for anything else — because a host deciding *whether*
+  to call the tool never read the references where those facts lived.
+
 ## 0.7.15
 
 - Protect existing canonical Team Memory Markdown during automatic hydration

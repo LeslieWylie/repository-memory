@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -46,6 +47,7 @@ from discovery import (
 )
 from fallback import SECRET_CONTENT, SECRET_NAME, _claim_support, query_terms
 from fallback import search as fallback_search
+from tokenize_query import tokenizer_status
 from local_index import ensure as ensure_local_index
 from local_index import status as local_index_status
 from memmy import MemmyError, configure_memmy, memmy_memory_client
@@ -61,6 +63,7 @@ from memorycore import (
 )
 from knowledge import KnowledgeClient
 from snapshot import local_view, prepare_view
+from standalone_memory import is_question_turn as _is_question_turn
 from semantic_repository import ensure as ensure_semantic_index
 from semantic_repository import status as semantic_index_status
 from semantic_repository import configure as configure_semantic
@@ -310,7 +313,7 @@ def _discover_views(root: Path | None, source_id: str | None, scope: str, local:
         specs = []
         discovery_error = str(exc)
     repository_views: list[SourceView] = []
-    if scope in {"repository", "all"}:
+    if scope in {"repository", "all", "auto"}:
         reuse = os.environ.get("REPOSITORY_MEMORY_EVAL_REUSE_VIEW", "").casefold() in {"1", "true", "yes", "on"}
         for spec in specs:
             key = (str(spec.root), spec.id, bool(local))
@@ -321,24 +324,33 @@ def _discover_views(root: Path | None, source_id: str | None, scope: str, local:
             if reuse:
                 _EVAL_VIEW_CACHE[key] = view
             repository_views.append(view)
-    memory_view = _memory_view() if scope in {"memory", "all"} else None
+    memory_view = _memory_view() if scope in {"memory", "all", "auto"} else None
     return repository_views, memory_view, discovery_error
 
 
 def _empty(query: str, mode: str, source_views: list[SourceView], reason: str, *, scope: str = "repository", backend: str | None = None) -> dict[str, Any]:
     groups = {name: {"verified": [], "answerable": [], "candidates": [], "results": [], "abstain": True} for name in ("repository", "memory")}
+    if scope == "auto":
+        groups["team"] = {"active": [], "candidates": [], "abstain": True, "retrieval_mode": "abstain"}
+    # ``auto`` answers from the repository lane, so its empty surface is the
+    # repository one; ``all`` keeps the surface blank and speaks only through
+    # groups.  Either way an abstention stays an abstention.
+    surface = {"verified": [], "answerable": [], "candidates": [], "results": []} if scope == "all" else groups["repository"] if scope == "auto" else groups[scope]
     return {
         "schema_version": SCHEMA_VERSION,
         "query": query,
         "mode": mode,
         "scope": scope,
         "sources": [_source_payload(view) for view in source_views],
-        "verified": [] if scope == "all" else groups[scope]["verified"],
-        "answerable": [] if scope == "all" else groups[scope]["answerable"],
-        "candidates": [] if scope == "all" else groups[scope]["candidates"],
-        "results": [] if scope == "all" else groups[scope]["results"],
-        "groups": groups if scope == "all" else None,
+        "verified": surface["verified"],
+        "answerable": surface["answerable"],
+        "candidates": surface["candidates"],
+        "results": surface["results"],
+        "groups": groups if scope in {"all", "auto"} else None,
         "abstain": True,
+        # Present on every ``auto`` response so a caller can test the key
+        # rather than distinguish "no plane answered" from "old build".
+        "answered_by": [] if scope == "auto" else None,
         "retrieval_mode": "abstain",
         "freshness": {view.spec.id: _freshness(view) for view in source_views},
         "diagnostics": {"scope": scope, "adapter": backend, "result_count": 0, "retrieval_mode": "abstain", "reason": reason},
@@ -393,8 +405,21 @@ def normalize_item(item: dict[str, Any], view: SourceView, source_type: str, que
     native = bool(item.get("_native_memory") or memory_backend)
     memory_backend = memory_backend or (item.get("_memory_backend") if native else None) or ("memorycore" if native else None)
     checked = validate_memory(citation, excerpt) if native else validate(view.path, path, start, end, excerpt, commit, view.commit)
-    if not native and view.dirty and view.commit_type == "local_worktree":
-        checked = {**checked, "valid": False, "stale": True, "reason": "source working tree is dirty"}
+    # A dirty worktree means the excerpt cannot be pinned to a commit.  It does
+    # not mean the excerpt is wrong: ``validate`` has just read those exact
+    # lines off disk and matched them.  Collapsing the two facts threw away
+    # evidence that had already proved the claim -- measured on this repository,
+    # a question whose answer sat in three documents at coverage 1.0 returned
+    # zero results because an unrelated file was uncommitted.  The missing pin
+    # is reported as evidence quality instead, and the caller decides what an
+    # unpinned citation is worth.  Nothing here relaxes the excerpt check.
+    unpinned = bool(
+        not native
+        and view.dirty
+        and view.commit_type == "local_worktree"
+        and checked.get("valid")
+        and not checked.get("stale")
+    )
     backend_id = citation.get("memory_id") or item.get("id")
     # Evaluation and cross-adapter joins need an ID that does not change when
     # a backend assigns a different record ID. A source-scoped canonical path
@@ -442,7 +467,13 @@ def normalize_item(item: dict[str, Any], view: SourceView, source_type: str, que
     }
     support = item.get("support") if isinstance(item.get("support"), dict) else None
     if support is None and query is not None:
-        support = _claim_support(query_terms(query), str(excerpt or ""), start or 1, end or start or 1)
+        # ``path`` counts as evidence for the same reason it does in
+        # ``fallback.search``: retrieval indexes "<path> <text>", so a document
+        # can be found *by* its path and then be unable to prove the term that
+        # found it.  Adapter results already got this credit; core-normalized
+        # ones did not, which was a silent inconsistency between two paths to
+        # the same answer.
+        support = _claim_support(query_terms(query), str(excerpt or ""), start or 1, end or start or 1, path=path)
     support = support or {"matched_terms": [], "unmatched_terms": [], "coverage": 1.0, "claim_support": "unknown", "supporting_spans": []}
     result = {
         "id": result_id,
@@ -490,6 +521,7 @@ def normalize_item(item: dict[str, Any], view: SourceView, source_type: str, que
         "memory": {
             "layer": memory_layer,
             "type": memory_type,
+            "role": item.get("memory_role"),
             "query_source": item.get("_memory_query_source") or citation.get("source") or item.get("_source"),
             "strategy": item.get("_memory_strategy"),
         } if source_type == "long_term" or native else None,
@@ -516,9 +548,16 @@ def normalize_item(item: dict[str, Any], view: SourceView, source_type: str, que
             "linked_evidence": item.get("linked_evidence") or citation.get("linked_evidence") or [],
             "valid": checked.get("valid", False),
             "stale": checked.get("stale", False),
-            "validation_reason": checked.get("reason"),
+            "pinned": not unpinned,
+            "validation_reason": "verified against the working tree, not pinned to a commit" if unpinned else checked.get("reason"),
         },
     }
+    if unpinned:
+        # Distinct from "stale": stale evidence may no longer say what it said,
+        # while this evidence is exactly what is on disk and merely uncommitted.
+        # Keeping it out of the demotion set is what lets a working repository
+        # answer at all; the status keeps the difference visible.
+        result["evidence_status"] = "worktree"
     result["_verified"] = (checked.get("valid") and status not in {"stale", "candidate", "pending", "inferred", "generated"}) if native else result_is_verified(checked, status, commit, view.commit)
     if not result["_verified"]:
         if checked.get("stale"):
@@ -540,21 +579,106 @@ def _split_results(items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], l
     return verified, candidates
 
 
-def _answerable_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Return citations whose excerpt supports the complete query claim.
+def _normalize_echo(value: str) -> str:
+    """Reduce text to comparable content: letters, digits, and ideographs.
+
+    Punctuation differs between a captured question and its re-asking (full
+    width vs. ASCII ``?``, trailing whitespace), and none of it carries
+    meaning for this comparison.
+    """
+
+    return "".join(char for char in str(value or "") if char.isalnum()).casefold()
+
+
+def _is_query_echo(item: dict[str, Any], query: str = "") -> bool:
+    """True when the "evidence" is a question rather than an answer.
+
+    Conversation capture stores both sides of a turn, and the L0/L1 path marks
+    them accepted.  A captured *user* turn that asks something is therefore
+    retrievable as evidence, and its excerpt matches every term of a re-asking
+    by construction — which is exactly what ``claim_support=direct`` tests for.
+    Left alone that is a self-confirming loop: the system cites the question as
+    its own answer.
+
+    The test is structural, not lexical.  An earlier version compared the
+    excerpt against the *current* query, so it only ever caught a verbatim
+    re-ask: querying "octo-daemon 升级" returned four hits whose excerpts were
+    all the longer question "octo-daemon 升级到哪个版本了?当时是怎么验证的?",
+    and none of them tripped a similarity test against the short query.  What
+    makes a record unusable as evidence is what it *is* — a captured question —
+    not how much it happens to resemble what was typed this time.
+
+    Only interrogative user turns are barred.  A user turn that states a fact
+    ("我们升级到了 0.5.0") is legitimate evidence, and dropping every user turn
+    would throw it away.  The lexical arm is kept as a backstop for backends
+    that do not report a role.
+
+    The structural test lives in ``standalone_memory.is_question_turn`` and is
+    applied there too, before ranking, because a filter this late can only
+    empty the window the echoes already filled.  Sharing the predicate keeps
+    the two layers from drifting apart.
+
+    Echoes stay in ``verified`` when they reach it — they are real, resolvable
+    records — but the memory plane drops them before the limit slice so they
+    cannot crowd out the record that answers.
+    """
+
+    memory = item.get("memory") if isinstance(item.get("memory"), dict) else {}
+    role = str(memory.get("role") or item.get("memory_role") or "").strip().casefold()
+    excerpt_raw = str(item.get("excerpt") or item.get("content") or "").strip()
+    if _is_question_turn(role, excerpt_raw):
+        return True
+
+    normalized_query = _normalize_echo(query)
+    excerpt = _normalize_echo(excerpt_raw)
+    if not normalized_query or not excerpt:
+        return False
+    if excerpt == normalized_query or excerpt in normalized_query:
+        return True
+    # Quoting the question is fine as long as the excerpt goes on to say
+    # something.  Require it to be materially longer, not merely padded.
+    return normalized_query in excerpt and len(excerpt) < len(normalized_query) * 1.15
+
+
+def _answerable_items(items: list[dict[str, Any]], query: str = "") -> list[dict[str, Any]]:
+    """Return citations that can answer without a further evidence lookup.
 
     ``verified`` is deliberately document-level: it means the citation points
     at a real, fresh, non-pending document.  That is useful for recall and
     qrels evaluation, but it is not permission to answer a composite question.
-    Only ``direct`` claim support is answerable without an additional evidence
-    lookup.  Partial/unknown hits remain visible as verified documents and
-    candidates for diagnostics, while the top-level result abstains.
+    For a repository citation the bar stays ``direct`` — the excerpt has to
+    carry every term of the claim, because a document quote that covers half a
+    question is exactly the case that produces a confident wrong answer.
+
+    A prior assistant turn is judged differently, and it has to be.
+    ``_claim_support`` asks whether the excerpt contains every query term, so
+    against a question phrased as a question the only text that can ever score
+    ``direct`` is that same question: an answer does not repeat the words
+    "哪个" or "了".  Measured live on the real store — the two assistant turns
+    holding "octo-daemon 从 0.1.0 升级到 0.5.0, commit fcec9177" scored
+    ``partial`` with ``coverage 0.33`` and were withheld, while the captured
+    question itself scored ``direct`` and was served.  Requiring ``direct`` of
+    conversation memory does not make the system careful, it makes it answer
+    with the question and abstain on the answer.
+
+    So an assistant turn is answerable when retrieval matched something in it
+    at all (``claim_support`` is not ``unknown``).  Its role establishes that
+    it is an answer; retrieval establishes that it is about this query.  The
+    support block travels with the item, so a caller that wants to know how
+    much of a compound question a given turn covers can still read
+    ``coverage`` and ``unmatched_terms`` — nothing is hidden, and the
+    repository plane's abstention guarantee is untouched.
     """
 
-    return [
-        item for item in items
-        if str((item.get("support") or {}).get("claim_support") or "") == "direct"
-    ]
+    answerable = []
+    for item in items:
+        if _is_query_echo(item, query):
+            continue
+        support = str((item.get("support") or {}).get("claim_support") or "")
+        role = str(((item.get("memory") or {}) if isinstance(item.get("memory"), dict) else {}).get("role") or "").strip().casefold()
+        if support == "direct" or (role == "assistant" and support == "partial"):
+            answerable.append(item)
+    return answerable
 
 
 def _fallback_items(view: SourceView, query: str, limit: int, deep: bool, *, stale: bool = False) -> list[dict[str, Any]]:
@@ -575,17 +699,14 @@ def _fallback_items(view: SourceView, query: str, limit: int, deep: bool, *, sta
             # MemOS' vector lane is useful as a rescue path, but eagerly
             # hashing a large Git corpus for every new snapshot can make a
             # simple filename/date query look like a hung agent.  Start with
-            # the citation-first lexical/path lane for large sources and load
-            # the semantic cache only when that lane returns nothing.
+            # the citation-first lexical/path lane for large sources and build
+            # the semantic cache only when that lane returns nothing.  A cache
+            # that already exists for this commit is loaded here regardless of
+            # size: the cost being deferred is the encode, not the file read.
             defer_semantic = len(documents) >= 1000 or estimated_bytes >= 8 * 1024 * 1024
-            semantic_index = {
-                "configured": True,
-                "available": False,
-                "indexed": False,
-                "strategy": "lexical",
-                "deferred": True,
-                "defer_reason": "large_repository_first_pass",
-            } if defer_semantic else ensure_semantic_index(view, local_index, deep, allow_download=False)
+            semantic_index = ensure_semantic_index(
+                view, local_index, deep, allow_download=False, build=not defer_semantic
+            )
             view.metadata["_semantic_index_cache"] = {"deep": deep, "value": semantic_index}
         view.metadata["semantic_index"] = semantic_index
     except (OSError, RuntimeError, TypeError, ValueError):
@@ -677,7 +798,18 @@ def _memory_items(view: SourceView, adapter: Adapter, query: str, limit: int) ->
     if memory.get("reachable") is not True:
         return [], {"source": view.spec.id, "adapter": memory.get("backend") or "memorycore", "memory": memory, "repository_skipped": True, "fallback": False}
     try:
-        native_items = adapter.memory_search(query, limit)
+        # Over-fetch, because the echo filter runs downstream and captured
+        # questions outrank the answers that quote them: a short query matches
+        # a stored question almost exactly, while the assistant turn that
+        # answers it is long and dilutes the same terms.  Measured live —
+        # "octo-daemon 升级" returned six hits, four of them that question
+        # asked on four earlier days, and the three assistant turns holding
+        # "0.5.0, commit fcec9177" never entered the window at all.  Asking for
+        # exactly ``limit`` means the filter can only ever empty the plane;
+        # asking for more gives it something to fall through to.  The group
+        # loop slices back to ``limit`` after filtering, so this widens what is
+        # considered, not what is returned.
+        native_items = adapter.memory_search(query, max(limit * 4, limit + 12))
     except AdapterError as exc:
         return [], {"source": view.spec.id, "adapter": "memorycore", "memory": memory, "repository_skipped": True, "fallback": True, "reason": str(exc)}
     normalized = [
@@ -690,7 +822,10 @@ def _memory_items(view: SourceView, adapter: Adapter, query: str, limit: int) ->
         memmy = memory["providers"].get("memmy")
         if isinstance(memmy, dict) and isinstance(memmy.get("embedding"), dict) and memmy["embedding"].get("available") is True:
             semantic = memmy["embedding"]
-    return normalized[:limit], {
+    # Deliberately not truncated to ``limit`` here.  The only caller feeds this
+    # into the memory group, which drops echoes and *then* slices to ``limit``;
+    # cutting the window twice would undo the over-fetch above.
+    return normalized, {
         "source": view.spec.id,
         "adapter": memory.get("backend") or "memorycore",
         "memory": memory,
@@ -703,15 +838,25 @@ def _memory_items(view: SourceView, adapter: Adapter, query: str, limit: int) ->
 
 
 def _package_search(query: str, mode: str, scope: str, views: list[SourceView], groups: dict[str, dict[str, Any]], diagnostics: list[dict[str, Any]], limit: int) -> dict[str, Any]:
-    selected = groups[scope] if scope != "all" else {"verified": [], "candidates": [], "results": []}
+    # ``auto`` recalls every plane but still answers from the repository lane.
+    # Keeping the top-level surface identical to ``scope="repository"`` is what
+    # lets one call be the default without changing what an existing caller
+    # reads, and it keeps Git citations as the mainline answer.
+    selected = groups["repository"] if scope == "auto" else groups[scope] if scope != "all" else {"verified": [], "candidates": [], "results": []}
     memory_ready = any(entry.get("memory", {}).get("status") == "ready" for entry in diagnostics if isinstance(entry.get("memory"), dict))
+    # ``retrieval_mode`` and ``semantic_available`` describe how the *answer*
+    # was retrieved.  Under ``auto`` the answer comes from the repository lane,
+    # so the memory lane's stronger strategy must not be reported here — that
+    # would advertise `local-hybrid` for a repository result that was actually
+    # found lexically.
+    answer_lane = [entry for entry in diagnostics if not isinstance(entry.get("memory"), dict)] if scope == "auto" else diagnostics
     semantic_ready = any(
         isinstance(entry.get("semantic"), dict) and entry["semantic"].get("available") is True
-        for entry in diagnostics
+        for entry in answer_lane
     )
     semantic_strategies = [
         str(entry["semantic"].get("strategy"))
-        for entry in diagnostics
+        for entry in answer_lane
         if isinstance(entry.get("semantic"), dict) and entry["semantic"].get("available") is True
     ]
     retrieval_mode = (
@@ -728,6 +873,19 @@ def _package_search(query: str, mode: str, scope: str, views: list[SourceView], 
     answerable = [] if scope == "all" else selected.get("answerable", [])[:limit]
     abstain = answerable_count == 0
     candidate_count = sum(len(group.get("candidates", [])) for group in groups.values()) if scope == "all" else len(selected["candidates"])
+    # ``abstain`` stays repository-only under ``auto``.  That is the
+    # citation-first contract, and relaxing it would let uncited conversation
+    # memory suppress an abstention the evidence guards depend on.  But a model
+    # that reads only ``abstain`` gives up while ``groups.memory`` holds the
+    # answer, so name the planes that did answer.  Additive: ``None`` outside
+    # ``auto``, and callers written before this key simply ignore it.
+    answered_by = None
+    if scope == "auto":
+        answered_by = [name for name in ("repository", "memory") if groups.get(name, {}).get("answerable")]
+        # Team records are decisions, not Git citations; only accepted ones
+        # count as an answer.  ``candidates`` are explicitly not.
+        if groups.get("team", {}).get("active"):
+            answered_by.append("team")
     return {
         "schema_version": SCHEMA_VERSION,
         "query": query,
@@ -741,8 +899,9 @@ def _package_search(query: str, mode: str, scope: str, views: list[SourceView], 
         # for document-level retrieval metrics and citation diagnostics.
         "results": answerable,
         "answerable": answerable,
-        "groups": groups if scope == "all" else None,
+        "groups": groups if scope in {"all", "auto"} else None,
         "abstain": abstain,
+        "answered_by": answered_by,
         "freshness": {view.spec.id: _freshness(view) for view in views},
         "diagnostics": {
             "scope": scope,
@@ -753,13 +912,38 @@ def _package_search(query: str, mode: str, scope: str, views: list[SourceView], 
             "claim_abstain": abstain and result_count > 0,
             "retrieval_mode": retrieval_mode,
             "semantic_available": semantic_ready,
+            # Whether jieba happens to be installed changes what a Chinese
+            # query retrieves, so a number reported without it is not
+            # attributable.  This travels beside ``semantic_available`` for
+            # exactly that reason.
+            "tokenizer": tokenizer_status()["name"],
+            # The counts above describe the answer surface, which is the
+            # repository lane.  These describe what else was recalled, so a
+            # caller can tell "nothing was found" from "nothing was searched".
+            "planes": {
+                "repository": len(groups.get("repository", {}).get("verified", [])),
+                "memory": len(groups.get("memory", {}).get("verified", [])),
+                "team_active": len(groups.get("team", {}).get("active", [])),
+                "team_candidates": len(groups.get("team", {}).get("candidates", [])),
+            },
             "query_terms": query_terms(query),
         },
     }
 
 
-def search(root: Path | None, query: str, limit: int = 5, deep: bool = False, source_id: str | None = None, local: bool = False, scope: str = "repository") -> dict[str, Any]:
-    if scope not in {"repository", "memory", "all"}:
+def search(root: Path | None, query: str, limit: int = 5, deep: bool = False, source_id: str | None = None, local: bool = False, scope: str = "auto") -> dict[str, Any]:
+    """Retrieve across every plane the runtime owns, without merging them.
+
+    ``auto`` is the default because an agent should not have to know which of
+    the three planes holds the answer before it is allowed to ask.  It recalls
+    repository evidence, local conversation memory, and Team Memory, and
+    returns them as separate groups.  The top-level answer surface stays
+    repository-only, exactly as ``scope="repository"`` returns it: Git
+    citations remain the mainline, and a Team Memory record never arrives
+    shaped like a verified citation.
+    """
+
+    if scope not in {"repository", "memory", "all", "auto"}:
         raise ValueError(f"unsupported scope: {scope}")
     mode = classify(query)
     repository_views, memory_view, discovery_error = _discover_views(root, source_id, scope, local)
@@ -770,23 +954,55 @@ def search(root: Path | None, query: str, limit: int = 5, deep: bool = False, so
     diagnostics: list[dict[str, Any]] = []
     repository_verified_buckets: list[tuple[int, int, list[dict[str, Any]]]] = []
     repository_candidate_buckets: list[tuple[int, int, list[dict[str, Any]]]] = []
-    for source_index, view in enumerate(repository_views):
-        adapter = discover_adapter(view)
-        if scope in {"repository", "all"}:
-            items, diagnostic = _repository_items(view, adapter, query, limit, deep, local)
-            verified, candidates = _split_results(items)
-            repository_verified_buckets.append((_source_route_score(view, query, verified), source_index, verified))
-            repository_candidate_buckets.append((_source_route_score(view, query, candidates), source_index, candidates))
-            diagnostics.append(diagnostic)
-    if memory_view is not None:
-        adapter = Adapter(None, memory_view)
-        if scope in {"memory", "all"}:
-            items, diagnostic = _memory_items(memory_view, adapter, query, limit)
-            verified, candidates = _split_results(items)
-            groups["memory"]["verified"].extend(verified)
-            groups["memory"]["candidates"].extend(candidates)
-            diagnostics.append(diagnostic)
-    if discovery_error and scope in {"repository", "all"} and not repository_views:
+    # Team Memory lives in its own store, so it cannot be reached through the
+    # source views above.  Start it before the repository loop so the two
+    # lanes overlap; they are still ranked and returned independently.
+    team_future = None
+    team_pool = None
+    if scope == "auto":
+        team_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="team-recall")
+        team_future = team_pool.submit(team_memory_store().search, query, limit=limit)
+    try:
+        for source_index, view in enumerate(repository_views):
+            adapter = discover_adapter(view)
+            if scope in {"repository", "all", "auto"}:
+                items, diagnostic = _repository_items(view, adapter, query, limit, deep, local)
+                verified, candidates = _split_results(items)
+                repository_verified_buckets.append((_source_route_score(view, query, verified), source_index, verified))
+                repository_candidate_buckets.append((_source_route_score(view, query, candidates), source_index, candidates))
+                diagnostics.append(diagnostic)
+        if memory_view is not None:
+            adapter = Adapter(None, memory_view)
+            if scope in {"memory", "all", "auto"}:
+                items, diagnostic = _memory_items(memory_view, adapter, query, limit)
+                verified, candidates = _split_results(items)
+                groups["memory"]["verified"].extend(verified)
+                groups["memory"]["candidates"].extend(candidates)
+                diagnostics.append(diagnostic)
+        if team_future is not None:
+            # A Team Memory outage must not take down repository retrieval:
+            # the citation lane is the mainline and answers on its own.
+            try:
+                team = team_future.result()
+            except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error) as exc:
+                team = None
+                diagnostics.append({"source": None, "adapter": "team-memory", "team_skipped": True, "reason": str(exc)})
+            if isinstance(team, dict):
+                # Team records are experience provenance, not Git citations, so
+                # they are deliberately not exposed under ``verified``.  Callers
+                # that flatten ``groups[*].verified`` therefore never count a
+                # reviewed decision as a validated source citation.
+                groups["team"] = {
+                    "active": team.get("active", []),
+                    "candidates": team.get("candidates", []),
+                    "abstain": not team.get("active"),
+                    "retrieval_mode": team.get("retrieval_mode", "lexical"),
+                }
+                diagnostics.append({"source": None, "adapter": "team-memory", "team_memory": team.get("diagnostics", {})})
+    finally:
+        if team_pool is not None:
+            team_pool.shutdown(wait=True)
+    if discovery_error and scope in {"repository", "all", "auto"} and not repository_views:
         diagnostics.append({"source": None, "adapter": "repository-memory", "fallback": False, "memory_skipped": True, "reason": discovery_error})
     if discovery_error and scope == "memory" and memory_view is not None:
         diagnostics.append({"source": None, "adapter": "repository-memory", "repository_skipped": True, "reason": discovery_error})
@@ -794,12 +1010,36 @@ def search(root: Path | None, query: str, limit: int = 5, deep: bool = False, so
     ordered_candidates = [bucket for _score, _index, bucket in sorted(repository_candidate_buckets, key=lambda item: (-item[0], item[1]))]
     groups["repository"]["verified"] = _interleave_results(ordered_verified, limit)
     groups["repository"]["candidates"] = _interleave_results(ordered_candidates, limit)
-    for group in groups.values():
-        group["verified"] = group["verified"][:limit]
-        group["candidates"] = group["candidates"][:limit]
-        group["answerable"] = _answerable_items(group["verified"])
+    echo_dropped = 0
+    for name, group in groups.items():
+        if name == "team":
+            continue
+        # Drop query echoes *before* the limit slice, not after.  Filtering them
+        # only out of ``answerable`` left them holding result slots: a live
+        # recall for "octo-daemon 升级到哪个版本了?当时是怎么验证的?" came back
+        # with all five memory hits being that question, captured verbatim from
+        # earlier turns and scoring ``claim_support: direct`` by construction.
+        # The record that actually answers it never made the cut.
+        #
+        # The lexical backstop is passed a query only for the memory plane.  It
+        # compares an excerpt against the question, and a repository document
+        # that is genuinely short and happens to contain the query text is a
+        # real citation, not a mirror.  The structural arm needs no query and
+        # applies everywhere — repository documents carry no role, so it is a
+        # no-op for them.
+        echo_query = query if name == "memory" else ""
+        kept_verified = [item for item in group["verified"] if not _is_query_echo(item, echo_query)]
+        kept_candidates = [item for item in group["candidates"] if not _is_query_echo(item, echo_query)]
+        echo_dropped += (len(group["verified"]) - len(kept_verified)) + (len(group["candidates"]) - len(kept_candidates))
+        group["verified"] = kept_verified[:limit]
+        group["candidates"] = kept_candidates[:limit]
+        group["answerable"] = _answerable_items(group["verified"], echo_query)
         group["results"] = group["answerable"]
         group["abstain"] = not group["answerable"]
+    if echo_dropped:
+        # Never a silent cap: say how much was removed, so a plane that looks
+        # thin can be told apart from one that was crowded out by its own echo.
+        diagnostics.append({"source": None, "adapter": "repository-memory", "query_echo_dropped": echo_dropped})
     return _package_search(query, mode, scope, views, groups, diagnostics, limit)
 
 
@@ -1089,9 +1329,22 @@ def capture_turn(root: Path | None, payload: Any, source_id: str | None = None) 
     l0_backend = native_result.get("result") if isinstance(native_result.get("result"), dict) else {}
     sessions = l0_backend.get("sessions") if isinstance(l0_backend.get("sessions"), list) else []
     session_result = sessions[0] if sessions and isinstance(sessions[0], dict) else {}
+    accepted_ids = session_result.get("accepted_ids") or []
+    # MemoryCore reports per-session ``accepted_ids``; the standalone backend
+    # reports counts instead and returns ``sessions`` as an integer, so the id
+    # list is empty for a perfectly good write.  Fall back to the count, or the
+    # receipt claims "0 records" for a write that read-back proves is durable.
+    recorded_count = native_result.get("l0_recorded")
+    if recorded_count is None:
+        recorded_count = l0_backend.get("l0_recorded")
+    try:
+        recorded_count = int(recorded_count or 0)
+    except (TypeError, ValueError):
+        recorded_count = 0
     l0 = {
         "l0_verified": bool(session_result.get("l0_verified") or native_result.get("l0_verified")),
-        "record_ids": session_result.get("accepted_ids") or [],
+        "record_ids": accepted_ids,
+        "record_count": len(accepted_ids) or recorded_count,
         "status": "verified" if (session_result.get("l0_verified") or native_result.get("l0_verified")) else "unknown",
     }
     l1: dict[str, Any] = {"status": "not_configured", "count": 0}
@@ -1194,7 +1447,7 @@ def capture_turn(root: Path | None, payload: Any, source_id: str | None = None) 
             })
             team_memory = team_result.get("memory") if isinstance(team_result.get("memory"), dict) else {}
             team_candidate = {"created": True, "status": "candidate", "id": team_memory.get("id"), "memory_type": memory_type, "duplicate": team_result.get("duplicate", False), "evidence_status": "candidate"}
-        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error) as exc:
             team_candidate = {"created": False, "status": "error", "reason": str(exc)[:240]}
 
     # The local candidate is useful only if the team can review it.  When the
@@ -1208,7 +1461,11 @@ def capture_turn(root: Path | None, payload: Any, source_id: str | None = None) 
 
         if auto_sync_enabled():
             team_sync = sync_team_memory(agent_id=turn.get("agent_id"), pull=True)
-    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+    except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error) as exc:
+        # Mirroring into the canonical team repository is optional.  A storage
+        # or repository failure here must degrade to a diagnosable receipt: L0
+        # is already durable and the idempotency ledger below still has to run,
+        # otherwise the next identical turn would ingest L0 a second time.
         team_sync = {"status": "error", "created": False, "reason": str(exc)[:240]}
 
     result = {
@@ -1528,9 +1785,13 @@ def get_result(
                         "line_start": start,
                         "line_end": end,
                         "evidence": "\n".join(window),
-                        "valid": not dirty_local,
-                        "stale": dirty_local,
-                        "validation_reason": "source working tree is dirty" if dirty_local else None,
+                        # The window above was read straight out of the file, so
+                        # it is valid by construction.  A dirty tree costs it the
+                        # commit pin and nothing else.
+                        "valid": True,
+                        "stale": False,
+                        "pinned": not dirty_local,
+                        "validation_reason": "verified against the working tree, not pinned to a commit" if dirty_local else None,
                     }
                     value: dict[str, Any] = {
                         "id": result_id,
@@ -1545,10 +1806,10 @@ def get_result(
                         "evidence_window": {"line_start": start, "line_end": end, "requested_line_start": line_start, "requested_line_end": line_end, "truncated": len(content_lines) > len(window)},
                         "support": {"matched_terms": [], "unmatched_terms": [], "coverage": 1.0, "claim_support": "unknown", "supporting_spans": []},
                         "citation": citation,
-                        "evidence_status": "stale" if dirty_local else "secondary",
+                        "evidence_status": "worktree" if dirty_local else "secondary",
                         "freshness": view.freshness,
                         "layer": "repository",
-                        "status": "stale" if dirty_local else "verified",
+                        "status": "worktree" if dirty_local else "verified",
                         "provenance": {
                             "source": spec.id,
                             "repository": spec.repository,
@@ -1557,15 +1818,19 @@ def get_result(
                             "locator": {"start_line": start, "end_line": end},
                         },
                         "readback": {
-                            "verified": not dirty_local,
-                            "status": "stale" if dirty_local else "verified",
+                            # The receipt says the evidence was read back out of
+                            # the source, and it was -- the window above is that
+                            # read.  Whether the source could be pinned to a
+                            # commit is a separate fact and rides on ``status``.
+                            "verified": True,
+                            "status": "worktree" if dirty_local else "verified",
                             "source": spec.id,
                             "memory_id": result_id,
                             "layer": "repository",
                             "receipt": "repository-citation-readback",
                         },
                     }
-                    result = {"schema_version": SCHEMA_VERSION, "found": True, "id": result_id, "source": spec.id, "repository": spec.repository, "commit": view.commit, "layer": "repository", "memory_id": result_id, "status": "stale" if dirty_local else "verified", "provenance": value["provenance"], "readback": value["readback"], "result": value, "freshness": view.freshness}
+                    result = {"schema_version": SCHEMA_VERSION, "found": True, "id": result_id, "source": spec.id, "repository": spec.repository, "commit": view.commit, "layer": "repository", "memory_id": result_id, "status": "worktree" if dirty_local else "verified", "provenance": value["provenance"], "readback": value["readback"], "result": value, "freshness": view.freshness}
                     if explain:
                         result["doctor"] = doctor(root, source_id=spec.id)
                     return result
@@ -1634,6 +1899,7 @@ def doctor(root: Path | None = None, source_id: str | None = None, *, local: boo
             "repository": {"status": "not_configured", "source_count": 0},
             "knowledge_service": {"required": False, **KnowledgeClient().health()},
             "semantic": memory_report.get("embedding", {"available": False, "strategy": "keyword-only"}),
+            "tokenizer": tokenizer_status(),
             "routing": routing,
             "agents": routing.get("agents", {"configured": [], "covered": []}),
             "sources": [],
@@ -1716,7 +1982,7 @@ def doctor(root: Path | None = None, source_id: str | None = None, *, local: boo
     healthy = all(report.get("healthy", True) for report in reports)
     routing = _openclaw_routing()
     active_values = unique_values(active)
-    return {"schema_version": SCHEMA_VERSION, "ok": healthy, "status": "ready" if healthy else "degraded", "active_adapter": active_values[0] if len(active_values) == 1 else active_values, "capabilities": capabilities, "memory": memory[0] if len(memory) == 1 else memory, "team_memory": team_memory_store().health(), "team_repository": team_repository_health(), "repository": {"status": "ready" if reports else "not_configured", "source_count": len(reports)}, "knowledge_service": {"required": False, **KnowledgeClient().health()}, "semantic": semantic[0] if len(semantic) == 1 else ({"available": False, "strategy": "keyword-only"} if native_ready else semantic), "routing": routing, "agents": routing.get("agents", {"configured": [], "covered": []}), "sources": reports, "config": config_summary(), "upstream_components": vendor_components_report(), "actions": actions}
+    return {"schema_version": SCHEMA_VERSION, "ok": healthy, "status": "ready" if healthy else "degraded", "active_adapter": active_values[0] if len(active_values) == 1 else active_values, "capabilities": capabilities, "memory": memory[0] if len(memory) == 1 else memory, "team_memory": team_memory_store().health(), "team_repository": team_repository_health(), "repository": {"status": "ready" if reports else "not_configured", "source_count": len(reports)}, "knowledge_service": {"required": False, **KnowledgeClient().health()}, "semantic": semantic[0] if len(semantic) == 1 else ({"available": False, "strategy": "keyword-only"} if native_ready else semantic), "tokenizer": tokenizer_status(), "routing": routing, "agents": routing.get("agents", {"configured": [], "covered": []}), "sources": reports, "config": config_summary(), "upstream_components": vendor_components_report(), "actions": actions}
 
 
 def feedback(root: Path | None, result_id: str, note: str, rating: str | None = None, feedback_id: str | None = None) -> dict[str, Any]:
@@ -1929,7 +2195,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor_parser = common("doctor"); doctor_parser.add_argument("--local", action="store_true", help="Inspect the local checkout without attempting a remote snapshot"); doctor_parser.add_argument("--no-index", action="store_true", help="Do not build a missing derived index during diagnostics"); doctor_parser.add_argument("--json", action="store_true")
     sync = common("sync"); sync.add_argument("--deep", action="store_true"); sync.add_argument("--local", action="store_true"); sync.add_argument("--all", action="store_true"); sync.add_argument("--json", action="store_true")
-    search_parser = common("search"); search_parser.add_argument("query"); search_parser.add_argument("--limit", type=int, default=5); search_parser.add_argument("--deep", action="store_true"); search_parser.add_argument("--local", action="store_true"); search_parser.add_argument("--scope", choices=("repository", "memory", "all"), default="repository"); search_parser.add_argument("--json", action="store_true")
+    search_parser = common("search"); search_parser.add_argument("query"); search_parser.add_argument("--limit", type=int, default=5); search_parser.add_argument("--deep", action="store_true"); search_parser.add_argument("--local", action="store_true"); search_parser.add_argument("--scope", choices=("repository", "memory", "all", "auto"), default="auto"); search_parser.add_argument("--json", action="store_true")
     get_parser = common("get"); get_parser.add_argument("result_id"); get_parser.add_argument("--commit"); get_parser.add_argument("--line-start", type=int); get_parser.add_argument("--line-end", type=int); get_parser.add_argument("--json", action="store_true")
     explain_parser = common("explain"); explain_parser.add_argument("result_id"); explain_parser.add_argument("--commit"); explain_parser.add_argument("--line-start", type=int); explain_parser.add_argument("--line-end", type=int); explain_parser.add_argument("--json", action="store_true")
     feedback_parser = common("feedback"); feedback_parser.add_argument("result_id"); feedback_parser.add_argument("--note", required=True); feedback_parser.add_argument("--rating"); feedback_parser.add_argument("--feedback-id"); feedback_parser.add_argument("--json", action="store_true")
@@ -2022,9 +2288,15 @@ def build_parser() -> argparse.ArgumentParser:
     gui.add_argument("--host", default="127.0.0.1")
     gui.add_argument("--port", type=int, default=0)
     gui.add_argument("--json", action="store_true")
-    semantic = sub.add_parser("semantic", help="Configure the optional local Hugging Face repository encoder")
+    semantic = sub.add_parser("semantic", help="Configure the optional repository encoder (local Hugging Face model or remote OpenAI-compatible endpoint)")
     semantic.add_argument("action", choices=("status", "configure"))
-    semantic.add_argument("--model", default="Alibaba-NLP/gte-multilingual-base")
+    semantic.add_argument("--provider", choices=("huggingface", "gateway", "builtin"), default="huggingface", help="huggingface loads a local model into memory; gateway calls a remote /embeddings endpoint and uses no resident memory")
+    semantic.add_argument("--model", help="Defaults to the recommended model for the selected provider")
+    semantic.add_argument("--endpoint", help="Base URL of an OpenAI-compatible API for --provider gateway, for example https://host/v1")
+    semantic.add_argument("--dimensions", type=int, help="Requested output width for --provider gateway; the endpoint's actual width is what gets recorded")
+    semantic.add_argument("--api-key-env", help="Name of the environment variable holding the endpoint credential. The credential itself is never written to the configuration file")
+    semantic.add_argument("--api-key-file", help="Path to a file holding the endpoint credential, for hosts launched without a shell environment. Only the path is stored")
+    semantic.add_argument("--api-key-json-path", help="Dot path to the credential inside --api-key-file when that file is JSON belonging to another tool, for example models.providers.NAME.apiKey")
     semantic.add_argument("--download", action="store_true", help="Allow the explicit configure operation to download model files")
     semantic.add_argument("--disable", action="store_true")
     semantic.add_argument("--json", action="store_true")
@@ -2040,7 +2312,7 @@ def _mcp_dispatch(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     if name == "memory_sync":
         return sync_index(root, source_id=source, local=bool(arguments.get("local")))
     if name == "memory_search":
-        return search(root, str(arguments.get("query") or ""), int(arguments.get("limit") or 5), bool(arguments.get("deep")), source, bool(arguments.get("local")), str(arguments.get("scope") or "repository"))
+        return search(root, str(arguments.get("query") or ""), int(arguments.get("limit") or 5), bool(arguments.get("deep")), source, bool(arguments.get("local")), str(arguments.get("scope") or "auto"))
     if name == "memory_get":
         return get_result(
             root,
@@ -2324,7 +2596,24 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
             if args.action == "status":
                 value = semantic_model_status()
             else:
-                value = configure_semantic(model=args.model, enabled=not args.disable, allow_download=args.download)
+                from discovery import read_config
+                from local_embedding import GATEWAY_ALIASES, GATEWAY_DEFAULT_MODEL, HF_DEFAULT_MODEL
+
+                configured_endpoint = (read_config().get("semantic") or {}).get("endpoint")
+                is_gateway = str(args.provider).strip().casefold() in GATEWAY_ALIASES
+                if is_gateway and not (args.endpoint or configured_endpoint):
+                    raise RuntimeError("semantic configure --provider gateway requires --endpoint")
+                value = configure_semantic(
+                    model=args.model or (GATEWAY_DEFAULT_MODEL if is_gateway else HF_DEFAULT_MODEL),
+                    enabled=not args.disable,
+                    allow_download=args.download,
+                    provider=args.provider,
+                    endpoint=args.endpoint,
+                    dimensions=args.dimensions,
+                    api_key_env=args.api_key_env,
+                    api_key_file=args.api_key_file,
+                    api_key_json_path=args.api_key_json_path,
+                )
         elif args.command == "init":
             value = init_source(args.path, args.source_id, args.repository, args.profile, not args.no_sync, args.local_only)
         elif args.command == "source":

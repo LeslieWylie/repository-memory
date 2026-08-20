@@ -15,6 +15,10 @@ const completionKeys = new Set();
 const runStates = new Map();
 const activeAgentStates = new Map();
 const captureBoundaryStates = new Map();
+// What the pre-turn recall actually found, keyed like every other run state.
+// ``before_prompt_build`` runs before ``before_agent_run`` creates the run
+// state, so the signal has to be parked here and picked up there.
+const recallSignals = new Map();
 
 function text(value) {
   if (typeof value === "string") return value;
@@ -51,6 +55,27 @@ function captureBoundary(event, prompt) {
     originalUserMessageCount,
     afterTimestamp,
   };
+}
+
+function rememberBoundary(key, next) {
+  // Hosts expose the turn prompt at more than one lifecycle point, and they are
+  // not equally clean: `before_prompt_build` carries the raw user text, while
+  // `before_agent_run` carries the prompt *after* prompt build, so context
+  // injected by another plugin (auto-recall, skill hints) is already prepended.
+  // Keeping the later value would push that injected block into L0 as if the
+  // user had typed it.  When the later prompt is only the earlier one plus a
+  // prefix, keep the earlier text.  A genuinely new turn does not end with the
+  // previous prompt, so a stale boundary is still replaced.
+  const previous = captureBoundaryStates.get(key);
+  const merged = { ...previous, ...next };
+  if (previous?.startedAt) merged.startedAt = previous.startedAt;
+  const earlier = optional(previous?.originalUserText);
+  const later = optional(next?.originalUserText);
+  if (earlier && (!later || (later !== earlier && later.endsWith(earlier)))) {
+    merged.originalUserText = earlier;
+  }
+  captureBoundaryStates.set(key, merged);
+  return merged;
 }
 
 function messagesFrom(event, maxMessages, maxMessageChars, boundary) {
@@ -108,6 +133,28 @@ function isAllowedAgent(cfg, ctx) {
   return cfg.agentIds.includes(agentId);
 }
 
+function stripRecallContext(prompt) {
+  // ``before_prompt_build`` prepends this extension's own recall block to the
+  // prompt, so ``event.prompt`` is "<repository-memory-context>…</…>" plus the
+  // user's message.  ``promptPolicy`` now only labels the audit row, but that
+  // label is how we measure the classifier against what retrieval actually
+  // found, and recalled memory quotes maintenance vocabulary ("升级", "部署",
+  // "重启") constantly.  Classifying the combined text made the label describe
+  // our own injected context instead of the user's question.
+  return String(prompt || "")
+    .replace(/<repository-memory-context>[\s\S]*?<\/repository-memory-context>/g, " ")
+    // A block written by an older build (or truncated before its closing tag)
+    // leaves recall text behind, which is exactly what must not be classified.
+    // Drop the tags, the fixed header sentence, and the recall bullets — every
+    // line the block emits — so only the user's own words remain.
+    .split("\n")
+    .filter((line) => !/^\s*<\/?repository-memory-context>\s*$/.test(line))
+    .filter((line) => !/^\s*The following is conversation memory, not repository citation\./.test(line))
+    .filter((line) => !/^\s*-\s*\[[^\]\n]+\]\s.*\(memory_id=/.test(line))
+    .join("\n")
+    .trim();
+}
+
 function isExplicitDirectOperation(prompt) {
   return /直接(?:读|看|打开|检查)文件|运行命令|执行命令|read\s+the\s+file|open\s+the\s+file|run\s+(?:a\s+)?command|cat\s+|sed\s+|grep\s+/i.test(prompt);
 }
@@ -124,7 +171,13 @@ function isRepositoryFactPrompt(prompt) {
   return /记忆|知识库|仓库|代码库|实验结果|评测结果|日报|周报|历史报告|研究结论|最近|最新|运行结果|最近在做|最近做了什么|上次|之前|进展|状态|根据记录|来源|证据|citation|repository|repo\b|experiment|evaluation|benchmark|latest|recent|history|report|according to/i.test(prompt);
 }
 
-function promptPolicy(prompt) {
+function promptPolicy(rawPrompt) {
+  // Observability only.  Nothing downstream branches on this: recall runs on
+  // every turn and the evidence guards read what retrieval returned.  The
+  // label is kept so the audit can show where a lexical reading of the
+  // question disagrees with the evidence — which is the measurement, not the
+  // mechanism.  Do not reintroduce it as a gate.
+  const prompt = stripRecallContext(rawPrompt);
   if (isRepositoryFactPrompt(prompt)) return "repository-fact";
   if (isMaintenancePrompt(prompt)) return "maintenance";
   return "ordinary";
@@ -132,7 +185,18 @@ function promptPolicy(prompt) {
 
 function repoTool(cfg, toolName, suffix) {
   const prefix = cfg.repoToolPrefix;
-  return toolName === `${prefix}${suffix}` || (prefix === "" && toolName === suffix) || toolName === `repository-memory__${suffix}`;
+  // ``repository_${suffix}`` is the alias family this file registers itself.
+  // It has to be listed here too: the default ``repoToolPrefix`` is the MCP
+  // form ``repository-memory__``, so without this clause the extension could
+  // not recognise its own tools.  A host model that reached for the alias got
+  // zeroed counters, ``search: false`` in ``agent_end`` and a spurious
+  // "memory_get started before repository search" warning — and, worse, the
+  // receipt/empty-retrieval/unsupported-claim guards never fired, because they
+  // all read the counters this match populates.
+  return toolName === `${prefix}${suffix}`
+    || (prefix === "" && toolName === suffix)
+    || toolName === `repository-memory__${suffix}`
+    || toolName === `repository_${suffix}`;
 }
 
 function bareHostMemoryTool(toolName) {
@@ -244,16 +308,30 @@ function resultCounts(value) {
   const groups = result.groups && typeof result.groups === "object" ? Object.values(result.groups) : [];
   const groupedVerified = groups.flatMap((group) => Array.isArray(group?.verified) ? group.verified : []);
   const groupedAnswerable = groups.flatMap((group) => Array.isArray(group?.answerable) ? group.answerable : []);
+  // Team records live under ``active``/``candidates`` because they are
+  // decisions, not Git citations.  An accepted one still answers a question,
+  // and only accepted ones count — ``candidates`` are explicitly leads.
+  const groupedActive = groups.flatMap((group) => Array.isArray(group?.active) ? group.active : []);
   const items = groupedVerified.length ? groupedVerified : contextEvidence.length ? contextEvidence : verified;
   // New runtimes expose ``answerable`` separately from document-level
   // ``verified``.  Keep the fallback for older MCP payloads so this extension
   // remains compatible during a rolling install, but never fall back when the
   // field is explicitly present and empty.
-  const answerable = Array.isArray(result.answerable)
-    ? result.answerable
-    : groupedAnswerable.length
-      ? groupedAnswerable
-      : items;
+  //
+  // Under ``scope=auto`` the top-level ``answerable`` is repository-only by
+  // design, while ``verified`` above counts every plane.  Reading them from
+  // different planes made the two numbers incomparable: a live turn answered
+  // correctly from conversation memory and reported ``verified: 11,
+  // answerable: 0, abstain: true``, which is precisely the shape the
+  // unsupported-claim guard treats as a violation.  When the payload is
+  // grouped, both counts come from the same groups.
+  const answerable = groupedVerified.length
+    ? [...groupedAnswerable, ...groupedActive]
+    : Array.isArray(result.answerable)
+      ? result.answerable
+      : groupedAnswerable.length
+        ? groupedAnswerable
+        : items;
   const citations = items.filter((item) => item?.citation?.valid === true || item?.citation_valid === true).length;
   const freshnessValue = result.freshness;
   const freshness = freshnessValue && typeof freshnessValue === "object"
@@ -261,15 +339,77 @@ function resultCounts(value) {
     : freshnessValue || null;
   const failed = result.ok === false || Boolean(result.error) || result.status === "error";
   const claimAbstain = result.claim_abstain === true || (items.length > 0 && answerable.length === 0);
+  // Under ``scope=auto`` the top-level ``abstain`` is the repository plane's
+  // verdict, not the turn's — the runtime says so, and emits ``answered_by``
+  // naming the planes that did produce something answerable.  Prefer that
+  // statement; fall back to the flag only for an ungrouped payload, where the
+  // top level *is* the whole answer.
+  const answeredBy = Array.isArray(result.answered_by) ? result.answered_by : null;
+  const grouped = groupedVerified.length > 0 || groupedActive.length > 0;
+  // A Git receipt can only be demanded of an answer that rests on Git
+  // evidence.  ``verified`` above counts every plane, so an answer drawn
+  // entirely from conversation memory was being told its receipt was
+  // incomplete — for a citation that does not exist, on a plane whose own
+  // injected header says "this is conversation memory, not repository
+  // citation".  Count the repository plane separately; an ungrouped payload
+  // is repository-only by definition.
+  //
+  // Count what that plane found *answerable*, not what it retrieved.  A
+  // lexical near-miss still lands in ``verified``: on the octo-daemon replay
+  // the repository plane returned five standup files that merely mention the
+  // daemon and then said so itself — ``answerable: 0, abstain: true`` — while
+  // the answer came from conversation memory.  Gating on ``verified`` there
+  // demanded a receipt for documents the runtime had already disowned.  For an
+  // ungrouped payload this falls back to the same ``answerable`` the guard has
+  // always used, which itself falls back to ``items`` on older MCP payloads,
+  // so repository-only callers are unaffected.
+  const repositoryGroup = result.groups && typeof result.groups === "object" ? result.groups.repository : null;
+  const repositoryAnswerable = repositoryGroup && typeof repositoryGroup === "object"
+    ? (Array.isArray(repositoryGroup.answerable) ? repositoryGroup.answerable.length : 0)
+    : grouped
+      ? 0
+      : answerable.length;
+  const abstain = answeredBy
+    ? answeredBy.length === 0
+    : grouped
+      ? claimAbstain
+      : result.abstain === true || claimAbstain;
   return {
     verified: items.length,
+    repositoryAnswerable,
     answerable: answerable.length,
     citations,
-    abstain: result.abstain === true || claimAbstain,
+    // The identifying facts of what was actually returned.  ``hasEvidenceReceipt``
+    // uses these instead of guessing from vocabulary — see the note there.
+    evidenceKeys: evidenceKeys([...items, ...answerable]),
+    abstain,
     claimAbstain,
+    answeredBy,
     freshness,
     failed,
   };
+}
+
+function evidenceKeys(items) {
+  // A citation is identified by its commit and its path.  Collect both from
+  // whatever the runtime returned so a receipt can be checked against the
+  // evidence rather than against the words an answer happened to use.
+  const keys = new Set();
+  for (const item of items) {
+    if (!item || typeof item !== "object") continue;
+    const citation = item.citation && typeof item.citation === "object" ? item.citation : {};
+    const commit = String(citation.commit ?? item.commit ?? "").trim();
+    if (/^[0-9a-f]{7,40}$/i.test(commit)) keys.add(commit.slice(0, 7).toLowerCase());
+    const path = String(citation.path ?? item.path ?? "").trim();
+    if (path) {
+      keys.add(path.toLowerCase());
+      const base = path.split("/").pop();
+      if (base && base.length >= 4) keys.add(base.toLowerCase());
+    }
+    const memoryId = String(citation.memory_id ?? item.memory_id ?? "").trim();
+    if (memoryId) keys.add(memoryId.toLowerCase());
+  }
+  return [...keys];
 }
 
 function resultShape(value) {
@@ -281,15 +421,47 @@ function resultShape(value) {
 }
 
 function finalAnswerText(event) {
-  return text(event?.finalText || event?.answer || event?.response || event?.message || event?.content).trim();
+  // The host sends ``lastAssistantMessage`` — see PluginHookBeforeAgentFinalizeEvent
+  // in openclaw's hook-types, whose only text fields are that and ``messages``.
+  // Reading finalText/answer/response meant this returned "" on every real turn,
+  // so ``Boolean(answer)`` was false and all four guards below were dead in
+  // production: 1602 audit rows, zero finalize_warning.  The tests passed a
+  // ``finalText`` fixture, so the suite agreed with itself and never once
+  // exercised the field the host actually sends.
+  const direct = text(event?.lastAssistantMessage ?? event?.finalText ?? event?.answer ?? event?.response ?? event?.message ?? event?.content).trim();
+  if (direct) return direct;
+  const messages = Array.isArray(event?.messages) ? event.messages : [];
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const item = messages[index];
+    if (!item || typeof item !== "object" || item.role !== "assistant") continue;
+    const body = text(item.content ?? item.text ?? item.message).trim();
+    if (body) return body;
+  }
+  return "";
 }
 
 function hasExplicitAbstention(answer) {
   return /abstain\s*[:=]\s*true|没有(?:找到|可验证|足够)|无法(?:确认|验证)|证据不足|不能确认|不作结论|拒绝回答/i.test(answer);
 }
 
-function hasEvidenceReceipt(answer) {
-  const source = /citation|source|repository|来源|仓库|证据/i.test(answer);
+function hasEvidenceReceipt(answer, evidenceKeys = []) {
+  // Prefer checking the answer against the evidence that was actually
+  // returned.  The vocabulary test below asks the model to use particular
+  // words, and it got the first real answer this guard ever saw wrong: the
+  // reply ended "依据：`rlvr-auto-survey/standup/武垚乐.md`，commit
+  // `e7a3dad5...`，约第 296-307 行" — a complete, checkable receipt — and was
+  // flagged because "依据" is not in the source list and no freshness word
+  // appeared.  Requiring specific phrasing means maintaining a synonym list
+  // forever and failing every answer that phrases it a new way.  A commit
+  // hash or a path from the tool result is the citation itself; if the answer
+  // carries one, it showed its work.
+  const value = String(answer || "").toLowerCase();
+  if (Array.isArray(evidenceKeys) && evidenceKeys.some((key) => key && value.includes(key))) return true;
+  // Fallback for payloads that carried no identifiable citation (older
+  // runtimes, memory-only results): fall back to the vocabulary heuristic
+  // rather than accusing an answer the guard cannot check.
+  if (Array.isArray(evidenceKeys) && evidenceKeys.length > 0) return false;
+  const source = /citation|source|repository|来源|仓库|证据|依据/i.test(answer);
   const commit = /(?:commit|提交)\s*[:=]?\s*(?:[0-9a-f]{7,40}|[a-z0-9._/-]+)/i.test(answer);
   const path = /(?:path|路径|文件)\s*[:=]?\s*[^\s,，;；]+/i.test(answer) || /(?:^|\s)[./~][^\s,，;；]+/.test(answer);
   const line = /(?:line|行号|行|#L)\s*[:=]?\s*\d+/i.test(answer);
@@ -304,6 +476,25 @@ async function appendAudit(cfg, event) {
     await appendFile(path, `${JSON.stringify({ timestamp: new Date().toISOString(), ...event })}\n`, { encoding: "utf8", mode: 0o600 });
   } catch {
     // Auditing must never turn a completed agent response into a crash.
+  }
+}
+
+async function queuePendingCapture(payload, error) {
+  // A capture failure must stay diagnosable and replayable without ever
+  // touching the user's turn.  The pending record is metadata plus the bounded
+  // payload the runtime would have consumed, so a later replay is exact.
+  const dir = join(homedir(), ".local", "share", "repository-memory", "autocapture", "pending");
+  const name = `${digest({ s: payload?.session_id, r: payload?.run_id })}.json`;
+  try {
+    await mkdir(dir, { recursive: true, mode: 0o700 });
+    await writeFile(
+      join(dir, name),
+      JSON.stringify({ queued_at: new Date().toISOString(), error: String(error || "unknown").slice(0, 400), payload }),
+      { encoding: "utf8", mode: 0o600 },
+    );
+    return join(dir, name);
+  } catch {
+    return null;
   }
 }
 
@@ -346,15 +537,29 @@ function runCapture(cfg, payload) {
 
 function shouldRecallPrompt(prompt) {
   const value = String(prompt || "").trim();
-  if (!value || /^\/(?:help|start|reset|new|status)\b/i.test(value)) return false;
-  // Memory recall is for conversational context. Maintenance/code turns keep
-  // their normal tool context and do not receive an implicit memory query.
-  return !isMaintenancePrompt(value);
+  // TencentDB's injection pipeline is a hook registry that always runs; MemOS
+  // retrieves first and judges the retrieved memory afterwards.  Neither asks
+  // what the question sounded like, and a keyword gate here was wrong in both
+  // directions — "octo-daemon 升级到哪个版本了" is plain fact recall that reads
+  // as maintenance vocabulary.  Recall unconditionally and let the retrieval
+  // decide: ``formatMemoryContext`` injects nothing when nothing is answerable,
+  // so an actual "run the tests" turn stays silent on its own evidence.
+  return Boolean(value) && !/^\/(?:help|start|reset|new|status)\b/i.test(value);
+}
+
+function memoryPlane(value) {
+  // ``--scope memory`` answers on the top-level fields and leaves ``groups``
+  // null; only ``auto``/``all`` fill ``groups.memory``.  ``formatMemoryContext``
+  // has always fallen back to the result itself, but the audit and the guard
+  // signal read ``groups.memory`` directly — so a recall that injected three
+  // records was logged as ``injected`` with ``answerable: 0``, and the finalize
+  // guard was told recall had found nothing.  Resolve the plane once.
+  const result = parseResult(value);
+  return result?.groups?.memory && typeof result.groups.memory === "object" ? result.groups.memory : result;
 }
 
 function formatMemoryContext(value, maxChars) {
-  const result = parseResult(value);
-  const group = result.groups?.memory && typeof result.groups.memory === "object" ? result.groups.memory : result;
+  const group = memoryPlane(value);
   const items = Array.isArray(group.answerable)
     ? group.answerable
     : Array.isArray(group.results)
@@ -379,8 +584,14 @@ function formatMemoryContext(value, maxChars) {
     const id = item?.id || item?.memory_id || item?.citation?.memory_id || "unknown";
     lines.push(`- [${layer}/${status}] ${content.replace(/\s+/g, " ")} (memory_id=${id})`);
   }
-  lines.push("", "</repository-memory-context>");
-  return lines.join("\n").slice(0, Math.max(1000, Number(maxChars) || 12000));
+  // Truncate the entries, then close the tag.  Slicing the joined string could
+  // cut the closing tag off, leaving an unbalanced block in the prompt — which
+  // both reads badly to the model and defeats the tag-pair strip that keeps
+  // recalled text out of intent classification.
+  const budget = Math.max(1000, Number(maxChars) || 12000);
+  const closing = "\n\n</repository-memory-context>";
+  const body = lines.join("\n");
+  return `${body.length > budget - closing.length ? body.slice(0, Math.max(0, budget - closing.length)) : body}${closing}`;
 }
 
 function runRuntimeJSON(cfg, args, label) {
@@ -429,6 +640,10 @@ function compactItem(item) {
     "commit_type", "path", "line_start", "line_end", "title", "citation",
     "freshness", "support", "readback", "related", "provenance", "ref_id",
     "ref_kind",
+    // Team Memory records carry their reusable kind and reviewed confidence
+    // here.  Dropping them would leave the Agent unable to say whether it is
+    // quoting a decision or a failure, which is the whole point of that plane.
+    "type", "confidence",
   ];
   const result = {};
   for (const key of keep) {
@@ -443,12 +658,29 @@ function compactRuntimeResult(label, result) {
   if (!result || typeof result !== "object") return result;
   if (!label.endsWith("_search")) return result;
   const compactList = (value) => Array.isArray(value) ? value.slice(0, 10).map(compactItem) : value;
+  // ``auto`` returns a group per plane, so the groups now carry as much payload
+  // as the top-level surface used to.  Compacting only the top level would let
+  // one default call ship three uncompacted result sets into the context.
+  const compactGroups = (groups) => {
+    if (!groups || typeof groups !== "object") return groups;
+    const out = {};
+    for (const [name, group] of Object.entries(groups)) {
+      if (!group || typeof group !== "object") { out[name] = group; continue; }
+      const next = { ...group };
+      for (const key of ["verified", "answerable", "candidates", "results", "active"]) {
+        if (Array.isArray(next[key])) next[key] = compactList(next[key]);
+      }
+      out[name] = next;
+    }
+    return out;
+  };
   return {
     ...result,
     verified: compactList(result.verified),
     candidates: compactList(result.candidates),
     results: compactList(result.results),
     answerable: compactList(result.answerable),
+    groups: compactGroups(result.groups),
     // Full source manifests are useful to doctor, but too large for a tool
     // result.  Search keeps freshness and diagnostics, which are the routing
     // and citation decisions the Agent needs.
@@ -481,7 +713,7 @@ const SEARCH_PARAMETERS = {
   required: ["query"],
   properties: {
     query: { type: "string", minLength: 1, description: "Original user query; do not rewrite it into a filename." },
-    scope: { type: "string", enum: ["repository", "memory", "all"], default: "repository" },
+    scope: { type: "string", enum: ["auto", "repository", "memory", "all"], default: "auto", description: "Omit this. `auto` searches every plane and keeps them separate." },
     limit: { type: "integer", minimum: 1, maximum: 50, default: 5 },
   },
   additionalProperties: false,
@@ -533,10 +765,14 @@ function registerNativeTools(api, cfg) {
   );
   register(
     "repository_memory_search",
-    "Search repository evidence or explicitly requested conversation memory through the shared repository-memory runtime. Read-only.",
+    "Answer anything about this project, its history, past conversations, or prior team decisions — pass the user's question verbatim. Returns Git-cited repository evidence as the answer surface, plus conversation memory and team decisions as separate groups. Read-only.",
     SEARCH_PARAMETERS,
+    // The alias family is what a host model usually reaches for, so it has to
+    // default to the same multi-plane path as the MCP tool.  Pinning it to
+    // ``repository`` here would silently drop the memory and team planes even
+    // though the runtime already recalls them.
     (input) => [
-      "search", String(input.query || ""), "--scope", ["repository", "memory", "all"].includes(input.scope) ? input.scope : "repository",
+      "search", String(input.query || ""), "--scope", ["auto", "repository", "memory", "all"].includes(input.scope) ? input.scope : "auto",
       "--limit", String(Math.max(1, Math.min(10, Number(input.limit) || 5))), "--json",
     ],
   );
@@ -602,12 +838,21 @@ export default {
     // TencentDB's client plugin performs recall in before_prompt_build. Keep
     // the same lifecycle while delegating to the shared Python runtime, so
     // MCP, CLI, and automatic recall cannot drift into separate backends.
+    // The raw user text is only observable here, before any plugin gets to
+    // prepend context to the prompt.  Record it independently of the optional
+    // recall hook so the turn boundary is clean even when recall is disabled.
+    api.on("before_prompt_build", async (event, ctx) => {
+      if (!isAllowedAgent(cfg, ctx)) return;
+      const prompt = optional(event?.prompt) || optional(event?.message) || "";
+      rememberBoundary(stateKey(ctx, event), { ...captureBoundary(event, prompt), startedAt: Date.now() });
+    }, { priority: 95, timeoutMs: 5000 });
+
     if (cfg.recallEnabled) {
       api.on("before_prompt_build", async (event, ctx) => {
         if (!isAllowedAgent(cfg, ctx)) return;
         const prompt = optional(event?.prompt) || optional(event?.message) || "";
         const boundaryKey = stateKey(ctx, event);
-        captureBoundaryStates.set(boundaryKey, { ...captureBoundary(event, prompt), startedAt: Date.now() });
+        rememberBoundary(boundaryKey, { ...captureBoundary(event, prompt), startedAt: Date.now() });
         if (!shouldRecallPrompt(prompt)) return;
         const outcome = await runRecall(cfg, prompt);
         if (!outcome.ok) {
@@ -622,7 +867,14 @@ export default {
           return;
         }
         const context = formatMemoryContext(outcome.result, cfg.recallMaxChars);
-        const group = outcome.result?.groups?.memory;
+        const group = memoryPlane(outcome.result);
+        const recallAnswerable = Array.isArray(group?.answerable) ? group.answerable.length : 0;
+        // MemOS derives ``trigger_retrieval`` from whether the memory it holds
+        // answers the query, not from what the query sounded like.  This is
+        // the same signal, measured rather than guessed: recall already ran,
+        // so record what it found for the finalize guard.
+        recallSignals.set(stateKey(ctx, event), { answerable: recallAnswerable, at: Date.now() });
+        if (recallSignals.size > 512) recallSignals.delete(recallSignals.keys().next().value);
         await appendAudit(cfg, {
           agent: optional(ctx?.agentId) || "main",
           run_id: optional(ctx?.runId) || null,
@@ -630,7 +882,7 @@ export default {
           scope: "memory",
           outcome: context ? "injected" : "empty",
           verified: Array.isArray(group?.verified) ? group.verified.length : 0,
-          answerable: Array.isArray(group?.answerable) ? group.answerable.length : 0,
+          answerable: recallAnswerable,
           retrieval_mode: outcome.result?.retrieval_mode || outcome.result?.diagnostics?.retrieval_mode || "unknown",
         });
         return context ? { prependContext: context } : undefined;
@@ -643,7 +895,7 @@ export default {
     api.on("before_agent_run", async (event, ctx) => {
       if (!isAllowedAgent(cfg, ctx)) return;
       const prompt = optional(event?.prompt) || optional(event?.message) || "";
-      captureBoundaryStates.set(stateKey(ctx, event), { ...captureBoundary(event, prompt), startedAt: Date.now() });
+      rememberBoundary(stateKey(ctx, event), { ...captureBoundary(event, prompt), startedAt: Date.now() });
     }, { priority: 95, timeoutMs: 5000 });
 
     if (cfg.guardEnabled) {
@@ -654,7 +906,6 @@ export default {
         const policy = promptPolicy(prompt);
         runStates.set(key, {
           mode: policy,
-          strict: policy === "repository-fact",
           doctor: false,
           doctorRequested: false,
           doctorCompleted: false,
@@ -684,14 +935,16 @@ export default {
         if (!isAllowedAgent(cfg, ctx)) return;
         const toolName = optional(event?.toolName) || "unknown";
         const state = agentState(cfg, ctx, event);
-        if (bareHostMemoryTool(toolName) && state?.strict) {
+        if (bareHostMemoryTool(toolName) && state) {
           await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "tool_audited", tool: toolName, reason: "bare host memory backend is outside the repository-memory evidence plane" });
         }
-        if (!state?.strict) return;
+        // Track the tool sequence on every turn.  Gating this on a keyword
+        // classification meant the counters the finalize guards read were
+        // populated only when the classifier happened to agree that the
+        // question was about the repository — so a turn it misread ran with
+        // every guard silently disabled.
+        if (!state) return;
         if (repoTool(cfg, toolName, "memory_search")) {
-          if (!state.doctorCompleted) {
-            await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "policy_warning", tool: toolName, reason: "repository search started before a successful doctor" });
-          }
           state.search = true;
           return;
         }
@@ -724,7 +977,7 @@ export default {
         }
         const evidenceBypass = directKind === "file-read" || (directKind === "shell" && (isEvidenceReadCommand(command) || isDestructiveCommand(command)));
         if (evidenceBypass) {
-          await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "tool_audited", tool: toolName, reason: "repository-fact turn used direct file/shell access; final evidence remains the agent's responsibility" });
+          await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "tool_audited", tool: toolName, intent: state.mode, reason: "turn used direct file/shell access; final evidence remains the agent's responsibility" });
         }
       }, { priority: 100, timeoutMs: 5000 });
 
@@ -735,14 +988,18 @@ export default {
         const repoSearch = repoTool(cfg, toolName, "memory_search");
         const contextTool = repoTool(cfg, toolName, "memory_context");
         const result = event?.result ?? event?.output ?? event?.resultText;
-        const counts = repoSearch || contextTool ? resultCounts(result) : { verified: 0, answerable: 0, citations: 0, abstain: false, claimAbstain: false, freshness: null, failed: false };
+        const counts = repoSearch || contextTool ? resultCounts(result) : { verified: 0, repositoryAnswerable: 0, answerable: 0, citations: 0, evidenceKeys: [], abstain: false, claimAbstain: false, answeredBy: null, freshness: null, failed: false };
         if ((repoSearch || contextTool) && event?.error) counts.failed = true;
         if ((repoSearch || contextTool) && state) {
           state.searchCompleted = true;
           state.searchFailed = counts.failed;
           state.verified = counts.verified;
+          state.repositoryAnswerable = counts.repositoryAnswerable;
           state.answerable = counts.answerable;
           state.citations = counts.citations;
+          // Accumulate across calls: a turn may search more than once, and the
+          // receipt can name evidence from any of them.
+          state.evidenceKeys = [...new Set([...(state.evidenceKeys || []), ...(counts.evidenceKeys || [])])];
           state.abstain = counts.abstain;
           state.claimAbstain = counts.claimAbstain;
         }
@@ -751,8 +1008,12 @@ export default {
           state.searchCompleted = true;
           state.searchFailed = counts.failed;
           state.verified = counts.verified;
+          state.repositoryAnswerable = counts.repositoryAnswerable;
           state.answerable = counts.answerable;
           state.citations = counts.citations;
+          // Accumulate across calls: a turn may search more than once, and the
+          // receipt can name evidence from any of them.
+          state.evidenceKeys = [...new Set([...(state.evidenceKeys || []), ...(counts.evidenceKeys || [])])];
           state.abstain = counts.abstain;
           state.claimAbstain = counts.claimAbstain;
         }
@@ -769,13 +1030,14 @@ export default {
           event: "tool_completed",
           tool: toolName,
           input_hash: digest(event?.params || {}),
-          scope: repoSearch ? "repository" : null,
+          scope: repoSearch ? (optional(event?.params?.scope) || "auto") : null,
           outcome: event?.error ? "error" : "completed",
           verified: counts.verified,
           answerable: counts.answerable,
           citations: counts.citations,
           abstain: counts.abstain,
           claim_abstain: counts.claimAbstain,
+          answered_by: counts.answeredBy,
           freshness: counts.freshness,
           failed: counts.failed,
           result_shape: resultShape(event?.result ?? event?.output ?? event?.resultText),
@@ -785,19 +1047,38 @@ export default {
       api.on("before_agent_finalize", async (_event, ctx) => {
         if (!isAllowedAgent(cfg, ctx)) return;
         const state = agentState(cfg, ctx, _event);
-        if (!state?.strict || state.revisionRequested) return;
+        if (!state || state.revisionRequested) return;
         const answer = finalAnswerText(_event);
-        const missingReceipt = Boolean(answer) && state.verified > 0 && !hasEvidenceReceipt(answer);
-        const missingRetrieval = Boolean(answer) && !state.searchCompleted && !hasExplicitAbstention(answer);
+        // MemOS evaluates the retrieved memory against the query
+        // (``MEMORY_ANSWER_ABILITY_EVALUATION_PROMPT``); it never asks what
+        // topic the question was about.  Three of these were already that
+        // shape — each is meaningless until a repository search has actually
+        // returned something — so they key off that retrieval alone.  The
+        // keyword gate they used to sit behind added nothing but false
+        // negatives: it read "小队 agent 集体拒任务那次,根因是什么?" as
+        // ``ordinary`` and "octo-daemon 升级到哪个版本了?" as ``maintenance``,
+        // and both plain fact questions answered with every guard off.
+        const missingReceipt = Boolean(answer) && Number(state.repositoryAnswerable || 0) > 0 && !hasEvidenceReceipt(answer, state.evidenceKeys);
         const emptyRetrieval = Boolean(answer) && state.searchCompleted && state.verified === 0 && !state.abstain && !hasExplicitAbstention(answer);
         const unsupportedClaim = Boolean(answer) && state.verified > 0 && state.answerable === 0 && !hasExplicitAbstention(answer);
+        // The fourth is the only one that needs to know whether this turn
+        // wanted memory, because it fires when no retrieval happened at all.
+        // MemOS answers that with ``trigger_retrieval``, computed from whether
+        // the memory it holds addresses the question. The pre-turn recall has
+        // already run exactly that search, so use what it found: measured, not
+        // guessed, and silent on a turn where memory had nothing to say.
+        const recalled = recallSignals.get(stateKey(ctx, _event));
+        const wantedMemory = Number(recalled?.answerable || 0) > 0;
+        const missingRetrieval = Boolean(answer) && wantedMemory && !state.searchCompleted && !hasExplicitAbstention(answer);
         if (missingReceipt || missingRetrieval || emptyRetrieval || unsupportedClaim) {
           await appendAudit(cfg, {
             agent: optional(ctx?.agentId) || "main",
             run_id: optional(ctx?.runId) || null,
             event: "finalize_warning",
-            reason: missingReceipt ? "repository-memory answer receipt incomplete" : missingRetrieval ? "repository-fact answer had no observed shared-memory retrieval" : unsupportedClaim ? "verified citations did not support the complete claim; answer must abstain or narrow the claim" : "repository-memory answer had no verified result or explicit abstention",
+            intent: state.mode,
+            reason: missingReceipt ? "repository-memory answer receipt incomplete" : missingRetrieval ? "recall found answerable memory but the answer skipped shared-memory retrieval" : unsupportedClaim ? "verified citations did not support the complete claim; answer must abstain or narrow the claim" : "repository-memory answer had no verified result or explicit abstention",
             search_failed: state.searchFailed === true,
+            recall_answerable: Number(recalled?.answerable || 0),
           });
         }
       }, { priority: 100, timeoutMs: 5000 });
@@ -879,12 +1160,45 @@ export default {
         original_user_text: boundary.originalUserText,
         after_timestamp: boundary.afterTimestamp,
       };
-      void runCapture(cfg, payload).then((outcome) => {
+      void runCapture(cfg, payload).then(async (outcome) => {
         if (!outcome.ok) {
+          // Without a receipt the audit trail shows `agent_end` for every turn
+          // while nothing reaches L0, which reads as "capture is wired" when it
+          // is not.  Record the failure, queue the turn, and allow a retry.
+          const pending = await queuePendingCapture(payload, outcome.error);
+          await appendAudit(cfg, {
+            agent: optional(ctx?.agentId) || "main",
+            run_id: turnId,
+            event: "memory_capture",
+            scope: "memory",
+            outcome: "failed",
+            session_id: payload.session_id,
+            error: String(outcome.error || "unknown").slice(0, 400),
+            pending_path: pending,
+          });
           api.logger?.warn?.(`${PLUGIN_ID}: capture failed: ${outcome.error}`);
           return;
         }
         const result = outcome.result || {};
+        await appendAudit(cfg, {
+          agent: optional(ctx?.agentId) || "main",
+          run_id: turnId,
+          event: "memory_capture",
+          scope: "memory",
+          outcome: result.duplicate ? "duplicate" : "captured",
+          session_id: payload.session_id,
+          idempotency_key: result.idempotency_key || null,
+          l0: result.l0?.status || "unknown",
+          l0_records: Array.isArray(result.l0?.record_ids) && result.l0.record_ids.length
+            ? result.l0.record_ids.length
+            : Number(result.l0?.record_count || 0),
+          l1: result.l1?.status || "unknown",
+          l1_count: Number(result.l1?.count || 0),
+          l2: result.l2?.status || "skipped",
+          l3: result.l3?.status || "explicit_promotion_only",
+          team_memory: result.team_memory?.status || "skipped",
+          team_repository: result.team_repository?.status || "not_configured",
+        });
         api.logger?.info?.(`${PLUGIN_ID}: L0=${result.l0?.status || "unknown"}, L1=${result.l1?.status || "unknown"}, L2=${result.l2?.status || "skipped"}, L3=${result.l3?.status || "explicit-only"}`);
       });
       if (activeAgentStates.get(optional(ctx?.agentId) || "main") === state) {

@@ -3,3 +3,7 @@
 {"id":"tm-solution","query":"export import bundle next machine","intent":"solution"}
 {"id":"tm-handoff","query":"runner ready next agent branch","intent":"handoff"}
 {"id":"tm-negative","query":"ZZZQWE fictional memory","intent":"negative","expected_abstain":true}
+{"id":"tm-cjk-decision","query":"调度链验证最近是怎么做的","intent":"decision"}
+{"id":"tm-cjk-failure","query":"火山云配额为什么会超限","intent":"failure"}
+{"id":"tm-cjk-negative","query":"ZZZQWE 虚构项目最近进展","intent":"negative","expected_abstain":true}
+{"id":"tm-cjk-date","query":"8月18日 的回放交接","intent":"handoff"}

@@ -47,7 +47,9 @@ remains `lexical` and the response must still carry a valid citation.
 Agents should send the user's question as-is. A filename-shaped second query
 is not required and should not be used to hide a failed first retrieval.
 
-`memory_context` is the multi-source task-start path. Its repository and Team
-Memory lanes run in parallel, then return sectioned provenance. It reports
-`multi-source-lexical` for the separate repository/Team Memory lanes; this does
-not disable the standalone memory search lane's `local-hybrid` capability.
+`memory_search` defaults to `scope="auto"`, the multi-plane task-start path.
+Repository, conversation memory, and Team Memory lanes run in their own
+rankings and come back as separate groups; no cross-backend score is invented.
+The top-level answer surface stays repository-only, so `retrieval_mode`
+describes how that answer was retrieved and never borrows the memory lane's
+`local-hybrid` strategy to describe a lexically-found repository result.

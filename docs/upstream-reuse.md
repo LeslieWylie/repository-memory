@@ -11,7 +11,8 @@ silently become a second runtime or a second canonical source.
 | [TencentDB Agent Memory](https://github.com/Tencent/TencentDB-Agent-Memory) | `97f94654280b2932c35ba4806a491999ed244cc9` | MIT | Layer lifecycle and explicit read-back discipline | TencentDB service, Wiki/TCVDB and its memory slot |
 | [Mem0](https://github.com/mem0ai/mem0) | `001c235229be8795e3834520467bd0d661ed8f34` | Apache-2.0 | Small provider boundary and feedback-oriented API shape | Hosted/vector database defaults and a competing memory authority |
 | [MemPalace](https://github.com/MemPalace/mempalace) | `639c69a1d6be41a04964ceb72a3d29d6f45629e9` | MIT | Local-first retention and original-record preservation ideas | Its server deployment and unrelated personal-memory semantics |
-| [Hindsight](https://github.com/vectorize-io/hindsight) | `b919b97df37705e87f8583e9224777707a033cd4` | MIT | Retention/recall concepts are reference material only | No code copied into the runtime |
+| [Hindsight](https://github.com/vectorize-io/hindsight) | `ec9cc702ec55898bcac0db9c9e598305772ad7ad` | MIT | Retention/recall concepts, and the pattern of treating CJK segmentation as a named, swappable tokenizer choice | No code copied into the runtime |
+| [jieba](https://github.com/fxsjy/jieba) | `0.42.1` (PyPI) | MIT | CJK query segmentation, as an optional `cjk` extra | The `lac_small` paddle models and the paddle backend, which are never imported; no user dictionary is loaded |
 
 ## Decision
 
@@ -73,6 +74,36 @@ left as adapter promises:
   always-on startup cost: large sources begin with lexical/path retrieval and
   load the optional deterministic projection only after a lexical miss. This
   preserves the useful fallback without making a fresh snapshot appear hung.
+- Segmenting a CJK query before lexical scoring is now reuse rather than
+  reference. Every upstream implementation that works in Chinese does it:
+  TencentDB Agent Memory tokenizes with `@node-rs/jieba` before BM25, MemOS
+  calls `jieba.lcut` in its `FastTokenizer`, and Hindsight exposes `jieba` and
+  `chinese_compatible` as index-time tokenizer choices. MemPalace's `\w{2,}`
+  is the counter-example, and it is English-only. `tokenize_query.py` follows
+  the same shape with two constraints of our own: segmentation runs on CJK
+  runs only, because jieba shreds identifiers such as `rlvr-auto-survey`, and
+  adjacent segments are rejoined, because a compound absent from the
+  dictionary comes back split and rejoining recovers it without a user
+  dictionary or any list of project names. jieba stays optional: this package
+  declares no hard dependencies, and retrieval falls back to character n-gram
+  carving when the extra is not installed.
+- Date normalization is ours, not upstream, and it is held to the same rule as
+  everything else in retrieval: it is a grammar over digits and 年/月/日, so it
+  does not grow when a project, a person, or a system is added. People ask
+  `8月18日` and Markdown headings say `## 2026-08-18`; without normalizing, the
+  term was required, occurred in no document, and the question abstained against
+  a file that answered it. The year is never inferred from the clock, because
+  guessing it answers a different question whenever the corpus spans more than
+  one year.
+- The `gateway` embedding provider reuses one thing and only one thing: the
+  OpenAI `/embeddings` request and response shape, which every gateway we can
+  reach already speaks. It adds no dependency — `urllib` and `json` are enough,
+  so `dependencies` stays empty — and no resident memory, which is why it
+  exists: the local neural option needs 1.5–2 GB to hold its weights and the
+  machine this runs on does not have it. The credential is never written to
+  configuration; what gets persisted is the *name* of the environment variable
+  to read, because a config file is copied, diffed and backed up, and a secret
+  written into it leaks by every one of those routes.
 
 The repository index stores conservative date anchors from paths and headings,
 plus explicit local references. Temporal routing uses those anchors instead of
@@ -86,6 +117,15 @@ store, opaque graph edges, automatic LLM memory acceptance, or a mandatory
 remote embedding service. The default remains zero-service and citation-first.
 The current `builtin-char-ngram-v1` projection is a deterministic local recall
 lane; it is not a neural embedding model and is reported as such.
+
+"Mandatory" is the operative word in that list: a remote endpoint may now be
+configured, and on this machine one is. It stays a non-goal in the sense that
+matters — nothing is required to reach the network, an unreachable endpoint
+degrades to the local projection instead of failing the query, and no embedding
+provider of any kind can decide whether a question is answerable. Embeddings
+widen the candidate set; claim support and citations decide the answer. Verified
+live rather than asserted: a query of invented tokens admitted five candidates
+through the gateway and still produced zero answerable results and abstained.
 
 ## Reference locations
 

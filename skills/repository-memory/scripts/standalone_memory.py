@@ -39,6 +39,7 @@ from local_embedding import (
     vectorize,
 )
 from local_memory import SECRET_CONTENT, STOP_WORDS, _payload, _stable_id
+from tokenize_query import plane_terms
 from memos_lifecycle import (
     backpropagate,
     classify_turn,
@@ -104,12 +105,71 @@ _MMR_DIVERSITY_WEIGHT = 0.18
 _RECENCY_HALF_LIFE_DAYS = 14.0
 
 
+_INTERROGATIVE_ENDINGS = ("?", "？")
+
+
+def is_question_turn(role: str | None, content: str | None) -> bool:
+    """True when a stored turn is a user asking rather than anyone answering.
+
+    A chat-captured store accumulates the questions alongside the answers, and
+    a question is the single best lexical *and* semantic match for itself.
+    Measured on this store: eleven verbatim copies of "octo-daemon 升级到哪个
+    版本了？当时是怎么验证的？" scored 1.65 and took ranks 1-11, while the four
+    assistant turns that actually hold "0.5.0 / commit fcec9177" scored ~1.03
+    and landed at ranks 24-27.  Recall fetches five, so the answer was
+    unreachable — and every replay of the question writes another copy, so the
+    margin widens each time it is asked.
+
+    No ranking weight fixes that: MMR's diversity term is 0.18 and the gap is
+    0.6.  The exclusion has to happen before the pool is cut.  The test is
+    punctuation and role, not vocabulary — there is no question-word list to
+    keep in sync with the languages people actually type.  A user turn that
+    states a fact ("我们升级到了 0.5.0") is not a question and stays.
+    """
+
+    if str(role or "").strip().casefold() != "user":
+        return False
+    return str(content or "").strip().endswith(_INTERROGATIVE_ENDINGS)
+
+
+def _is_accepted(row: sqlite3.Row) -> bool:
+    """True when a record has been through the lifecycle, not merely proposed.
+
+    L0/L1 capture lands as ``verified``; L2/L3 promotion sets ``accepted``.  A
+    record still marked ``candidate`` is a proposal awaiting review, so it has
+    not earned the promotion bonus its layer label would otherwise grant.
+    """
+
+    keys = row.keys()
+    if "accepted" in keys and row["accepted"]:
+        return True
+    status = str((row["status"] if "status" in keys else "") or "").strip().casefold()
+    return status in {"accepted", "verified"}
+
+
 def _terms(query: str) -> list[str]:
-    return [
-        term.casefold()
-        for term in re.findall(r"[\w一-龥./:-]{2,}", query, re.UNICODE)
-        if term.casefold() not in STOP_WORDS
-    ]
+    """Tokenize a query the same way every other retrieval plane does.
+
+    The word regex this used to rely on splits on whitespace and punctuation,
+    which works for languages that put spaces between words.  Chinese does not,
+    so a whole clause came back as a single token: "octo-daemon 升级到哪个版本
+    了?当时是怎么验证的?" tokenized to ``['octo-daemon', '升级到哪个版本了',
+    '当时是怎么验证的']``.  Those clause-length strings appear verbatim in
+    exactly one place — the stored copy of that same question — so a question
+    could only ever lexically match itself.  Measured live: the assistant turns
+    holding the answer matched on ``octo-daemon`` alone and scored 0.16 against
+    the echo's 0.48.
+
+    Character bigrams were the first fix, and they did recall the answer.  Word
+    segmentation replaces them because it recalls the same answer with far less
+    noise, and because keeping four planes on four tokenizers meant a query
+    behaved differently depending on which one answered it.  Note that the
+    unsegmented run is no longer kept as a term: it was precisely the token that
+    could only match the echo, and ``is_question_turn`` now drops that echo on a
+    principled basis rather than by out-scoring it.
+    """
+
+    return plane_terms(query, STOP_WORDS)
 
 
 def _lifecycle(content: str, default: str = "verified") -> str:
@@ -833,29 +893,77 @@ class StandaloneMemoryClient:
         latest_requested = bool(_LATEST_QUERY.search(query))
         now = time.time()
         ranked = []
+        seen_content: dict[str, dict[str, Any]] = {}
         for row in self._rows(query, limit):
             content = str(row["content"])
+            # Drop the question before it can compete — see ``is_question_turn``.
+            # Everything excluded here is already discarded downstream by the
+            # answer surface, so this widens what reaches the caller; it cannot
+            # remove a result that used to be served.
+            if is_question_turn(row["role"], content):
+                continue
             matched = [term for term in terms if term in content.casefold()]
             semantic_score = cosine(query_vector, unpack(row["embedding"], int(row["embedding_dim"] or EMBEDDING_DIMENSION)))
             if not matched and semantic_score < 0.12:
                 continue
             layer = str(row["layer"])
+            # The promotion premium is paid for having been promoted, so it has
+            # to be gated on promotion actually having happened.  Paying it on
+            # the layer label alone gave all 45 unaccepted L2 candidates +0.35
+            # against an accepted L1 turn's +0.2 — a head start for generated
+            # text nobody accepted.  Measured on this store: once the query
+            # echoes were excluded, ten candidate envelopes ("status: candidate
+            # / generated: true") took ranks 1-10 at ~1.15 and pushed the
+            # accepted answers at ~1.03 out of a five-deep recall window, even
+            # though the answer surface discards candidates on sight.  An
+            # unaccepted candidate is a proposal about L1 evidence, so it scores
+            # as that evidence rather than as the tier it aspires to.
+            promoted = _is_accepted(row)
             bonus = {"L3": 0.45, "L2": 0.35, "L1": 0.2, "L0": 0.0}.get(layer, 0.0)
+            if not promoted:
+                bonus = min(bonus, 0.2)
             lexical_score = min(0.65, len(matched) * 0.16)
             recency_score = self._recency_score(row, now=now, latest_requested=latest_requested)
             feedback_score = max(-0.2, min(0.2, float(row["priority"] or 0.0) * 0.12))
             relevance = semantic_score + lexical_score + bonus + recency_score + feedback_score
-            ranked.append({
+            entry = {
                 "id": str(row["id"]),
                 "row": row,
                 "matched": matched,
                 "semantic_score": semantic_score,
                 "recency_score": recency_score,
                 "_relevance": relevance,
+                "_promoted": promoted,
                 "_vector": unpack(row["embedding"], int(row["embedding_dim"] or EMBEDDING_DIMENSION)),
-            })
+            }
+            # Byte-identical turns are one memory stored many times, not many
+            # memories.  MMR is meant to suppress them but is a weighted
+            # preference, so a duplicate that scores higher than everything else
+            # still fills the window with itself.  Keep the best-ranked copy and
+            # let the rest of the window hold different content.
+            key = hashlib.sha256(content.strip().encode("utf-8")).hexdigest()
+            previous = seen_content.get(key)
+            if previous is None:
+                seen_content[key] = entry
+                ranked.append(entry)
+            elif relevance > float(previous["_relevance"]):
+                previous.update(entry)
         ranked.sort(key=lambda item: (-float(item["_relevance"]), str(item["id"])))
-        selected = self._mmr_select(ranked[: max(20, int(limit) * 8)], limit)
+        # Accepted evidence and unreviewed candidates are separated by every
+        # caller *after* retrieval, so letting them compete for the same slots
+        # means a caller asking for five memories can receive five records the
+        # answer surface will throw away.  That is what happened here: seven
+        # candidate envelopes outranked the accepted turns holding the answer,
+        # and a five-deep recall came back empty.  Fill from the accepted pool
+        # first and let candidates take what is left, so candidates still
+        # surface when there is little else — which is when they are useful —
+        # without ever displacing evidence.
+        window = max(20, int(limit) * 8)
+        promoted_pool = [item for item in ranked if item.get("_promoted")]
+        candidate_pool = [item for item in ranked if not item.get("_promoted")]
+        selected = self._mmr_select(promoted_pool[:window], limit)
+        if len(selected) < limit:
+            selected += self._mmr_select(candidate_pool[:window], limit - len(selected))
         results = []
         connection = self._connect()
         try:
@@ -901,6 +1009,10 @@ class StandaloneMemoryClient:
             "snippet": content[:512],
             "memory_layer": layer,
             "memory_type": {"L0": "conversation", "L1": "atomic", "L2": "scenario", "L3": "profile"}.get(layer, "memory"),
+            # ``get()`` has always returned the role; search dropped it, so the
+            # answer surface could not tell a captured user turn from an
+            # assistant answer and had to guess from the text.
+            "memory_role": row["role"],
             "tier": tier,
             "ref_kind": ref_kind,
             "ref_id": record_id,

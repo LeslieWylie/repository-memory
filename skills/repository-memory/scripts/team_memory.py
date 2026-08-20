@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Callable, Protocol, TypeVar
 
 from discovery import data_root
+from tokenize_query import fts5_can_match, plane_terms
 
 MEMORY_TYPES = {"evidence", "decision", "discovery", "failure", "solution", "handoff"}
 STATUSES = {"candidate", "active", "superseded", "stale"}
@@ -30,9 +31,14 @@ SECRET_CONTENT = re.compile(
     r"-----BEGIN .*PRIVATE KEY-----|(?:api[_-]?key|access[_-]?token|password|secret)\s*[:=]\s*['\"]?[A-Za-z0-9_\-/.+=]{16,}|\bsk-[A-Za-z0-9_-]{16,}",
     re.IGNORECASE,
 )
+# Nouns that describe this store rather than anything stored in it: in Team
+# Memory every record is a "memory" about a "project" for the "team", so those
+# select everything.  That is a field-specific filter.  Language-level question
+# scaffolding (的/是/最近/什么) lives in ``tokenize_query.STOP_TERMS`` and is
+# dropped before these are consulted.
 STOP_WORDS = {
     "the", "and", "for", "with", "from", "this", "that", "what", "when", "where",
-    "which", "about", "project", "memory", "team", "最近", "最近的", "之前", "怎么", "什么",
+    "which", "about", "project", "memory", "team",
 }
 MEMORY_PAYLOAD_FIELDS = (
     "id", "memory_type", "title", "content", "summary", "scope", "provenance",
@@ -64,8 +70,14 @@ def _parse(value: Any, default: Any) -> Any:
 
 
 def _terms(value: str) -> list[str]:
-    raw = re.findall(r"[\w一-龥./:#-]{2,}", value or "", re.UNICODE)
-    return [term.casefold() for term in dict.fromkeys(raw) if term.casefold() not in STOP_WORDS]
+    """Tokenize a query the same way every other retrieval plane does.
+
+    This used to be ``[\\w一-龥./:#-]{2,}`` with no segmentation, so a Chinese
+    question arrived as one clause-length token that occurs verbatim nowhere and
+    this store was simply unreachable in Chinese.
+    """
+
+    return plane_terms(value, STOP_WORDS)
 
 
 def _default_node_id() -> str:
@@ -462,6 +474,12 @@ class SQLiteTeamMemoryBackend:
         valid_until = str(payload.get("valid_until") or "") or None
         def operation(connection: sqlite3.Connection) -> dict[str, Any]:
             existing = connection.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
+            if existing is None and idempotency:
+                # ``idempotency_key`` is UNIQUE, so a row published under an
+                # earlier id scheme still owns this key.  Matching on the id
+                # alone would miss it and turn a re-publish into an
+                # IntegrityError instead of the documented duplicate receipt.
+                existing = connection.execute("SELECT * FROM memories WHERE idempotency_key = ?", (idempotency,)).fetchone()
             if existing:
                 return {"schema_version": 1, "ok": True, "duplicate": True, "memory": self._row(existing), "canonical_repo_changed": False}
             superseded_row = connection.execute("SELECT * FROM memories WHERE id = ?", (supersedes,)).fetchone() if supersedes else None
@@ -524,7 +542,12 @@ class SQLiteTeamMemoryBackend:
         terms = _terms(query)
         connection = self._connect()
         try:
-            if self._fts_available(connection) and terms:
+            # FTS is only a candidate pre-filter; the real match is the
+            # substring pass below, which is CJK-safe.  Scan instead of
+            # pre-filtering when the index cannot see a term — see
+            # ``tokenize_query.fts5_can_match``.
+            prefilter = bool(terms) and all(fts5_can_match(term) for term in terms)
+            if self._fts_available(connection) and prefilter:
                 match = " OR ".join('"' + term.replace('"', "") + '"' for term in terms)
                 rows = connection.execute("SELECT m.* FROM memories m JOIN memories_fts f ON f.id = m.id WHERE memories_fts MATCH ?", (match,)).fetchall()
             else:

@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -413,7 +414,7 @@ def import_team_memory(repository: str | None = None, *, include_candidates: boo
         paths.extend((base / "l1/candidate").glob("*.md"))
         paths.extend((base / "l2/candidate").glob("*.md"))
         paths.extend((base / "l3/candidate").glob("*.md"))
-    imported = skipped = 0
+    imported = skipped = failed = 0
     store = team_memory_store()
     for path in sorted(paths):
         fields, body = _frontmatter(path.read_text(encoding="utf-8"))
@@ -470,23 +471,31 @@ def import_team_memory(repository: str | None = None, *, include_candidates: boo
             "title": title,
             "content": content[:12000],
             "summary": summary or content[:400],
-            "status": local_status,
+            # A newly hydrated record can only enter the local store as
+            # candidate or active.  Canonical ``stale``/``superseded`` states
+            # land as candidate for review, matching the default_status guard
+            # below; the canonical state stays visible in provenance.
+            "status": local_status if local_status in {"candidate", "active"} else "candidate",
             "confidence": float(fields.get("confidence") or 0.5),
             "scope": scope,
-            "provenance": provenance,
+            "provenance": {**provenance, "canonical_status": local_status},
             "reviewed_by": fields.get("reviewed_by"),
             "activated_at": fields.get("accepted_at"),
             "idempotency_key": f"central:{central_id}",
         }
         try:
             result = store.publish(payload, default_status=local_status if local_status in {"candidate", "active"} else "candidate")
-        except (OSError, RuntimeError, TypeError, ValueError):
+        except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
+            # Hydration is best-effort per record.  One unreadable or
+            # conflicting canonical file must not abort the whole pull, which
+            # would otherwise propagate into the caller's turn capture.
+            failed += 1
             continue
         if result.get("duplicate"):
             skipped += 1
         else:
             imported += 1
-    return {"ok": True, "status": "hydrated", "repository_root": str(root), "imported": imported, "skipped": skipped, "canonical_repo_changed": False}
+    return {"ok": True, "status": "hydrated", "repository_root": str(root), "imported": imported, "skipped": skipped, "failed": failed, "canonical_repo_changed": False}
 
 
 def sync_team_memory(repository: str | None = None, *, agent_id: str | None = None, pull: bool = True) -> dict[str, Any]:

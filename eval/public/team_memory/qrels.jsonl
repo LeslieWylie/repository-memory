@@ -2,3 +2,6 @@
 {"query_id":"tm-failure","memory_id":"team:failure:sqlite-lock","relevance":2,"reason":"The failure record directly covers concurrent SQLite locks and retry."}
 {"query_id":"tm-solution","memory_id":"team:solution:portable-bundle","relevance":2,"reason":"The solution record directly covers bundle export and import across machines."}
 {"query_id":"tm-handoff","memory_id":"team:handoff:runner","relevance":2,"reason":"The handoff directly covers the runner and next agent."}
+{"query_id":"tm-cjk-decision","memory_id":"team:decision:cjk-scheduler","relevance":2,"reason":"A Chinese question with its scaffolding intact must still reach the record about 调度链验证; before segmentation the whole clause was one unmatchable token."}
+{"query_id":"tm-cjk-failure","memory_id":"team:failure:cjk-quota","relevance":2,"reason":"火山云 is not in the segmenter dictionary and comes back as 火山 + 云; rejoining adjacent segments is what recovers it, with no user dictionary."}
+{"query_id":"tm-cjk-date","memory_id":"team:handoff:cjk-date","relevance":2,"reason":"People ask 8月18日 and records write 2026-08-18. Without normalizing the date to the form the corpus uses, the term is required, occurs nowhere, and the query abstains."}

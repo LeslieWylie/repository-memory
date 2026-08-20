@@ -1,156 +1,131 @@
 ---
 name: repository-memory
-description: Find source-backed project facts and durable conversation memory with verified citations, freshness status, and explicit write boundaries.
+description: Answer questions about this project, its history, past conversations, and prior team decisions from source-backed evidence with verified citations. Use whenever the user asks what something is, why it was decided, what happened before, or what the team already knows.
 ---
 
 # Repository Memory
 
-Use this Skill when the user asks about project knowledge, research notes,
-reports, repository history, source-level evidence, or explicitly imported
-long-term memory. It is a generic local Skill: discover the repository,
-adapter, runtime, and index at execution time. Do not invent paths, providers,
-models, ports, or service URLs.
-
-## Required first-use flow
-
-Use the host's namespaced repository-memory MCP when available. The public MCP
-tools are:
+## The one call
 
 ```text
-repository-memory__memory_doctor
-repository-memory__memory_sync
-repository-memory__memory_search
-repository-memory__memory_get
-repository-memory__memory_timeline
-repository-memory__memory_observe
-repository-memory__memory_reflect
+memory_search(query=<the user's question, verbatim>)
 ```
 
-The exact namespace is host-defined. A bare `memory_search` may belong to a
-different backend; do not silently substitute it.
+That is the whole interface for reading. It searches three planes at once and
+keeps them apart:
 
-Before the first query, or after the environment changes:
+- **`verified` / `results` / `answerable`** — repository evidence with
+  commit/path/line citations. This is the answer surface.
+- **`groups.memory`** — durable conversation memory (L0–L3).
+- **`groups.team`** — reviewed team decisions, failures, solutions,
+  discoveries, and handoffs, split into `active` and `candidates`.
 
-1. Call `memory_doctor` (or the bundled CLI `doctor --json`).
-2. Confirm the actual source, indexed commit, freshness, adapter, retrieval
-   mode, and memory-layer population. `ready` means usable, not populated.
-3. If the source is missing or stale, call `memory_sync`, then run doctor
-   again. Do not claim a stale or dirty checkout is fresh.
-   Do not set `local=true` merely because the worktree is dirty. The default
-   is the clean remote snapshot; use local mode only when the user explicitly
-   asks for an offline/local-worktree inspection.
-4. For a new installation, run one real positive query and one fabricated
-   negative query before reporting the setup as working.
+Send the question as the user wrote it. Do not translate it into a filename,
+do not pre-select a scope, and do not call `memory_doctor` first. Ask, then
+read what came back.
 
-If the MCP and bundled CLI are both absent, report `not_installed`. A config
-file or a model-written receipt is not proof of installation.
+Use the host's namespaced name when there is one (`repository-memory__memory_search`).
+A bare `memory_search` may belong to a different backend; do not substitute it.
 
-## Query flow
+## Capability boundary
 
-For ordinary project questions, preserve the user's wording and call:
+It answers from the registered stores and nothing else: the Git corpus
+(cited), reviewed team records, and captured conversation memory. `abstain`
+means those stores hold no evidence for the claim — that is the tool working,
+not failing. It never guesses, and a retry padded with invented specifics
+will not change the outcome.
 
-```text
-memory_search(query=<user's original question>, scope="repository")
-```
+Consulting it is a judgment call, not a ritual. Reach for it when the
+question is about this project or team — what happened, who did what and
+when, why something was decided, what the team already knows. Skip it for
+general knowledge, the outside world, or content already open in the
+session; answering those directly is correct use of this Skill.
 
-Do not add `local=true` to this call unless the user explicitly requested the
-local checkout. A dirty local worktree is not an acceptable default source for
-project facts.
+Every host reaches the same runtime and result contract: Claude Code and
+Codex through this Skill plus the audited `repository-memory` MCP server,
+OpenClaw through the native `repository-memory__memory_*` tools, and any
+other harness through the stdio MCP (`repository-memory mcp`) or the bundled
+CLI (`scripts/repository-memory.py search|get|doctor --json`).
 
-Do not manually turn a natural-language question into a filename. The runtime
-handles conservative lexical, structural, date, and local semantic routing.
-Use `scope="memory"` only for conversation memory, and `scope="all"` when the
-user explicitly wants both. Repository evidence and conversation memory must
-remain separate; never present a memory record as a Git citation.
+## Reading the answer
 
-After search:
+1. Answer from `answerable`/`results`, not from the mere presence of `verified`.
+2. `abstain` covers the repository plane only. Before giving up, read
+   `answered_by`: if it names `memory` or `team`, answer from that group and
+   label it as conversation memory or a team decision, not as a citation.
+3. Call `memory_get` when the claim is important, compound, or time-sensitive.
+4. Report source, commit, path or memory layer, line range, and freshness.
+5. If `claim_support` is `partial`, state only the supported subclaim.
+6. If `answered_by` is empty, say the evidence is insufficient. Do not
+   substitute a similar document.
+7. If `citation.pinned` is false (`evidence_status: worktree`), the excerpt was
+   read back from the working tree and matched, but the source has uncommitted
+   changes. Answer from it, and attribute it to the working tree rather than to
+   a commit.
 
-1. Prefer `answerable`/`results`, not merely the presence of `verified`.
-2. For the selected result, call `memory_get` when the claim is important,
-   compound, partial, or time-sensitive.
-3. Answer only from evidence whose citation is valid and whose freshness is
-   acceptable. Report source/repository, commit, path or memory layer, line
-   range or locator, freshness, and evidence status.
-4. If `claim_support` is `partial` or `unknown`, state only the supported
-   subclaim and abstain from the rest.
-5. If no directly supported result exists, say that the evidence is
-   insufficient. Do not fill the gap with a similar document.
+`verified` means a citation or memory identifier checked out — not that one
+excerpt proves every part of a compound question. `candidates` are leads:
+stale, generated, inferred, or citation-incomplete content is not a fact until
+`memory_get` validates it.
 
-Use `memory_timeline` only when the user asks how a conversation memory was
-formed or when diagnosing L0/L1 capture. It is provenance for the memory lane,
-not a Git citation and not a reason to promote L2/L3.
+Team records are experience provenance, never Git citations. Never present one
+as a source citation.
 
-Use `memory_observe` for an ordered, raw local-memory trace. Use
-`memory_reflect` only when a bounded derived summary is useful; its output is
-always generated/candidate-labelled and must not be treated as an accepted
-fact without inspecting its evidence and lifecycle status.
+Report the actual `retrieval_mode`. If it says `lexical` or `keyword-only`,
+do not call the retrieval semantic or hybrid.
 
-`verified` means the runtime checked a citation or a stable memory
-layer/identifier. It does not mean one excerpt proves every part of a
-compound question. `candidates` are leads only: stale, dirty, generated,
-inferred, pending, or citation-incomplete content is not a fact until it is
-validated with `memory_get`/`explain` and the lifecycle rules allow it.
-
-When semantic dependencies are unavailable, report the actual
-`retrieval_mode` (for example `lexical-fallback` or `keyword-only`). Never
-call keyword retrieval semantic or hybrid. The runtime may use a local,
-dependency-free projection, but its availability must come from doctor/search.
+If the response reports the source as `not_configured` or stale, then call
+`memory_doctor`, and `memory_sync` if it asks for one. If neither the MCP nor
+the bundled CLI exists, report `not_installed` — a config file or a
+model-written receipt is not proof of installation.
 
 ## Memory layers and writes
 
-The standalone runtime keeps these layers distinct:
-
 ```text
-L0  raw conversation/message       explicit ingest or opt-in capture
-L1  extracted atomic memory         read-back verified before use
-L2  scenario/context                candidate until explicit review
-L3  profile/core memory             explicit accept/promote plus read-back
+L0  raw conversation/message      explicit ingest or opt-in capture
+L1  extracted atomic memory       read-back verified before use
+L2  scenario/context              candidate until explicit review
+L3  profile/core memory           explicit accept/promote plus read-back
 ```
 
-An API being reachable does not prove that a layer contains useful data. Use
-doctor or get to distinguish capability, readiness, population, status, and
-read-back. Do not claim L2/L3 exists merely because the endpoint supports it.
+A reachable endpoint does not prove a layer holds anything. Use doctor or get
+to separate capability, readiness, population, and read-back.
 
-Normal search and sync are read/index operations. Only run `ingest-session`,
-`feedback`, `promote`, Team Memory publish/activate, or host capture when the
-user or an explicit task-end workflow requests a write. Never silently rewrite
-the canonical repository. New memories remain candidate/pending until the
-documented review or promotion step; ordinary conversation never writes L3.
-
-For candidate review, run `supervise --lane all --json`. It reports `hold`
-when no user-configured supervisor command is available. Only explicit
-`--apply`, with a valid model decision and read-back, changes user-level L2 or
-Team Memory state. L3 still requires an explicit promotion operation.
-
-For multi-agent reuse, a host may configure a user-owned Git Team Memory
-repository. L0 remains local; an enabled post-turn capture exports only a
-sanitized L1 candidate to `knowledge/team-memory/inbox/<agent>/`, and
-`team-sync` hydrates reviewed active/accepted records back into the local
-runtime. Team sync is an explicit configured write: it never commits or pushes
-and it never promotes a candidate. Keep repository evidence, team memory, and
-local memory labelled as separate result groups.
-
-For reproducible measurements, run `benchmark --suite public` or provide a
-user-owned external benchmark manifest. The runtime does not download or
-silently reshape third-party datasets, and it does not claim leaderboard
-performance from the bundled fixture.
+Search and sync are read operations. Only run `ingest-session`, `feedback`,
+`promote`, Team Memory publish/activate, or host capture when the user or an
+explicit task-end workflow asks for a write. New memories stay
+candidate/pending until the documented review step; ordinary conversation
+never writes L3. Never rewrite the canonical repository.
 
 ## Tool boundary
 
-The Skill does not forbid normal development tools. `read`, `grep`, `git`,
-`exec`, tests, and debugging remain valid for coding tasks. For a project-fact
-answer, however, do not use them as an undocumented substitute for the
-repository-memory MCP, and do not describe directly inspected files as MCP
-citations. If the source is not registered, explicitly register it with the
-CLI only after the user supplies or confirms the repository root.
+`read`, `grep`, `git`, `exec`, tests, and debugging remain valid for coding
+work. For a project-fact answer, do not use them as an undocumented substitute
+for this MCP, and never describe a directly-read file as an MCP citation.
+
+## Advanced
+
+Only when the single call is not enough:
+
+- `memory_get` — resolve one result and its evidence window.
+- `memory_doctor` / `memory_sync` — diagnose or refresh sources.
+- `memory_timeline` / `memory_observe` — how a conversation memory was formed;
+  provenance for the memory lane, not a Git citation.
+- `memory_reflect` — bounded derived summary, always candidate-labelled.
+- `scope="repository" | "memory" | "all"` — pin a single plane. The default
+  `auto` is correct for ordinary questions.
+- `local=true` — only when the user explicitly asks for the offline worktree.
+  A dirty worktree is not an acceptable default source for project facts.
 
 Read the references only when needed:
 
-- `references/operations.md` — CLI commands and MCP handshake;
-- `references/result-contract.md` — `verified`, `answerable`, and candidates;
+- `references/result-contract.md` — `verified`, `answerable`, candidates;
 - `references/citation.md` — citation validation;
-- `references/entity-and-memory-model.md` — routing and L0–L3 semantics;
+- `references/retrieval.md` — routing and retrieval-mode honesty;
+- `references/entity-and-memory-model.md` — L0–L3 semantics;
 - `references/write-policy.md` — explicit writes and promotion;
 - `references/automatic-capture.md` — optional host lifecycle capture;
-- `references/team-memory.md` — shared decisions and handoffs.
-- `docs/team-memory-git-sync.md` — Git-backed multi-agent sync and review flow.
+- `references/team-memory.md` — shared decisions and handoffs;
+- `references/operations.md` — CLI commands and MCP handshake;
+- `references/host-guard.md` — host routing and the advisory guard;
+- `docs/team-memory-git-sync.md` — Git-backed multi-agent sync and review.
