@@ -24,7 +24,11 @@ from typing import Any, Callable, Protocol, TypeVar
 from discovery import data_root
 from tokenize_query import fts5_can_match, plane_terms
 
-MEMORY_TYPES = {"evidence", "decision", "discovery", "failure", "solution", "handoff"}
+# ``scenario`` is the L2 record kind this system's own supervisor writes and
+# the canonical exporter publishes under ``l2/accepted``.  It was missing here,
+# so a hydrating store rejected a file the same pipeline had produced -- every
+# host showed ``failed: 1`` on pull for the first accepted scenario.
+MEMORY_TYPES = {"evidence", "decision", "discovery", "failure", "solution", "handoff", "scenario"}
 STATUSES = {"candidate", "active", "superseded", "stale"}
 RATINGS = {"helpful", "not_helpful", "stale", "wrong"}
 SECRET_CONTENT = re.compile(

@@ -73,6 +73,7 @@ from semantic_repository import summary as semantic_summary
 from team_memory import team_memory_store
 from team_repository import (
     configure_team_repository,
+    distinct_memory_counts,
     export_team_memory as export_team_repository,
     import_team_memory as import_team_repository,
     sync_team_memory,
@@ -2439,7 +2440,7 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
         elif args.command == "team-sync":
             value = sync_team_repo(args.repository, agent_id=args.agent_id, pull=not bool(args.no_pull))
         elif args.command == "team-status":
-            value = {"schema_version": SCHEMA_VERSION, "team_memory": team_memory_store().health(), "team_repository": team_repository_health(args.repository), "canonical_repo_changed": False}
+            value = {"schema_version": SCHEMA_VERSION, "team_memory": team_memory_store().health(), "team_memory_distinct": distinct_memory_counts(), "team_repository": team_repository_health(args.repository), "canonical_repo_changed": False}
         elif args.command == "team-evaluate":
             from team_memory_eval import evaluate_team_memory
 

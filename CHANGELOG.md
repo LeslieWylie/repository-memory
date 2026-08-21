@@ -164,6 +164,20 @@
   the document's own vocabulary, guided by those terms, and still never to pad
   a retry with invented specifics.
 
+- Let a hydrating store accept the `scenario` records this pipeline itself
+  exports. The supervisor writes accepted L2 scenarios and the exporter
+  publishes them under `l2/accepted`, but the store's type vocabulary predated
+  L2 export — so every host's pull reported `failed: 1` on the first accepted
+  scenario, and the JSON did not say which file. Hydration failures now carry
+  `failures: [{path, error}]`, and the whole per-file body sits inside the
+  guard: a malformed `confidence:` used to escape the narrower try and abort
+  the entire pull.
+- Report `team_memory_distinct` in team-status: memories grouped by canonical
+  identity, beside the raw row counts. One memory can sit in the store as a
+  local original plus a hydrated central wrapper, so row counts overstate the
+  plane — measured: a fresh host hydrated 75 active canonical files and was
+  told to expect "140+" because another machine's row count said 143.
+
 ## 0.7.15
 
 - Protect existing canonical Team Memory Markdown during automatic hydration

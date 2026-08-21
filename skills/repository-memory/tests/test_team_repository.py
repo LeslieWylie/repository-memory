@@ -113,7 +113,9 @@ def test_publish_matches_existing_idempotency_key_under_a_changed_id_scheme(tmp_
 
 
 def test_import_counts_rejected_records_instead_of_aborting(tmp_path, monkeypatch):
-    """One unusable canonical file must not stop the rest of the hydration."""
+    """One unusable canonical file must not stop the rest of the hydration,
+    and the result must name it: two hosts reproduced ``failed: 1`` and
+    neither could say which record it was."""
 
     repository = tmp_path / "team-data"
     active = repository / "knowledge/team-memory/l1/active"
@@ -122,13 +124,13 @@ def test_import_counts_rejected_records_instead_of_aborting(tmp_path, monkeypatc
     monkeypatch.setenv("REPOSITORY_MEMORY_TEAM_DB", str(tmp_path / "team.sqlite3"))
     monkeypatch.setenv("REPOSITORY_MEMORY_CONFIG", str(tmp_path / "config.json"))
 
-    def write(name: str, central_id: str, kind: str) -> None:
+    def write(name: str, central_id: str, kind: str, confidence: str = "0.5") -> None:
         (active / name).write_text(
             "---\n"
             f"id: {central_id}\n"
             f"kind: {kind}\n"
             "status: active\n"
-            "confidence: 0.5\n"
+            f"confidence: {confidence}\n"
             "---\n\n"
             f"# {central_id}\n\n"
             "## Summary\n\nSummary line.\n\n"
@@ -136,15 +138,23 @@ def test_import_counts_rejected_records_instead_of_aborting(tmp_path, monkeypatc
             encoding="utf-8",
         )
 
-    # ``scenario`` is not part of the team memory type vocabulary.
-    write("bad.md", "team_l2_unsupported", "scenario")
+    # ``scenario`` is the supervisor's own L2 kind; the store must accept what
+    # the same pipeline exports.
+    write("scenario.md", "team_l2_scenario", "scenario")
     write("good.md", "team_l1_supported", "discovery")
+    write("bad-kind.md", "team_l1_bad_kind", "not-a-kind")
+    # A malformed confidence used to escape the narrower try and abort the
+    # entire hydration; now it is one counted, named failure.
+    write("bad-confidence.md", "team_l1_bad_confidence", "discovery", confidence="not-a-number")
     configure_team_repository(str(repository), auto_sync=True, agent_id="yaole")
 
     result = import_team_memory(include_candidates=False)
     assert result["ok"] is True
-    assert result["imported"] == 1
-    assert result["failed"] == 1
+    assert result["imported"] == 2
+    assert result["failed"] == 2
+    named = {failure["path"].rsplit("/", 1)[-1].rsplit("\\", 1)[-1] for failure in result["failures"]}
+    assert named == {"bad-kind.md", "bad-confidence.md"}
+    assert all(failure["error"] for failure in result["failures"])
 
 
 def test_import_hydrates_stale_canonical_records_as_candidates(tmp_path, monkeypatch):

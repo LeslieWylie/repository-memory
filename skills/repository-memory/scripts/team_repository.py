@@ -420,87 +420,93 @@ def import_team_memory(repository: str | None = None, *, include_candidates: boo
         paths.extend((base / "l2/candidate").glob("*.md"))
         paths.extend((base / "l3/candidate").glob("*.md"))
     imported = skipped = failed = 0
+    failures: list[dict[str, str]] = []
     store = team_memory_store()
     for path in sorted(paths):
-        fields, body = _frontmatter(path.read_text(encoding="utf-8"))
-        central_id = fields.get("id")
-        if not central_id:
-            continue
-        status = fields.get("status", "candidate")
-        if status == "accepted":
-            local_status = "active"
-        elif status in {"active", "candidate", "stale", "superseded"}:
-            local_status = status
-        else:
-            continue
-        title_match = re.search(r"^#\s+(.+)$", body, re.MULTILINE)
-        title = title_match.group(1).strip() if title_match else central_id
-        summary_match = re.search(r"^## Summary\s*\n\s*(.*?)(?=\n## Content\s*\n|\Z)", body, re.MULTILINE | re.DOTALL)
-        content_match = re.search(r"^## Content\s*\n\s*(.*?)(?=\n## Evidence\s*\n|\Z)", body, re.MULTILINE | re.DOTALL)
-        summary = summary_match.group(1).strip() if summary_match else ""
-        content = content_match.group(1).strip() if content_match else body[:12000]
-        evidence: list[dict[str, str]] = []
-        evidence_match = re.search(r"^evidence:\s*\n(?P<items>(?:\s*- .*\n?)*)", path.read_text(encoding="utf-8"), re.MULTILINE)
-        for item in (evidence_match.group("items").splitlines() if evidence_match else []):
-            raw = item.strip()
-            if not raw.startswith("-"):
-                continue
-            parsed: dict[str, str] = {}
-            for part in raw[1:].strip().split("; "):
-                if "=" in part:
-                    key, value = part.split("=", 1)
-                    parsed[key.strip()] = value.strip()
-            if parsed:
-                evidence.append(parsed)
-        source_memory_id = fields.get("source_memory_id")
-        scope = _parse_json(fields.get("scope"), {})
-        provenance = {
-            "source": "team-knowledge-data",
-            "canonical_path": str(path.relative_to(root)),
-            "layer": fields.get("layer", "L1"),
-            "agent_id": fields.get("agent_id"),
-            "central_id": central_id,
-            "source_memory_id": source_memory_id,
-            "observed_at": fields.get("observed_at"),
-            "run_id": fields.get("run_id"),
-            "session_id": fields.get("session_id"),
-            "evidence": evidence,
-        }
-        payload = {
-            # The canonical ID is the identity shared across local stores.
-            # Keep the original local ID only as provenance; otherwise a
-            # hydrated record would hash to a second central filename when it
-            # is exported again.
-            "id": f"team:central:{central_id}",
-            "type": fields.get("kind", "discovery"),
-            "title": title,
-            "content": content[:12000],
-            "summary": summary or content[:400],
-            # A newly hydrated record can only enter the local store as
-            # candidate or active.  Canonical ``stale``/``superseded`` states
-            # land as candidate for review, matching the default_status guard
-            # below; the canonical state stays visible in provenance.
-            "status": local_status if local_status in {"candidate", "active"} else "candidate",
-            "confidence": float(fields.get("confidence") or 0.5),
-            "scope": scope,
-            "provenance": {**provenance, "canonical_status": local_status},
-            "reviewed_by": fields.get("reviewed_by"),
-            "activated_at": fields.get("accepted_at"),
-            "idempotency_key": f"central:{central_id}",
-        }
+        # Best-effort per record: one unreadable or malformed canonical file
+        # must not abort the whole pull.  The whole per-file body sits inside
+        # the guard -- a bad ``confidence:`` or an unreadable file used to
+        # escape the old narrower try and kill the entire hydration.  And the
+        # failure names its file: two hosts reproduced ``failed: 1`` and
+        # neither could say which record it was.
         try:
+            fields, body = _frontmatter(path.read_text(encoding="utf-8"))
+            central_id = fields.get("id")
+            if not central_id:
+                continue
+            status = fields.get("status", "candidate")
+            if status == "accepted":
+                local_status = "active"
+            elif status in {"active", "candidate", "stale", "superseded"}:
+                local_status = status
+            else:
+                continue
+            title_match = re.search(r"^#\s+(.+)$", body, re.MULTILINE)
+            title = title_match.group(1).strip() if title_match else central_id
+            summary_match = re.search(r"^## Summary\s*\n\s*(.*?)(?=\n## Content\s*\n|\Z)", body, re.MULTILINE | re.DOTALL)
+            content_match = re.search(r"^## Content\s*\n\s*(.*?)(?=\n## Evidence\s*\n|\Z)", body, re.MULTILINE | re.DOTALL)
+            summary = summary_match.group(1).strip() if summary_match else ""
+            content = content_match.group(1).strip() if content_match else body[:12000]
+            evidence: list[dict[str, str]] = []
+            evidence_match = re.search(r"^evidence:\s*\n(?P<items>(?:\s*- .*\n?)*)", path.read_text(encoding="utf-8"), re.MULTILINE)
+            for item in (evidence_match.group("items").splitlines() if evidence_match else []):
+                raw = item.strip()
+                if not raw.startswith("-"):
+                    continue
+                parsed: dict[str, str] = {}
+                for part in raw[1:].strip().split("; "):
+                    if "=" in part:
+                        key, value = part.split("=", 1)
+                        parsed[key.strip()] = value.strip()
+                if parsed:
+                    evidence.append(parsed)
+            source_memory_id = fields.get("source_memory_id")
+            scope = _parse_json(fields.get("scope"), {})
+            provenance = {
+                "source": "team-knowledge-data",
+                "canonical_path": str(path.relative_to(root)),
+                "layer": fields.get("layer", "L1"),
+                "agent_id": fields.get("agent_id"),
+                "central_id": central_id,
+                "source_memory_id": source_memory_id,
+                "observed_at": fields.get("observed_at"),
+                "run_id": fields.get("run_id"),
+                "session_id": fields.get("session_id"),
+                "evidence": evidence,
+            }
+            payload = {
+                # The canonical ID is the identity shared across local stores.
+                # Keep the original local ID only as provenance; otherwise a
+                # hydrated record would hash to a second central filename when it
+                # is exported again.
+                "id": f"team:central:{central_id}",
+                "type": fields.get("kind", "discovery"),
+                "title": title,
+                "content": content[:12000],
+                "summary": summary or content[:400],
+                # A newly hydrated record can only enter the local store as
+                # candidate or active.  Canonical ``stale``/``superseded`` states
+                # land as candidate for review, matching the default_status guard
+                # below; the canonical state stays visible in provenance.
+                "status": local_status if local_status in {"candidate", "active"} else "candidate",
+                "confidence": float(fields.get("confidence") or 0.5),
+                "scope": scope,
+                "provenance": {**provenance, "canonical_status": local_status},
+                "reviewed_by": fields.get("reviewed_by"),
+                "activated_at": fields.get("accepted_at"),
+                "idempotency_key": f"central:{central_id}",
+            }
             result = store.publish(payload, default_status=local_status if local_status in {"candidate", "active"} else "candidate")
-        except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
-            # Hydration is best-effort per record.  One unreadable or
-            # conflicting canonical file must not abort the whole pull, which
-            # would otherwise propagate into the caller's turn capture.
+        except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error) as exc:
             failed += 1
+            if len(failures) < 20:
+                failures.append({"path": str(path.relative_to(root)), "error": f"{type(exc).__name__}: {exc}"[:300]})
             continue
         if result.get("duplicate"):
             skipped += 1
         else:
             imported += 1
-    return {"ok": True, "status": "hydrated", "repository_root": str(root), "imported": imported, "skipped": skipped, "failed": failed, "canonical_repo_changed": False}
+    return {"ok": True, "status": "hydrated", "repository_root": str(root), "imported": imported, "skipped": skipped, "failed": failed, "failures": failures, "canonical_repo_changed": False}
 
 
 def sync_team_memory(repository: str | None = None, *, agent_id: str | None = None, pull: bool = True) -> dict[str, Any]:
@@ -509,6 +515,31 @@ def sync_team_memory(repository: str | None = None, *, agent_id: str | None = No
         return exported
     imported = import_team_memory(repository, include_candidates=True) if pull else {"ok": True, "status": "skipped", "imported": 0, "skipped": 0}
     return {**exported, "pull": imported, "status": "synced", "canonical_repo_changed": bool(exported.get("canonical_repo_changed"))}
+
+
+def distinct_memory_counts() -> dict[str, Any]:
+    """Count memories, not rows, grouped by canonical identity.
+
+    One memory can sit in the local store as two rows -- the local original
+    and a central wrapper hydrated back from the canonical repository -- so
+    ``by_status`` row counts overstate the store.  Measured consequence: a
+    fresh host hydrated 75 active canonical files and was told to expect
+    "140+" because this machine's row count said 143.  The distinct view is
+    what the Git plane holds; a group counts as its most advanced lifecycle
+    state so a half-propagated activation is not reported as candidate.
+    """
+
+    groups: dict[str, list[str]] = {}
+    for record in team_memory_store().export_bundle().get("records", []):
+        if not isinstance(record, dict):
+            continue
+        groups.setdefault(_record_central_id(record, _layer(record)), []).append(str(record.get("status") or "candidate"))
+    order = ("active", "superseded", "stale", "candidate")
+    by_status: dict[str, int] = {}
+    for statuses in groups.values():
+        effective = next((state for state in order if state in statuses), statuses[0])
+        by_status[effective] = by_status.get(effective, 0) + 1
+    return {"total": len(groups), "by_status": by_status}
 
 
 def team_repository_health(repository: str | None = None) -> dict[str, Any]:
