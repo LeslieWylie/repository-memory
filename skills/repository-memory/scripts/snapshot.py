@@ -159,9 +159,24 @@ def prepare_view(spec: SourceSpec, local: bool = False) -> SourceView:
             commit = git(target, "rev-parse", remote_ref)
             if not commit:
                 return local_view(spec, f"remote ref unavailable: {remote_ref}")
-            ok, error = _run(target, ["checkout", "--detach", "--quiet", commit], timeout=120)
+            # ``--force`` because a snapshot worktree holds no legitimate local
+            # edits, and a checkout that was killed mid-write (a caller timeout
+            # is enough) leaves index and HEAD advanced with stale files on
+            # disk -- after which a plain checkout sees nothing to do and the
+            # staleness is permanent.  Measured live: a snapshot labelled
+            # 8a752159 served standup files from a week earlier, and every
+            # question about that week abstained against a corpus that had the
+            # answer.
+            ok, error = _run(target, ["checkout", "--force", "--detach", "--quiet", commit], timeout=120)
             if not ok:
                 return local_view(spec, f"snapshot checkout failed: {_safe_error(error, remote_url)}")
+            # Trust the materialization only after verifying it: a clean
+            # detached snapshot has an empty status.  Anything else means the
+            # worktree still does not match the commit this view is about to
+            # claim, and answering from it would cite lines that are not there.
+            ok, status_output = _run(target, ["status", "--porcelain"], timeout=60)
+            if not ok or status_output.strip():
+                return local_view(spec, "snapshot materialization incomplete after forced checkout")
             return SourceView(
                 spec=spec,
                 path=target,

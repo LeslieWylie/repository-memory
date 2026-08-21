@@ -203,6 +203,16 @@
   proxy-based by design, MemOS documents none) or a first-party CLI, so those
   axes stay ours; what they do better is root-level install docs and
   bilingual entry points, adopted as `INSTALL.md` and `README_CN.md`.
+- Force-materialize remote snapshots and verify them before claiming the
+  commit. A checkout killed mid-write — a caller timeout is enough — leaves
+  the snapshot's index and HEAD advanced while files on disk stay old, and
+  every later plain checkout sees nothing to do, so the staleness is
+  permanent and invisible. Measured live: a snapshot labelled one commit
+  served standup files from a week earlier, and every question about that
+  week abstained against a corpus that had the answer. The checkout now runs
+  `--force` (a snapshot worktree holds no legitimate local edits) and the
+  view falls back to the local worktree, with a reason, when `status
+  --porcelain` is not empty afterwards.
 
 ## 0.7.15
 

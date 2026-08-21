@@ -946,6 +946,28 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertIn("Atlas evidence", (view.path / "docs" / "atlas.md").read_text(encoding="utf-8"))
         self.assertIn("Local uncommitted", (self.alpha / "docs" / "atlas.md").read_text(encoding="utf-8"))
 
+    def test_snapshot_repairs_a_torn_checkout(self):
+        # A checkout killed mid-write (a caller timeout is enough) leaves the
+        # snapshot's index and HEAD advanced while files on disk stay old --
+        # after which a plain checkout sees nothing to do and the staleness is
+        # permanent.  Measured live: a snapshot labelled one commit served
+        # standup files from a week earlier and every question about that week
+        # abstained against a corpus that had the answer.  prepare_view must
+        # re-materialize by force and only claim a commit it verified.
+        bare = Path(self.temp.name) / "torn-origin.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+        subprocess.run(["git", "-C", str(self.alpha), "remote", "add", "origin", str(bare)], check=True)
+        subprocess.run(["git", "-C", str(self.alpha), "push", "-q", "-u", "origin", "main"], check=True)
+        view = prepare_view(SourceSpec("alpha", self.alpha, "alpha"))
+        self.assertEqual(view.commit_type, "remote_snapshot")
+        # Simulate the torn state: worktree content diverges from the commit
+        # the snapshot claims, exactly what an interrupted checkout leaves.
+        (view.path / "docs" / "atlas.md").write_text("stale bytes from last week\n", encoding="utf-8")
+        repaired = prepare_view(SourceSpec("alpha", self.alpha, "alpha"))
+        self.assertEqual(repaired.commit_type, "remote_snapshot")
+        self.assertEqual(repaired.commit, view.commit)
+        self.assertIn("Atlas evidence", (repaired.path / "docs" / "atlas.md").read_text(encoding="utf-8"))
+
     def test_doctor_reports_effective_remote_snapshot_not_dirty_worktree(self):
         bare = Path(self.temp.name) / "doctor-origin.git"
         subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
