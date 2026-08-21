@@ -28,6 +28,28 @@ installed, whatever the rest of the output says.
 Not on PyPI. From a local checkout, `python3 -m pip install
 /path/to/repository-memory` or `python3 install.py --target auto --json`.
 
+## Team-grade install in the same command
+
+The optional planes ride on the same invocation instead of a follow-up
+checklist — CJK tokenizer, remote embeddings, and the shared team plane:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/LeslieWylie/repository-memory/main/bootstrap.sh | sh -s -- \
+  --target auto --source-url "<HTTPS url>" --source-branch main \
+  --cjk \
+  --semantic-provider gateway --semantic-model <model> \
+  --semantic-endpoint <openai-compatible /v1> --semantic-dimensions <n> \
+  --semantic-api-key-env <VAR_NAME> \
+  --team-repository <team knowledge repo HTTPS url> --team-agent-id <node-name> \
+  --json
+```
+
+Only the credential's *name* is ever persisted. `--cjk` failure degrades to
+the builtin tokenizer and is reported, never raised. The receipt's
+`team.publish_cron` field carries the ready-to-paste cron line. A team can
+bake its own defaults into a one-line wrapper that forwards to this
+bootstrap; keep organization URLs there, not here.
+
 ## Per host
 
 - **Claude Code / Codex** — `--target auto` installs the Skill into

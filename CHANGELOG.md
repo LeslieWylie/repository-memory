@@ -222,6 +222,16 @@
   section; with the heading weighted it answers direct out of the right one.
   A heading names what its section is about; that is the same structural fact
   the index already trusts when it derives date anchors from headings.
+- Let one install command configure the whole team-grade setup: `--cjk`
+  (best-effort jieba for the runtime interpreter, PEP 668 reported not
+  raised), `--semantic-*` (encoder provider/model/endpoint/dimensions and a
+  credential *name or path*, configured before source registration so the
+  first sync builds vectors with the right provider), and
+  `--team-repository`/`--team-agent-id` (clone under the data root — publish
+  commits from it, caches may be wiped — then team-configure and a first
+  hydrate; the receipt carries a ready `publish_cron` line). Previously this
+  was a hand-relayed checklist per host: the second host received it as five
+  chat steps and every step grew its own trap.
 
 ## 0.7.15
 

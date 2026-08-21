@@ -588,6 +588,101 @@ def _verify(canonical: Path, require_repository: bool) -> dict[str, Any]:
     }
 
 
+
+def _install_cjk() -> dict[str, Any]:
+    """Best-effort jieba install for the interpreter the CLI shim runs.
+
+    Optional by contract: a failure degrades to the builtin n-gram tokenizer
+    and is reported, never raised — a host without pip or without network
+    still gets a working install.
+    """
+
+    command = [_runtime_python(), "-m", "pip", "install", "--quiet", "jieba>=0.42,<1"]
+    ok, output = _run(command)
+    if not ok and "externally-managed" in output:
+        ok, output = _run([*command[:4], "--user", *command[4:]])
+    if not ok and "externally-managed" in output:
+        output = (
+            "this interpreter is externally managed (PEP 668); install jieba "
+            "yourself via pipx/venv or pip --break-system-packages — the "
+            "builtin n-gram tokenizer keeps working meanwhile: " + output
+        )
+    return {"requested": True, "installed": ok, "error": None if ok else output[:400]}
+
+
+def _configure_semantic(canonical: Path, args: argparse.Namespace) -> dict[str, Any]:
+    command = [
+        _runtime_python(),
+        str(canonical / "scripts" / "repository-memory.py"),
+        "semantic", "configure",
+        "--provider", str(args.semantic_provider),
+        "--json",
+    ]
+    if args.semantic_model:
+        command[-1:-1] = ["--model", str(args.semantic_model)]
+    if args.semantic_endpoint:
+        command[-1:-1] = ["--endpoint", str(args.semantic_endpoint)]
+    if args.semantic_dimensions:
+        command[-1:-1] = ["--dimensions", str(args.semantic_dimensions)]
+    if args.semantic_api_key_env:
+        command[-1:-1] = ["--api-key-env", str(args.semantic_api_key_env)]
+    if args.semantic_api_key_file:
+        command[-1:-1] = ["--api-key-file", str(args.semantic_api_key_file)]
+    if args.semantic_api_key_json_path:
+        command[-1:-1] = ["--api-key-json-path", str(args.semantic_api_key_json_path)]
+    ok, output = _run(command)
+    if not ok:
+        raise RuntimeError(f"semantic configuration failed: {output[:500]}")
+    value = json.loads(output)
+    semantic = value.get("semantic") if isinstance(value.get("semantic"), dict) else {}
+    return {key: semantic.get(key) for key in ("configured", "available", "provider", "model", "dimension", "error")}
+
+
+def _configure_team(canonical: Path, args: argparse.Namespace) -> dict[str, Any]:
+    """Clone (or reuse) the team knowledge repository and wire the team plane.
+
+    The clone lands under the data root, not the cache: publish commits from
+    it, and a cache is allowed to be wiped.
+    """
+
+    raw = str(args.team_repository)
+    if "://" in raw or raw.endswith(".git"):
+        name = raw.rstrip("/").rsplit("/", 1)[-1]
+        name = name[:-4] if name.endswith(".git") else name
+        target = _home() / ".local" / "share" / "repository-memory" / "team" / name
+        if (target / ".git").exists():
+            _run(["git", "-C", str(target), "pull", "--rebase", "--autostash", "--quiet"])
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            ok, output = _run(["git", "clone", "--quiet", raw, str(target)])
+            if not ok:
+                raise RuntimeError(f"team repository clone failed: {output[:500]}")
+    else:
+        target = Path(raw).expanduser().resolve()
+        if not target.exists():
+            raise RuntimeError(f"team repository path does not exist: {target}")
+    runtime = [_runtime_python(), str(canonical / "scripts" / "repository-memory.py")]
+    configure = [*runtime, "team-configure", "--repository", str(target), "--json"]
+    if args.team_agent_id:
+        configure[-1:-1] = ["--agent-id", str(args.team_agent_id)]
+    ok, output = _run(configure)
+    if not ok:
+        raise RuntimeError(f"team configuration failed: {output[:500]}")
+    sync_ok, sync_output = _run([*runtime, "team-sync", "--json"])
+    hydrate = {}
+    if sync_ok:
+        try:
+            hydrate = {key: json.loads(sync_output).get("pull", {}).get(key) for key in ("imported", "skipped", "failed")}
+        except (json.JSONDecodeError, AttributeError):
+            hydrate = {}
+    return {
+        "repository_root": str(target),
+        "agent_id": args.team_agent_id,
+        "hydrate": hydrate if sync_ok else {"error": sync_output[:300]},
+        "publish_cron": f"41 19 * * * {_home()}/.local/bin/repository-memory team-publish --json >> {_home()}/team-publish.log 2>&1",
+    }
+
+
 def install(args: argparse.Namespace) -> dict[str, Any]:
     version = tuple(int(part) for part in platform.python_version_tuple()[:2])
     if version < (3, 10):
@@ -627,6 +722,9 @@ def install(args: argparse.Namespace) -> dict[str, Any]:
             args.openclaw_all_agents,
         )
 
+    cjk_status = _install_cjk() if args.cjk else None
+    semantic_status = _configure_semantic(canonical, args) if args.semantic_provider else None
+
     if args.source_root and args.source_url:
         raise ValueError("use only one of --source-root and --source-url")
     source_root = None
@@ -635,6 +733,7 @@ def install(args: argparse.Namespace) -> dict[str, Any]:
     elif args.source_root:
         source_root = _discover_git_root() if args.source_root == "auto" else Path(args.source_root).expanduser().resolve()
     source_status = _configure_source(canonical, source_root, args.source_local_only) if source_root else None
+    team_status = _configure_team(canonical, args) if args.team_repository else None
     verification = None if args.no_verify else _verify(canonical, require_repository=bool(source_root))
     return {
         "schema_version": 1,
@@ -645,6 +744,9 @@ def install(args: argparse.Namespace) -> dict[str, Any]:
         "hosts": hosts,
         "source": source_status,
         "source_root": str(source_root) if source_root else None,
+        "cjk": cjk_status,
+        "semantic": semantic_status,
+        "team": team_status,
         "public_eval": str(public_eval),
         "verification": verification,
         "next_step": "restart or start a new agent turn, then ask it to use repository-memory",
@@ -662,6 +764,16 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--openclaw-config", help="override the OpenClaw config path")
     value.add_argument("--openclaw-agent", action="append", help="install and enable repository-memory only for this OpenClaw agent; repeat for multiple agents")
     value.add_argument("--openclaw-all-agents", action="store_true", help="explicitly install and enable repository-memory for every configured OpenClaw agent")
+    value.add_argument("--cjk", action="store_true", help="pip-install jieba for the runtime interpreter (optional; failure degrades to the builtin tokenizer)")
+    value.add_argument("--semantic-provider", choices=["gateway", "huggingface", "builtin"], help="configure the optional semantic encoder during install")
+    value.add_argument("--semantic-model", help="encoder model for --semantic-provider")
+    value.add_argument("--semantic-endpoint", help="OpenAI-compatible /embeddings endpoint for the gateway provider")
+    value.add_argument("--semantic-dimensions", type=int, help="embedding dimension for the gateway provider")
+    value.add_argument("--semantic-api-key-env", help="environment variable NAME holding the endpoint credential; only the name is persisted")
+    value.add_argument("--semantic-api-key-file", help="file the credential is read from; only the path is persisted")
+    value.add_argument("--semantic-api-key-json-path", help="dotted JSON path inside --semantic-api-key-file")
+    value.add_argument("--team-repository", help="team knowledge Git repository: an HTTPS URL (cloned under the data root) or an existing local path")
+    value.add_argument("--team-agent-id", help="this node's agent id for team memory publishing")
     value.add_argument("--no-mcp", action="store_true", help="install Skills without registering Codex/Claude MCP")
     value.add_argument("--no-verify", action="store_true", help="skip installed doctor and MCP smoke checks")
     value.add_argument("--json", action="store_true")
