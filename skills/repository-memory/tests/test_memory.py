@@ -519,16 +519,27 @@ class RepositoryMemoryTest(unittest.TestCase):
 
     def test_colloquial_interrogatives_and_spoken_dates_are_scaffolding(self):
         # Measured on live human phrasing: 在干嘛 / 做得怎么样 blocked answerable
-        # questions, and 8月20号 is the spoken register of 8月20日.
-        self.assertEqual(query_terms("武垚乐昨天在干嘛"), ["武垚乐"])
-        self.assertNotIn("得怎么样", query_terms("GLM 迁移做得怎么样了"))
+        # questions, and 8月20号 is the spoken register of 8月20日.  The exact
+        # term list is tokenizer-specific (jieba words vs builtin n-grams), so
+        # assert the contract — the name survives, the colloquial scaffolding
+        # never becomes a jieba-path claim — not one path's output verbatim.
+        from tokenize_query import tokenizer_status
+        colloquial = query_terms("武垚乐昨天在干嘛")
+        self.assertIn("武垚乐", colloquial)
+        self.assertNotIn("昨天", colloquial)
+        if tokenizer_status().get("name") == "jieba":
+            self.assertEqual(colloquial, ["武垚乐"])
+            self.assertNotIn("得怎么样", query_terms("GLM 迁移做得怎么样了"))
         self.assertEqual(query_terms("武垚乐 8月18号 做了什么"), query_terms("武垚乐 8月18日 做了什么"))
         self.assertIn("2026-08-20", query_terms("2026年8月20号 谁提交了"))
         # Modal prefixes and directional complements are closed glue classes:
         # jieba lexicalizes 要切/接进来 as words, the corpus writes 切/接入, and
         # requiring the glue held answerable questions at partial forever.
-        self.assertIn("要切", carved_query_terms("为什么要切 cuDNN"))
+        # 要切 only exists as a term on the jieba path — the builtin marker
+        # split already severs it at the modal — so that assertion is scoped.
         self.assertIn("接进来", carved_query_terms("kimi 的日志接进来了吗"))
+        if tokenizer_status().get("name") == "jieba":
+            self.assertIn("要切", carved_query_terms("为什么要切 cuDNN"))
         # A join never gates the claim when the segmenter gave real words: the
         # requirement keeps the components instead.
         support = _claim_support(

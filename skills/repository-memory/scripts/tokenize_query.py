@@ -41,6 +41,7 @@ the two differently — see ``fallback._claim_support``.
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Any
 
@@ -128,6 +129,14 @@ def _load_jieba() -> Any | None:
     if _JIEBA_PROBED:
         return _JIEBA
     _JIEBA_PROBED = True
+    # Deterministic path selection: the two tokenizer paths differ by design,
+    # and a test leg that believes it is exercising the builtin path while
+    # jieba leaks in from a reused environment verifies nothing.  Measured:
+    # the local no-jieba suite had been importing jieba for days, and the only
+    # real builtin coverage was CI.
+    if os.environ.get("REPOSITORY_MEMORY_TOKENIZER", "").strip().casefold() == "builtin":
+        _JIEBA_ERROR = "disabled by REPOSITORY_MEMORY_TOKENIZER=builtin"
+        return None
     try:
         import logging
 

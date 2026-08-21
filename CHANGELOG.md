@@ -273,6 +273,14 @@
   all three planes; a query that reduces to one real content word still
   answers from wherever the corpus writes that word, which is what lexical
   retrieval means.
+- Let `REPOSITORY_MEMORY_TOKENIZER=builtin` force the n-gram path, and make
+  the colloquial-scaffolding tests assert the contract rather than one
+  tokenizer's verbatim output. CI caught both: the new test hard-coded
+  jieba's segmentation and failed on every runner, and the local "no-jieba"
+  suite turned out to have been importing jieba for days from a reused
+  environment — its only real builtin coverage was CI itself. The forced
+  path is reported in `tokenizer_status.error`, so a measurement can say
+  which tokenizer produced it.
 
 ## 0.7.15
 
