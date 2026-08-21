@@ -9,11 +9,13 @@ never commits or pushes on the caller's behalf.
 
 from __future__ import annotations
 
+import datetime as dt
 import hashlib
 import json
 import os
 import re
 import sqlite3
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -515,6 +517,62 @@ def sync_team_memory(repository: str | None = None, *, agent_id: str | None = No
         return exported
     imported = import_team_memory(repository, include_candidates=True) if pull else {"ok": True, "status": "skipped", "imported": 0, "skipped": 0}
     return {**exported, "pull": imported, "status": "synced", "canonical_repo_changed": bool(exported.get("canonical_repo_changed"))}
+
+
+def _git(root: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    result = subprocess.run(
+        ["git", "-C", str(root), "-c", "commit.gpgsign=false", *args],
+        capture_output=True, text=True, encoding="utf-8", timeout=300, check=False,
+    )
+    if check and result.returncode != 0:
+        raise RuntimeError(f"git {args[0]} failed: {(result.stderr or result.stdout).strip()[:300]}")
+    return result
+
+
+def publish_team_memory(repository: str | None = None, *, agent_id: str | None = None, pull: bool = True, push: bool = True) -> dict[str, Any]:
+    """Pull, sync, and publish the team memory Git plane in one explicit step.
+
+    The capture hook deliberately never commits or pushes, so every node used
+    to close that gap with a hand-written shell script passed around in chat —
+    the second host got its copy by prompt. This is that script as a first-
+    class command: rebase-pull the team repository, run the same team-sync,
+    and commit/push only what team-sync wrote under ``knowledge/``. Review is
+    deliberately not here: activation stays an explicit supervised step.
+    """
+
+    root = configured_team_repository(repository)
+    if root is None:
+        return {"ok": False, "status": "not_configured", "reason": "team repository is not configured", "canonical_repo_changed": False}
+    if not (root / ".git").exists():
+        return {"ok": False, "status": "not_a_git_repository", "repository_root": str(root), "canonical_repo_changed": False}
+    result: dict[str, Any] = {"ok": True, "operation": "team-publish", "repository_root": str(root), "pulled": False, "committed": False, "pushed": False, "commit": None, "canonical_repo_changed": False}
+    try:
+        if pull and _git(root, "remote", check=False).stdout.strip():
+            _git(root, "pull", "--rebase", "--autostash", "--quiet")
+            result["pulled"] = True
+        sync = sync_team_memory(repository, agent_id=agent_id, pull=True)
+        result["sync"] = {key: sync.get(key) for key in ("ok", "created", "moved", "conflicts", "preserved")}
+        result["pull_hydrate"] = {key: (sync.get("pull") or {}).get(key) for key in ("imported", "skipped", "failed", "failures")}
+        if not sync.get("ok"):
+            result["ok"] = False
+            return result
+        # Stage only the knowledge tree team-sync writes into. ``add -A`` at
+        # the repository root would also sweep whatever else happens to sit in
+        # the clone -- publishing must never turn into a junk drawer commit.
+        _git(root, "add", "--", "knowledge")
+        if _git(root, "status", "--porcelain", "--", "knowledge").stdout.strip():
+            stamp = dt.date.today().isoformat()
+            author = agent_id or team_memory_store().node_id
+            _git(root, "commit", "--quiet", "-m", f"chore(team-memory): publish from {author} {stamp}")
+            result["committed"] = True
+            result["commit"] = _git(root, "rev-parse", "--short", "HEAD").stdout.strip()
+            if push and _git(root, "remote", check=False).stdout.strip():
+                _git(root, "push", "--quiet")
+                result["pushed"] = True
+    except RuntimeError as exc:
+        result["ok"] = False
+        result["error"] = str(exc)
+    return result
 
 
 def distinct_memory_counts() -> dict[str, Any]:

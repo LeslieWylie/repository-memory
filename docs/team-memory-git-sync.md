@@ -34,18 +34,27 @@ bounded turn
   -> team-memory/inbox/<agent>/candidate.md
 ```
 
-The hook does not commit, push, activate, or promote. A manual sync is always
-available:
+The hook does not commit, push, activate, or promote. The explicit close of
+that gap is one command — rebase-pull the team repository, run the same
+team-sync, commit only what it wrote under `knowledge/`, and push:
 
 ```bash
-repository-memory team-sync --json
+repository-memory team-publish --json
 repository-memory team-status --json
 ```
 
-`team-sync` is idempotent. A lifecycle transition from inbox candidate to
-active/accepted is represented as a Git move when the existing file belongs to
-the managed inbox. Conflicting files are written under
-`knowledge/team-memory/conflicts/` and are never overwritten.
+Schedule it per node (`--no-push`/`--no-pull` narrow it when needed):
+
+```text
+41 19 * * * repository-memory team-publish --json >> ~/team-publish.log 2>&1
+```
+
+`team-sync` remains available on its own and is idempotent. A lifecycle
+transition from inbox candidate to active/accepted is represented as a Git
+move when the existing file belongs to the managed inbox. Conflicting files
+are written under `knowledge/team-memory/conflicts/` and are never
+overwritten. Review is deliberately not part of publish: activation stays an
+explicit supervised step.
 
 ## Review and reuse
 

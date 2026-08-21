@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from team_memory import SQLiteTeamMemoryBackend
-from team_repository import configure_team_repository, import_team_memory, sync_team_memory, team_repository_health
+from team_repository import configure_team_repository, import_team_memory, publish_team_memory, sync_team_memory, team_repository_health
 
 
 def test_team_repository_export_is_idempotent_and_hydrates(tmp_path, monkeypatch):
@@ -189,3 +189,48 @@ def test_import_hydrates_stale_canonical_records_as_candidates(tmp_path, monkeyp
     record = backend.get("team:central:team_l1_stale")["result"]
     assert record["status"] == "candidate"
     assert record["provenance"]["canonical_status"] == "stale"
+
+
+def test_team_publish_commits_and_pushes_only_knowledge_changes(tmp_path, monkeypatch):
+    """The publish loop every node used to hand-write is one explicit command:
+    pull, sync, commit what team-sync wrote, push. Junk outside knowledge/
+    stays out of the commit, and a second run publishes nothing."""
+
+    import subprocess
+
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    repository = tmp_path / "team-data"
+    subprocess.run(["git", "clone", "-q", str(origin), str(repository)], check=True)
+    for key, value in (("user.name", "Test"), ("user.email", "test@example.com")):
+        subprocess.run(["git", "-C", str(repository), "config", key, value], check=True)
+    (repository / "knowledge" / "team-memory").mkdir(parents=True)
+    (repository / "knowledge" / "team-memory" / "README.md").write_text("# Shared Team Memory\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repository), "commit", "-qm", "seed"], check=True)
+    subprocess.run(["git", "-C", str(repository), "push", "-q", "origin", "HEAD"], check=True)
+    (repository / "scratch.log").write_text("local junk that must never be published\n", encoding="utf-8")
+
+    monkeypatch.setenv("REPOSITORY_MEMORY_TEAM_DB", str(tmp_path / "team.sqlite3"))
+    monkeypatch.setenv("REPOSITORY_MEMORY_CONFIG", str(tmp_path / "config.json"))
+    configure_team_repository(str(repository), auto_sync=True, agent_id="yaole")
+    from team_memory import team_memory_store
+    team_memory_store().publish({
+        "type": "discovery",
+        "title": "A discovery worth sharing with the team",
+        "content": "A concrete reusable discovery body long enough to publish.",
+        "provenance": {"agent_id": "yaole", "citations": ["README.md"]},
+        "confidence": 0.8,
+    })
+
+    result = publish_team_memory(agent_id="yaole")
+    assert result["ok"] is True, result
+    assert result["committed"] is True and result["pushed"] is True and result["commit"]
+    remote_log = subprocess.run(["git", "-C", str(origin), "log", "--format=%s", "-1"], capture_output=True, text=True, check=True).stdout
+    assert "publish from yaole" in remote_log
+    remote_files = subprocess.run(["git", "-C", str(origin), "ls-tree", "-r", "--name-only", "HEAD"], capture_output=True, text=True, check=True).stdout
+    assert "inbox/yaole/" in remote_files
+    assert "scratch.log" not in remote_files
+
+    second = publish_team_memory(agent_id="yaole")
+    assert second["ok"] is True and second["committed"] is False and second["pushed"] is False

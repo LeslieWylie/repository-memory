@@ -76,6 +76,7 @@ from team_repository import (
     distinct_memory_counts,
     export_team_memory as export_team_repository,
     import_team_memory as import_team_repository,
+    publish_team_memory,
     sync_team_memory,
     team_repository_health,
 )
@@ -2208,6 +2209,7 @@ def build_parser() -> argparse.ArgumentParser:
     import_parser = common("team-import"); import_parser.add_argument("--input", required=True); import_parser.add_argument("--json", action="store_true")
     team_config_parser = common("team-configure"); team_config_parser.add_argument("--repository", required=True); team_config_parser.add_argument("--agent-id"); team_config_parser.add_argument("--no-auto-sync", action="store_true"); team_config_parser.add_argument("--json", action="store_true")
     team_sync_parser = common("team-sync"); team_sync_parser.add_argument("--repository"); team_sync_parser.add_argument("--agent-id"); team_sync_parser.add_argument("--no-pull", action="store_true"); team_sync_parser.add_argument("--json", action="store_true")
+    team_publish_parser = common("team-publish"); team_publish_parser.add_argument("--repository"); team_publish_parser.add_argument("--agent-id"); team_publish_parser.add_argument("--no-pull", action="store_true"); team_publish_parser.add_argument("--no-push", action="store_true"); team_publish_parser.add_argument("--json", action="store_true")
     team_status_parser = common("team-status"); team_status_parser.add_argument("--repository"); team_status_parser.add_argument("--json", action="store_true")
     context_parser = common("context"); context_parser.add_argument("query"); context_parser.add_argument("--limit", type=int, default=5); context_parser.add_argument("--repo"); context_parser.add_argument("--issue"); context_parser.add_argument("--branch"); context_parser.add_argument("--agent"); context_parser.add_argument("--local", action="store_true"); context_parser.add_argument("--json", action="store_true")
     supersede_parser = common("supersede"); supersede_parser.add_argument("--id", required=True); supersede_parser.add_argument("--input", required=True); supersede_parser.add_argument("--json", action="store_true")
@@ -2410,7 +2412,7 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
                 return _mcp_dispatch(name, arguments)
             return serve(dispatch)
         gate_failed = False
-        root = None if args.command in {"init", "source", "doctor", "sync", "search", "get", "explain", "feedback", "promote", "publish", "team-activate", "team-export", "team-import", "team-configure", "team-sync", "team-status", "team-evaluate", "team-compact", "supervise", "benchmark", "context", "supersede", "memory-timeline", "memory-observe", "memory-reflect", "memory-retain", "ingest-session", "capture-turn", "knowledge", "memmy", "memos", "gui", "semantic", "memory", "memorycore"} else resolve_root(root_arg)
+        root = None if args.command in {"init", "source", "doctor", "sync", "search", "get", "explain", "feedback", "promote", "publish", "team-activate", "team-export", "team-import", "team-configure", "team-sync", "team-publish", "team-status", "team-evaluate", "team-compact", "supervise", "benchmark", "context", "supersede", "memory-timeline", "memory-observe", "memory-reflect", "memory-retain", "ingest-session", "capture-turn", "knowledge", "memmy", "memos", "gui", "semantic", "memory", "memorycore"} else resolve_root(root_arg)
         if args.command in {"init", "source"} and root_arg:
             root = resolve_root(root_arg)
         if args.command == "doctor":
@@ -2439,6 +2441,8 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
             value = configure_team_repo(args.repository, auto_sync=not bool(args.no_auto_sync), agent_id=args.agent_id)
         elif args.command == "team-sync":
             value = sync_team_repo(args.repository, agent_id=args.agent_id, pull=not bool(args.no_pull))
+        elif args.command == "team-publish":
+            value = {"schema_version": SCHEMA_VERSION, **publish_team_memory(args.repository, agent_id=args.agent_id, pull=not bool(args.no_pull), push=not bool(args.no_push))}
         elif args.command == "team-status":
             value = {"schema_version": SCHEMA_VERSION, "team_memory": team_memory_store().health(), "team_memory_distinct": distinct_memory_counts(), "team_repository": team_repository_health(args.repository), "canonical_repo_changed": False}
         elif args.command == "team-evaluate":

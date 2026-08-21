@@ -178,6 +178,15 @@
   plane — measured: a fresh host hydrated 75 active canonical files and was
   told to expect "140+" because another machine's row count said 143.
 
+- Add `team-publish`: rebase-pull the team repository, run team-sync, commit
+  only what it wrote under `knowledge/`, and push — as one explicit command
+  with a JSON receipt. The capture hook deliberately never commits or pushes,
+  and every node closed that gap with a hand-written shell script passed
+  around in chat; the second host literally received its copy by prompt.
+  Publishing stages nothing outside `knowledge/`, so a stray file in the
+  clone can never ride along, and review stays out of it: activation remains
+  an explicit supervised step.
+
 ## 0.7.15
 
 - Protect existing canonical Team Memory Markdown during automatic hydration
