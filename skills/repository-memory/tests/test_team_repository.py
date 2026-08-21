@@ -234,3 +234,27 @@ def test_team_publish_commits_and_pushes_only_knowledge_changes(tmp_path, monkey
 
     second = publish_team_memory(agent_id="yaole")
     assert second["ok"] is True and second["committed"] is False and second["pushed"] is False
+
+
+def test_team_publish_names_the_missing_git_identity(tmp_path, monkeypatch):
+    """A host without a git identity gets an actionable status, not a
+    localized git error buried in a generic failure."""
+
+    import subprocess
+
+    repository = tmp_path / "team-data"
+    subprocess.run(["git", "init", "-q", str(repository)], check=True)
+    (repository / "knowledge" / "team-memory").mkdir(parents=True)
+    (repository / "knowledge" / "team-memory" / "README.md").write_text("# Shared Team Memory\n", encoding="utf-8")
+    monkeypatch.setenv("REPOSITORY_MEMORY_TEAM_DB", str(tmp_path / "team.sqlite3"))
+    monkeypatch.setenv("REPOSITORY_MEMORY_CONFIG", str(tmp_path / "config.json"))
+    # Hide the developer machine's global identity so the check behaves the
+    # same here as on a fresh host or CI runner.
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "no-global-gitconfig"))
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(tmp_path / "no-system-gitconfig"))
+    configure_team_repository(str(repository), auto_sync=True, agent_id="yaole")
+
+    result = publish_team_memory(agent_id="yaole")
+    assert result["ok"] is False
+    assert result["status"] == "missing_git_identity"
+    assert "git -C" in result["reason"] and "user.email" in result["reason"]

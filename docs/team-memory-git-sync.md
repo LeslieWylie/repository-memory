@@ -49,6 +49,18 @@ Schedule it per node (`--no-push`/`--no-pull` narrow it when needed):
 41 19 * * * repository-memory team-publish --json >> ~/team-publish.log 2>&1
 ```
 
+Two identity facts, both measured on a fresh host:
+
+- The team repository clone needs a git identity before the first publish
+  (`git config user.name/user.email`, repository-local is enough); publish
+  preflights this and returns `missing_git_identity` with the exact commands.
+- Inbox directories group by each record's *capturing agent* id — carried in
+  the record itself so every node computes the same path — not by the node's
+  configured `--agent-id`, which names the node in publish commits and acts
+  as an export filter. Give agents globally meaningful ids: a host whose
+  OpenClaw agent is literally named `main` publishes into `inbox/main/`,
+  where a second node's `main` would mix with it.
+
 `team-sync` remains available on its own and is idempotent. A lifecycle
 transition from inbox candidate to active/accepted is represented as a Git
 move when the existing file belongs to the managed inbox. Conflicting files

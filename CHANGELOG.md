@@ -186,6 +186,13 @@
   Publishing stages nothing outside `knowledge/`, so a stray file in the
   clone can never ride along, and review stays out of it: activation remains
   an explicit supervised step.
+- Preflight the git identity in `team-publish` and answer with
+  `missing_git_identity` plus the exact commands to run. The first fresh-host
+  publish died on git's localized "Author identity unknown" buried in a
+  generic error. Documented beside it: inbox directories group by each
+  record's capturing-agent id (carried in the record, so every node computes
+  the same path), not by the node's configured agent id — name agents
+  globally, or two nodes' `main` agents will share one inbox.
 
 ## 0.7.15
 

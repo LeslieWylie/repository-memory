@@ -545,6 +545,17 @@ def publish_team_memory(repository: str | None = None, *, agent_id: str | None =
         return {"ok": False, "status": "not_configured", "reason": "team repository is not configured", "canonical_repo_changed": False}
     if not (root / ".git").exists():
         return {"ok": False, "status": "not_a_git_repository", "repository_root": str(root), "canonical_repo_changed": False}
+    # Commit needs an author. Preflight it instead of letting git fail in
+    # whatever language the host speaks -- the first fresh-host run died on
+    # a localized "Author identity unknown" that the JSON could not explain.
+    if not _git(root, "config", "user.email", check=False).stdout.strip():
+        return {
+            "ok": False,
+            "status": "missing_git_identity",
+            "repository_root": str(root),
+            "reason": f"set an identity first: git -C {root} config user.name <name> && git -C {root} config user.email <email>",
+            "canonical_repo_changed": False,
+        }
     result: dict[str, Any] = {"ok": True, "operation": "team-publish", "repository_root": str(root), "pulled": False, "committed": False, "pushed": False, "commit": None, "canonical_repo_changed": False}
     try:
         if pull and _git(root, "remote", check=False).stdout.strip():
