@@ -45,6 +45,8 @@ jobs:
           --qrels eval/public/qrels.jsonl
           --revision HEAD
           --local
+          --min-strict-p1 1.0
+          --min-recall-at-5 1.0
 
       - name: Run Team Memory retrieval gate
         run: >-
