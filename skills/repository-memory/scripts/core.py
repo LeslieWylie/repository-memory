@@ -47,6 +47,7 @@ from discovery import (
     resolve_root,
 )
 from fallback import SECRET_CONTENT, SECRET_NAME, _claim_support, query_terms
+from tokenize_query import carved_query_terms
 from fallback import search as fallback_search
 from tokenize_query import tokenizer_status
 from local_index import ensure as ensure_local_index
@@ -477,7 +478,9 @@ def normalize_item(item: dict[str, Any], view: SourceView, source_type: str, que
         # found it.  Adapter results already got this credit; core-normalized
         # ones did not, which was a silent inconsistency between two paths to
         # the same answer.
-        support = _claim_support(query_terms(query), str(excerpt or ""), start or 1, end or start or 1, path=path)
+        normalized_terms = query_terms(query)
+        normalized_carved = carved_query_terms(query) & set(normalized_terms)
+        support = _claim_support(normalized_terms, str(excerpt or ""), start or 1, end or start or 1, real_terms=frozenset(set(normalized_terms) - normalized_carved), carved=frozenset(normalized_carved), path=path)
     support = support or {"matched_terms": [], "unmatched_terms": [], "coverage": 1.0, "claim_support": "unknown", "supporting_spans": []}
     result = {
         "id": result_id,
@@ -1008,12 +1011,13 @@ def search(root: Path | None, query: str, limit: int = 5, deep: bool = False, so
                 # repository plane answers under; only direct support makes the
                 # plane answerable, everything else stays visible as a lead.
                 team_terms = query_terms(query)
+                team_carved = carved_query_terms(query) & set(team_terms)
                 active_records = []
                 for record in team.get("active", []):
                     if not isinstance(record, dict):
                         continue
                     body = "\n".join(str(record.get(key) or "") for key in ("title", "summary", "content"))
-                    support = _claim_support(team_terms, body, 1, max(1, body.count("\n") + 1))
+                    support = _claim_support(team_terms, body, 1, max(1, body.count("\n") + 1), real_terms=frozenset(set(team_terms) - team_carved), carved=frozenset(team_carved))
                     active_records.append({**record, "support": {key: support[key] for key in ("matched_terms", "unmatched_terms", "coverage", "claim_support")}})
                 active_records.sort(key=lambda item: -(item.get("support", {}).get("coverage") or 0.0))
                 groups["team"] = {

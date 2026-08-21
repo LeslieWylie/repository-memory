@@ -249,6 +249,30 @@
   the colloquial fragment as the unmatched claim, and `8月20号` failed where
   `8月20日` worked. Same closed-class boundary as before: these are function
   words and a date grammar, not a vocabulary that grows with content.
+- Rank by what the user said, and let structure outrank heuristics — four
+  fixes measured on live human-phrasing rounds. Coverage counts the words the
+  user (or segmenter) produced, not this module's joins, so the document
+  carrying 27b+模型+上线 no longer loses to a report that writes the join
+  verbatim. A manufactured join never gates the claim requirement when real
+  words exist: with substring matching, df==0 almost never holds for
+  two-character joins (要切 is "reachable" through 需要切换), so the old
+  zero-frequency drop could not save the requirement. The filename bonus now
+  fires for 2–3 character CJK names, and an exact file-stem match adds a
+  per-entity-layout bonus: 刘伯潇's own standup no longer loses to a passing
+  mention in a colleague's file. Full conjunctive coverage bypasses the layer
+  filter: 模型 routed to models/ and excluded the one standup entry that
+  answered.
+- Extend the closed glue classes: modal prefixes (要/再/先/…) on two-character
+  segmenter tokens and directional complements (进来/出去/起来/…) as suffixes
+  are droppable-not-dropped, and 时候 joins the temporal deictics while
+  项目/公司 join the question-framing nouns that cannot carry a claim alone.
+  Measured leaks each: an L1 memory of a past *abstention* answered
+  "火星殖民项目的预算" through the lone word 项目, and a labelling-prompt dump
+  answered "我们公司什么时候上市" through scattered 公司/时候/上市. After the
+  change every fabricated-entity negative in the human battery abstains on
+  all three planes; a query that reduces to one real content word still
+  answers from wherever the corpus writes that word, which is what lexical
+  retrieval means.
 
 ## 0.7.15
 

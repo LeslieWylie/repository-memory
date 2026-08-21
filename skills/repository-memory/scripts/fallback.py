@@ -26,6 +26,12 @@ SECRET_CONTENT = re.compile(r"-----BEGIN .*PRIVATE KEY-----|(?:api[_-]?key|acces
 DATE_RE = re.compile(r"20\d{2}[-/]\d{1,2}(?:[-/]\d{1,2})?|20\d{2}-W\d{1,2}", re.IGNORECASE)
 GENERIC_SUPPORT_TERMS = {
     "note", "report", "weekly", "paper", "model", "card", "update", "result",
+    # Question-framing nouns of the 历史/进展/情况 family, measured leaking:
+    # an L1 memory of a past *abstention* answered "火星殖民项目的预算" through
+    # the lone word 项目, and a labelling-prompt dump answered
+    # "我们公司什么时候上市" through scattered 公司/上市. They still retrieve
+    # and rank; they just cannot carry a claim alone.
+    "项目", "公司",
     # CJK pronouns/connectives carry no claim of their own.  They are excluded
     # here rather than in ``tokenize_query.STOP_TERMS`` so retrieval and layer
     # routing keep seeing them; only claim coverage ignores them.
@@ -182,6 +188,7 @@ def _claim_support(
     *,
     unreachable: frozenset[str] = frozenset(),
     real_terms: frozenset[str] = frozenset(),
+    carved: frozenset[str] = frozenset(),
     path: str = "",
 ) -> dict[str, Any]:
     """Report how much of the query this excerpt actually carries.
@@ -228,6 +235,19 @@ def _claim_support(
         if (len(term) >= 3 or (len(term) >= 2 and all("\u3400" <= char <= "\u9fff" for char in term)))
         and term not in GENERIC_SUPPORT_TERMS
     ))
+    # A claim is something the user said.  A join this tokenizer manufactured
+    # is a recall device, and the corpus-frequency probe below cannot save the
+    # requirement from it: with substring matching, a two-character join like
+    # ``要切`` is "reachable" through ``需要切换`` and ``日报写`` through
+    # ``日报写入``, so df==0 almost never holds and the join gated the claim
+    # forever.  When the segmenter produced real words, they are the claims;
+    # drop the joins from the requirement before the longest-form collapse so
+    # the components they absorbed stay required.  The builtin n-gram path has
+    # no real words and keeps the measured collapse-then-probe behaviour.
+    if real_terms and carved:
+        kept = [term for term in raw_support_terms if term not in carved or term in real_terms]
+        if kept:
+            raw_support_terms = kept
     # CJK token expansion deliberately adds short n-grams for recall.  Those
     # n-grams are not independent claims: if a longer CJK term contains one,
     # keep only the longest form for claim support so a hit on "评测结果" is
@@ -669,14 +689,28 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
         # coverage.  This is a generic lexical precision rule, not a domain
         # synonym table or an embedding substitute.
         coverage_terms = []
-        for term in raw_content_terms:
+        # A join this tokenizer manufactured (``模型上线`` from ``模型``+``上线``)
+        # is a recall device, not an independent signal: measured live, the
+        # document that carried 27b, 模型 and 上线 lost the ranking to a report
+        # that happened to write the join verbatim, because the join crowded
+        # its own components out of coverage.  Count coverage over the words
+        # the user (or the segmenter) actually produced; joins keep helping
+        # recall and tf scoring but no longer gate coverage.
+        coverage_source_terms = [
+            term for term in raw_content_terms
+            if not (
+                term in carved_terms
+                and any(other != term and other in term for other in raw_content_terms)
+            )
+        ]
+        for term in coverage_source_terms:
             if len(term) < 2:
                 continue
             if any(
                 len(other) > len(term)
                 and all("\u3400" <= char <= "\u9fff" for char in term)
                 and term in other
-                for other in raw_content_terms
+                for other in coverage_source_terms
             ):
                 continue
             coverage_terms.append(term)
@@ -693,11 +727,17 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
         )
         matched = sum(term in searchable for term in terms)
         layer = path_text.split("/", 1)[0]
+        full_conjunctive = len(coverage_terms) >= 2 and raw_coverage == len(coverage_terms)
         if (
             preferred_layers
             and not deep
             and not latest
             and layer not in preferred_layers
+            # A document covering every independent query signal outranks the
+            # layer heuristic that would have hidden it: measured live, 模型
+            # routed to models/ and excluded the standup entry that carried
+            # 27b, 模型 and 上线 together — the only document that answered.
+            and not full_conjunctive
             and not (relationship_query and named_terms and (layer in entity_layers or relative in graph_paths))
         ):
             # A relationship query can legitimately cross from a named entity
@@ -756,7 +796,7 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
         # several sections of one document; report claim support separately
         # instead of discarding the document from ranking metrics.
         evidence_status = "secondary"
-        support = _claim_support(terms, excerpt, start or excerpt_start, end or excerpt_end, unreachable=unreachable, real_terms=real_terms, path=relative)
+        support = _claim_support(terms, excerpt, start or excerpt_start, end or excerpt_end, unreachable=unreachable, real_terms=real_terms, carved=frozenset(carved_terms), path=relative)
         semantic_score = semantic_scores.get(relative, 0.0)
         graph_bonus = 900 if graph_candidate else 0
         # Keep P@1 deterministic for exact/entity queries: the builtin
@@ -865,7 +905,16 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
                 + sum(500 for term in raw_terms if "-" in term and term in haystack)
                 + sum(180 for phrase in phrase_terms if phrase in haystack)
                 + sum(28 for term in terms if term in relative.casefold())
-                + sum(260 for term in filename_terms if term in Path(relative).name.casefold() and len(term) >= 4)
+                + sum(
+                    260 for term in filename_terms
+                    if term in Path(relative).name.casefold()
+                    and (len(term) >= 4 or (len(term) >= 2 and all("\u3400" <= char <= "\u9fff" for char in term)))
+                )
+                # A per-person or per-entity layout puts the answer's owner in
+                # the file stem.  An exact stem match is that structure speaking
+                # — measured live, 刘伯潇's own standup lost to a passing mention
+                # in a colleague's file.
+                + sum(1200 for term in filename_terms if term == Path(relative).stem.casefold())
                 + heading_bonus
                 + heading_query_bonus
                 + (72 if relative.split("/", 1)[0] in preferred_layers else 0)

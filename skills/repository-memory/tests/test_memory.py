@@ -524,6 +524,22 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertNotIn("得怎么样", query_terms("GLM 迁移做得怎么样了"))
         self.assertEqual(query_terms("武垚乐 8月18号 做了什么"), query_terms("武垚乐 8月18日 做了什么"))
         self.assertIn("2026-08-20", query_terms("2026年8月20号 谁提交了"))
+        # Modal prefixes and directional complements are closed glue classes:
+        # jieba lexicalizes 要切/接进来 as words, the corpus writes 切/接入, and
+        # requiring the glue held answerable questions at partial forever.
+        self.assertIn("要切", carved_query_terms("为什么要切 cuDNN"))
+        self.assertIn("接进来", carved_query_terms("kimi 的日志接进来了吗"))
+        # A join never gates the claim when the segmenter gave real words: the
+        # requirement keeps the components instead.
+        support = _claim_support(
+            ["27b", "模型上线", "模型", "上线"],
+            "Qwen 27B 模型优化上线,BF16 全精度",
+            1, 1,
+            real_terms=frozenset({"27b", "模型", "上线"}),
+            carved=frozenset({"模型上线"}),
+        )
+        self.assertEqual(support["claim_support"], "direct")
+        self.assertNotIn("模型上线", support["unmatched_terms"])
 
     def test_auto_scope_recalls_every_plane_without_changing_the_answer_surface(self):
         """One call must reach all three planes and still answer like before.

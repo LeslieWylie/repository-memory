@@ -90,7 +90,7 @@ STOP_TERMS = {
     "最近", "最新", "上次", "之前", "以前", "目前", "当前", "本周", "本月", "今天", "昨天", "正在",
     "明天", "前天", "后天",
     # question framing that behaves as scaffolding in every phrasing we see
-    "历史", "进展", "情况", "近况",
+    "历史", "进展", "情况", "近况", "时候",
 }
 
 _JIEBA: Any | None = None
@@ -354,10 +354,42 @@ def query_terms(query: str) -> list[str]:
     return [term for term, _carved in expand(query)]
 
 
-def carved_query_terms(query: str) -> set[str]:
-    """Return the terms this module manufactured rather than the user typed."""
+# Modal and directional verb morphemes — a closed grammatical class, like the
+# stop set above. jieba glues them onto the following verb ("为什么要切" yields
+# the "word" 要切), and treating that glue as a user claim blocked answerable
+# questions: measured live, 要切 held "为什么要切 cuDNN" at partial forever while
+# the document said 切 cuDNN. Only the *first character* of a two-character
+# segmenter token is checked against this set, and the token is merely marked
+# droppable — the corpus-frequency probe still keeps it whenever any document
+# actually writes it, so a real word that happens to start with one of these
+# (要求, 先验, 就绪…) is unaffected wherever it exists in the corpus.
+MODAL_PREFIX_CHARS = frozenset("要再先还都也就别才又快去来")
 
-    return {term for term, carved in expand(query) if carved}
+# Directional verb complements — the other closed glue class. jieba lexicalizes
+# verb+complement ("接进来", "切过去") as one token, and the corpus writes the
+# bare verb: measured live, 接进来 held "kimi 的日志接进来了吗" at partial while
+# the document said 接入. Suffix-matched, same droppable-not-dropped contract
+# as the modal prefixes: the corpus-frequency probe has the final word.
+DIRECTIONAL_SUFFIXES = ("进来", "进去", "出来", "出去", "上来", "上去", "下来", "下去", "起来", "过来", "过去", "回来", "回去")
+
+
+def carved_query_terms(query: str) -> set[str]:
+    """Return the terms this module manufactured rather than the user typed.
+
+    Two-character segmenter tokens led by a closed-class modal/directional
+    morpheme are included: they are word-boundary guesses of the same kind as
+    this module's own joins, and the caller's zero-frequency probe — not this
+    function — decides whether the corpus knows them.
+    """
+
+    carved = {term for term, carved in expand(query) if carved}
+    for term, was_carved in expand(query):
+        if not was_carved and all("\u3400" <= char <= "\u9fff" for char in term):
+            if len(term) == 2 and term[0] in MODAL_PREFIX_CHARS:
+                carved.add(term)
+            elif 3 <= len(term) <= 4 and term.endswith(DIRECTIONAL_SUFFIXES):
+                carved.add(term)
+    return carved
 
 
 def plane_terms(query: str, stop_words: frozenset[str] | set[str] = frozenset()) -> list[str]:
