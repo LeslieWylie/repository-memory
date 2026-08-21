@@ -887,8 +887,9 @@ def _package_search(query: str, mode: str, scope: str, views: list[SourceView], 
     if scope == "auto":
         answered_by = [name for name in ("repository", "memory") if groups.get(name, {}).get("answerable")]
         # Team records are decisions, not Git citations; only accepted ones
-        # count as an answer.  ``candidates`` are explicitly not.
-        if groups.get("team", {}).get("active"):
+        # count as an answer, and only when one of them actually supports the
+        # claim — the group's ``abstain`` already encodes that judgement.
+        if groups.get("team", {}).get("active") and not groups.get("team", {}).get("abstain", True):
             answered_by.append("team")
     return {
         "schema_version": SCHEMA_VERSION,
@@ -996,10 +997,29 @@ def search(root: Path | None, query: str, limit: int = 5, deep: bool = False, so
                 # they are deliberately not exposed under ``verified``.  Callers
                 # that flatten ``groups[*].verified`` therefore never count a
                 # reviewed decision as a validated source citation.
+                #
+                # And a match is not an answer.  The team backend's lexical
+                # match returns any active record sharing a term with the
+                # question, so a fabricated query held a plane hostage through
+                # one generic word: measured live, "我们公司什么时候上市" came
+                # back answered_by=['team'] carrying a sync-timeout record that
+                # shared "公司" with nothing and "时候" with everything.  Score
+                # each active record with the same claim-support rule the
+                # repository plane answers under; only direct support makes the
+                # plane answerable, everything else stays visible as a lead.
+                team_terms = query_terms(query)
+                active_records = []
+                for record in team.get("active", []):
+                    if not isinstance(record, dict):
+                        continue
+                    body = "\n".join(str(record.get(key) or "") for key in ("title", "summary", "content"))
+                    support = _claim_support(team_terms, body, 1, max(1, body.count("\n") + 1))
+                    active_records.append({**record, "support": {key: support[key] for key in ("matched_terms", "unmatched_terms", "coverage", "claim_support")}})
+                active_records.sort(key=lambda item: -(item.get("support", {}).get("coverage") or 0.0))
                 groups["team"] = {
-                    "active": team.get("active", []),
+                    "active": active_records,
                     "candidates": team.get("candidates", []),
-                    "abstain": not team.get("active"),
+                    "abstain": not any(record.get("support", {}).get("claim_support") == "direct" for record in active_records),
                     "retrieval_mode": team.get("retrieval_mode", "lexical"),
                 }
                 diagnostics.append({"source": None, "adapter": "team-memory", "team_memory": team.get("diagnostics", {})})

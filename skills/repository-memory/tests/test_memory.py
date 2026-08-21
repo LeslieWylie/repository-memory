@@ -482,6 +482,49 @@ class RepositoryMemoryTest(unittest.TestCase):
         # Explicit scopes keep the old shape; the key is additive.
         self.assertIsNone(core.search(None, "Atlas evidence", scope="repository")["answered_by"])
 
+    def test_team_plane_answers_only_with_claim_support(self):
+        """A match is not an answer: one shared generic word must not put
+        ``team`` into ``answered_by``.
+
+        Measured live: "我们公司什么时候上市" came back answered_by=['team']
+        carrying a sync-timeout record that shared one generic term — a host
+        following the Skill ("answer from the named group") would have
+        fabricated an IPO answer out of an ops note.
+        """
+
+        from team_memory import team_memory_store
+
+        store = team_memory_store()
+        record = store.publish({
+            "type": "discovery",
+            "title": "网关限流阈值定为每分钟六百次",
+            "content": "网关限流阈值定为每分钟六百次，超过就排队，压测通过。",
+            "provenance": {"agent_id": "yaole", "citations": ["README.md"]},
+            "confidence": 0.9,
+        })["memory"]
+        store.activate(record["id"], reviewer="reviewer")
+
+        supported = core.search(None, "网关限流阈值是多少")
+        self.assertIn("team", supported["answered_by"])
+        top = supported["groups"]["team"]["active"][0]
+        self.assertEqual(top["support"]["claim_support"], "direct")
+
+        # Shares only "阈值" with the record; the claim itself is fabricated.
+        leak = core.search(None, "上市估值的阈值是多少")
+        self.assertNotIn("team", leak["answered_by"])
+        self.assertTrue(leak["groups"]["team"]["abstain"])
+        # The lead stays visible — gating answerability must not hide it.
+        if leak["groups"]["team"]["active"]:
+            self.assertIn("support", leak["groups"]["team"]["active"][0])
+
+    def test_colloquial_interrogatives_and_spoken_dates_are_scaffolding(self):
+        # Measured on live human phrasing: 在干嘛 / 做得怎么样 blocked answerable
+        # questions, and 8月20号 is the spoken register of 8月20日.
+        self.assertEqual(query_terms("武垚乐昨天在干嘛"), ["武垚乐"])
+        self.assertNotIn("得怎么样", query_terms("GLM 迁移做得怎么样了"))
+        self.assertEqual(query_terms("武垚乐 8月18号 做了什么"), query_terms("武垚乐 8月18日 做了什么"))
+        self.assertIn("2026-08-20", query_terms("2026年8月20号 谁提交了"))
+
     def test_auto_scope_recalls_every_plane_without_changing_the_answer_surface(self):
         """One call must reach all three planes and still answer like before.
 

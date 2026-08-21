@@ -232,6 +232,23 @@
   hydrate; the receipt carries a ready `publish_cron` line). Previously this
   was a hand-relayed checklist per host: the second host received it as five
   chat steps and every step grew its own trap.
+- Gate the team plane's answerability on claim support, not on having
+  matched. The team backend's lexical match returns any active record sharing
+  a term with the question, and `answered_by` counted that as an answer:
+  measured live with human phrasings, "我们公司什么时候上市" came back
+  `answered_by=['team']` carrying a sync-timeout ops note that shared one
+  generic word — a host following the Skill would have fabricated an IPO
+  answer from it. Every active team record now carries `support` scored by
+  the same claim rule the repository plane answers under, the group sorts by
+  coverage, and only direct support makes the plane answerable; weaker
+  matches stay visible as leads.
+- Add the colloquial register to the closed interrogative/deictic classes
+  (`干嘛`, `干啥`, `咋样`, `怎么样`, `得怎么样`, `啥时候`, `明天/前天/后天`) and accept
+  `号` as the spoken form of `日` in the date grammar. Measured on live human
+  phrasing: `武垚乐昨天在干嘛` and `GLM 迁移做得怎么样了` both abstained with
+  the colloquial fragment as the unmatched claim, and `8月20号` failed where
+  `8月20日` worked. Same closed-class boundary as before: these are function
+  words and a date grammar, not a vocabulary that grows with content.
 
 ## 0.7.15
 

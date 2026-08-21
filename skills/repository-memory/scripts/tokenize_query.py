@@ -56,7 +56,9 @@ CJK_CHAR = re.compile(r"[㐀-鿿]")
 # system is added, which is the same test every other list in retrieval has to
 # pass.  ``日`` is optional because ``8月18`` occurs, and the year is optional
 # because ``8月18日`` is how anyone actually asks.
-CJK_DATE = re.compile(r"(?:(\d{4})年)?(\d{1,2})月(?:(\d{1,2})日?)?")
+# ``号`` is the spoken register of ``日`` — ``8月20号`` and ``8月20日`` are the
+# same date, and humans type the first.
+CJK_DATE = re.compile(r"(?:(\d{4})年)?(\d{1,2})月(?:(\d{1,2})(?:日|号)?)?")
 
 # Question scaffolding, dropped before terms are formed.  This is bounded by
 # how the language asks questions, not by what the corpus contains: it does not
@@ -79,8 +81,14 @@ STOP_TERMS = {
     # ``什么`` — measured, and the reason a term list must be checked against
     # the segmenter rather than assembled by intuition.
     "什么", "干什么", "怎么", "怎样", "咋", "哪些", "哪个", "如何", "谁", "为什么", "多少",
+    # colloquial register of the same interrogatives — measured on live human
+    # phrasing: ``在干嘛`` and ``做得怎么样`` each blocked an answerable question
+    # because the colloquial form was treated as a content claim the corpus
+    # never writes.
+    "干嘛", "干啥", "咋样", "怎么样", "得怎么样", "啥时候",
     # temporal and aspectual deictics
     "最近", "最新", "上次", "之前", "以前", "目前", "当前", "本周", "本月", "今天", "昨天", "正在",
+    "明天", "前天", "后天",
     # question framing that behaves as scaffolding in every phrasing we see
     "历史", "进展", "情况", "近况",
 }
