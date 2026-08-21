@@ -30,8 +30,15 @@ On a remote OpenClaw host, send the bot this exact command (replace only the
 knowledge Git URL):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/LeslieWylie/repository-memory/main/bootstrap.sh | sh -s -- --target openclaw --openclaw-agent auto --source-url <knowledge-git-url> --source-branch main --json
+curl -fsSL https://raw.githubusercontent.com/LeslieWylie/repository-memory/main/bootstrap.sh | sh -s -- --target openclaw --openclaw-agent <agent-id> --source-url <knowledge-git-url> --source-branch main --json
 ```
+
+Name the agent explicitly — the installer refuses to guess, and a host whose
+config lives outside `~/.openclaw` needs `--openclaw-config <path>` too. The
+URL must be canonical HTTPS (an SSH alias from someone's `~/.ssh/config`
+resolves nowhere else). [INSTALL.md](../INSTALL.md) collects every measured
+fresh-host trap, and [docs/ai-setup-prompt.md](ai-setup-prompt.md) is a
+complete prompt you can hand to an AI operator verbatim.
 
 The command clones the installer into user cache, discovers the active agent,
 registers the namespaced stdio MCP, enables the advisory lifecycle extension,
@@ -96,19 +103,28 @@ solutions, discoveries, and handoffs. `team_candidates` are not accepted facts.
 The context response uses `retrieval_mode=multi-source-lexical`: the two
 recall lanes are parallel, but their scores and provenance are not mixed.
 
-## 4. Ask a repository-only question
+## 4. Ask a question
 
-Send the user's original question unchanged:
+Send the user's original question unchanged — no scope, no rewriting:
 
 ```bash
-repository-memory search "What changed in the evaluation pipeline recently?" \
-  --scope repository --json
+repository-memory search "What changed in the evaluation pipeline recently?" --json
 ```
+
+The default scope `auto` answers on the repository plane (top-level
+`results`/`answerable`) and returns conversation memory and team records
+alongside under `groups`; `answered_by` names every plane that produced
+something answerable. Read `results` for cited answers; if it is empty, check
+`answered_by` before giving up. Pass `--scope repository|memory|all` only when
+the question is explicitly pinned to one plane.
 
 If a result is verified, call `get` with its id and use the returned citation.
 If all results are candidates or the answer is negative/unsupported, return an
-explicit abstention. Do not turn the question into a filename and do not read
-the source directly to bypass a failed search.
+explicit abstention — and before retrying, read the candidates'
+`support.unmatched_terms`: they name exactly which words the corpus lacks, so
+one re-ask in the document's own vocabulary is the standard move. Do not turn
+the question into a filename and do not read the source directly to bypass a
+failed search.
 
 ## 5. Publish reusable team knowledge explicitly
 

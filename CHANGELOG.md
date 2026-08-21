@@ -281,6 +281,13 @@
   environment — its only real builtin coverage was CI itself. The forced
   path is reported in `tokenizer_status.error`, so a measurement can say
   which tokenizer produced it.
+- De-stale the entry docs and ship the setup prompt as a file. The quickstart
+  and README still taught `--scope repository` as the way to ask (predating
+  `auto` and `answered_by`), and the quickstart's remote one-liner passed
+  `--openclaw-agent auto` — an agent id that does not exist, measured failing
+  on a real host. `docs/ai-setup-prompt.md` is the complete install-verify-use
+  prompt as a maintained artifact, because the previous version lived in chat
+  messages and each relay drifted.
 
 ## 0.7.15
 

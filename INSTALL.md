@@ -84,6 +84,12 @@ bootstrap; keep organization URLs there, not here.
   literally named `main` publishes into `inbox/main/`, where another node's
   `main` would mix with it.
 
+## Hand it to an AI
+
+[docs/ai-setup-prompt.md](docs/ai-setup-prompt.md) is this whole page as one
+self-contained prompt — install, honest verification, and the usage
+contract — ready to paste to an AI operator verbatim.
+
 ## Verify like you mean it
 
 ```bash

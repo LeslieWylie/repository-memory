@@ -190,8 +190,7 @@ command:
 
 ```bash
 repository-memory doctor --json
-repository-memory search "the question in the user's own words" \
-  --scope repository --json
+repository-memory search "the question in the user's own words" --json
 ```
 
 With OpenClaw, verify the registered server through the host rather than
