@@ -213,6 +213,15 @@
   `--force` (a snapshot worktree holds no legitimate local edits) and the
   view falls back to the local worktree, with a reason, when `status
   --porcelain` is not empty afterwards.
+- Weight a Markdown heading that carries a query term above a body line that
+  mentions it in passing, and cite the section the heading opens. Four lines
+  tied at one occurrence each and the tie-break handed the citation to the
+  earliest — an incident retro inside the 08-20 section that referenced the
+  date once — while `## 2026-08-18`, the section actually about the queried
+  day, sat at line 77. The question was answered partial out of the wrong
+  section; with the heading weighted it answers direct out of the right one.
+  A heading names what its section is about; that is the same structural fact
+  the index already trusts when it derives date anchors from headings.
 
 ## 0.7.15
 

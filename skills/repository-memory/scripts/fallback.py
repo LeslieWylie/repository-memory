@@ -101,7 +101,20 @@ def _evidence_window(text: str, terms: list[str], max_lines: int = 12) -> tuple[
     file_lines = text.splitlines()
     if not file_lines:
         return "", 1, 1
-    line_scores = [sum(line.casefold().count(term) for term in terms) for line in file_lines]
+    # A Markdown heading that carries a query term names a whole section about
+    # it; a body line carrying the same term is inside some *other* section,
+    # mentioning it in passing.  Weight headings above body mentions, or the
+    # tie-break below hands the citation to whichever passing mention appears
+    # first: measured live, `## 2026-08-18` at line 77 lost to an incident
+    # retro inside the 08-20 section that referenced the date once, and the
+    # question about 08-18 was answered partial out of the wrong section.
+    def _line_score(line: str) -> int:
+        score = sum(line.casefold().count(term) for term in terms)
+        if score and line.lstrip().startswith("#"):
+            score += 1
+        return score
+
+    line_scores = [_line_score(line) for line in file_lines]
     matching = [index for index, score in enumerate(line_scores) if score]
     if not matching:
         start = 0
@@ -118,6 +131,11 @@ def _evidence_window(text: str, terms: list[str], max_lines: int = 12) -> tuple[
         if span_end - span_start + 1 <= max_lines * 2:
             start = max(0, span_start - max_lines // 4)
             end = min(len(file_lines), span_end + max_lines // 4 + 1)
+        elif file_lines[best].lstrip().startswith("#"):
+            # The anchor is a section heading: cite the section it opens, not
+            # the tail of whichever section happens to end just above it.
+            start = best
+            end = min(len(file_lines), start + max_lines)
         else:
             start = max(0, best - max_lines // 3)
             end = min(len(file_lines), start + max_lines)
