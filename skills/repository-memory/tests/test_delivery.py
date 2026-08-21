@@ -124,6 +124,23 @@ class DeliveryContractTest(unittest.TestCase):
         self.assertEqual(store.get(original["id"])["result"]["status"], "active")
         self.assertEqual(store.get(original["id"])["result"]["reviewed_by"], "reviewer")
 
+
+    def test_skill_frontmatter_version_matches_the_release(self) -> None:
+        # The Skill frontmatter now carries metadata.version per the open
+        # Agent Skills spec (version is NOT a top-level key there). Hosts read
+        # the copy, not the repo -- a stale frontmatter version would tell
+        # every host it runs an older release than the runtime underneath it.
+        import re
+        root = Path(__file__).resolve().parents[1]
+        skill = (root / "SKILL.md").read_text(encoding="utf-8")
+        front = skill.split("---")[1]
+        match = re.search(r"version:\s*\"([^\"]+)\"", front)
+        assert match is not None
+        version_file = (root / "VERSION").read_text(encoding="utf-8").strip()
+        assert match.group(1) == version_file
+        pyproject = (root.parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+        assert f'version = "{version_file}"' in pyproject
+
     def test_public_benchmark_uses_supplied_qrels(self) -> None:
         queries = Path(__file__).resolve().parents[3] / "eval" / "public" / "queries.jsonl"
         qrels = Path(__file__).resolve().parents[3] / "eval" / "public" / "qrels.jsonl"

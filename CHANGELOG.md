@@ -193,6 +193,16 @@
   record's capturing-agent id (carried in the record, so every node computes
   the same path), not by the node's configured agent id — name agents
   globally, or two nodes' `main` agents will share one inbox.
+- Conform to the surfaces the ecosystem actually reads, measured against
+  TencentDB Agent Memory and MemOS: MCP tools now carry `title` and
+  `annotations` (all read-only except `memory_sync`, the one open-world
+  tool), the CLI answers `--version` with the release and MCP revision, and
+  the Skill frontmatter carries `license` plus `metadata.version` per the
+  open Agent Skills spec — with a delivery test pinning frontmatter, VERSION
+  and pyproject to one number. Neither reference ships MCP (TencentDB is
+  proxy-based by design, MemOS documents none) or a first-party CLI, so those
+  axes stay ours; what they do better is root-level install docs and
+  bilingual entry points, adopted as `INSTALL.md` and `README_CN.md`.
 
 ## 0.7.15
 

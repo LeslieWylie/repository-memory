@@ -1,6 +1,10 @@
 ---
 name: repository-memory
 description: Answer questions about this project, its history, past conversations, and prior team decisions from source-backed evidence with verified citations. Use whenever the user asks what something is, why it was decided, what happened before, or what the team already knows.
+license: MIT
+metadata:
+  version: "0.7.16"
+  author: Repository Memory contributors
 ---
 
 # Repository Memory

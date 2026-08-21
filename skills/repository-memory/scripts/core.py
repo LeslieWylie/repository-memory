@@ -56,7 +56,8 @@ from memos_integration import configure as configure_memos
 from memos_integration import disable as disable_memos
 from memos_integration import doctor as doctor_memos
 from memos_integration import install as install_memos
-from mcp_server import serve
+from mcp_server import MODERN_PROTOCOL, serve
+from version import VERSION
 from memorycore import (
     _lifecycle_status as _native_lifecycle_status,
     _with_lifecycle_markers as _with_native_lifecycle,
@@ -2188,6 +2189,7 @@ def memory_context(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="repository-memory")
     parser.add_argument("--root")
+    parser.add_argument("--version", action="version", version=f"repository-memory {VERSION} (mcp {MODERN_PROTOCOL})")
     sub = parser.add_subparsers(dest="command", required=True)
 
     def common(name: str) -> argparse.ArgumentParser:

@@ -146,3 +146,37 @@ home-directory layout is user data and this file is public:
 Do not add resolved absolute paths to Skill instructions or user
 configuration — or to this file. `personal-absolute-path` in
 `tools/scan-tree.sh` now fails CI if they come back.
+
+## 2026-08-21 conformance comparison (TencentDB Agent Memory, MemOS)
+
+Compared both references against this project on documentation, MCP protocol,
+Skill spec, and CLI ergonomics.
+
+Adopted:
+
+- Root-level `INSTALL.md` with per-host sections and a Chinese overview
+  (`README_CN.md`) — TencentDB ships bilingual root docs (`README_CN`,
+  `INSTALL_CN`) and per-agent install guides; MemOS ships `README_ZH`. Our
+  install knowledge lived in quickstart plus a company skill's trap notes.
+- MCP tool `title` and `annotations` (readOnlyHint/destructiveHint/
+  idempotentHint/openWorldHint) and a CLI `--version` — from the MCP
+  2025-03-26+ tool metadata and ordinary CLI convention; neither reference
+  actually ships these (see below), the gap was ours against the spec.
+- `SKILL.md` frontmatter `license` + `metadata.version` per the open Agent
+  Skills spec (agentskills.io): `version` belongs inside `metadata`, not at
+  the top level.
+
+Deliberately not adopted:
+
+- TencentDB's proxy integration ("no plugin, hook, or MCP server required",
+  `/v3/tools/list|call` over HTTP): replacing the agent's base URL couples
+  memory to the model gateway path; we keep memory a tool the model chooses.
+- TencentDB's top-level `version:` frontmatter key: fails Agent Skills spec
+  validation, which allows only name/description/license/allowed-tools/
+  metadata/compatibility.
+- MemOS's service-first deployment (uvicorn/docker as the primary interface):
+  this project's contract is a zero-dependency local CLI; a service stays
+  optional.
+- `allowed-tools` frontmatter: enforcement varies by host and a wrong guess
+  breaks the CLI fallback path; revisit when host behavior converges.
+

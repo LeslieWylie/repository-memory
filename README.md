@@ -131,6 +131,9 @@ local memory; it is not an accepted fact and must be checked before reuse.
 
 ## Install
 
+Per-host guides, fresh-host traps, and the team-loop setup live in
+[INSTALL.md](INSTALL.md); a Chinese overview lives in [README_CN.md](README_CN.md).
+
 Requirements: Python 3.10+ and Git. The core runtime uses only the Python
 standard library. Node.js is needed only for the OpenClaw extension tests or
 when OpenClaw itself requires it.
