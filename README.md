@@ -95,6 +95,9 @@ commits or pushes. See [docs/team-memory-git-sync.md](docs/team-memory-git-sync.
 
 ## What happens on one question?
 
+(The full picture — components, record state machine, query sequence, fleet
+topology — lives in [docs/lifecycle.md](docs/lifecycle.md) as rendered UML.)
+
 ```mermaid
 flowchart LR
     A[Agent question] --> B[MCP or CLI]
