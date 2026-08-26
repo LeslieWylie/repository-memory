@@ -474,6 +474,13 @@ class RepositoryMemoryTest(unittest.TestCase):
             group = auto["groups"][plane]
             self.assertTrue(group.get("answerable") or group.get("active"))
 
+        # MCP clients may retain only a bounded prefix of a large structured
+        # result.  The grouped answer planes must therefore serialize before
+        # verbose repository candidates, or a valid memory answer can be
+        # truncated out of the agent-visible tool result.
+        serialized = json.dumps(auto, ensure_ascii=False)
+        self.assertLess(serialized.index('"groups"'), serialized.index('"verified"'))
+
         # A caller must be able to test the key, not the build.
         negative = core.search(None, "fictional benchmark ZZZQWE")
         self.assertEqual(negative["answered_by"], [])

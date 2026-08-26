@@ -915,6 +915,13 @@ def _package_search(query: str, mode: str, scope: str, views: list[SourceView], 
         "mode": mode,
         "scope": scope,
         "retrieval_mode": retrieval_mode,
+        # Keep the answer-bearing grouped planes ahead of verbose repository
+        # leads. OpenClaw persists a bounded textual rendering of MCP
+        # structuredContent; when ``verified`` contains several long documents,
+        # placing groups after it can truncate a valid conversation-memory
+        # answer before the model sees it.
+        "groups": groups if scope in {"all", "auto"} else None,
+        "answered_by": answered_by,
         "sources": [_source_payload(view) for view in views],
         "verified": selected["verified"][:limit],
         "candidates": selected["candidates"][:limit],
@@ -922,9 +929,7 @@ def _package_search(query: str, mode: str, scope: str, views: list[SourceView], 
         # for document-level retrieval metrics and citation diagnostics.
         "results": answerable,
         "answerable": answerable,
-        "groups": groups if scope in {"all", "auto"} else None,
         "abstain": abstain,
-        "answered_by": answered_by,
         "freshness": {view.spec.id: _freshness(view) for view in views},
         "diagnostics": {
             "scope": scope,
