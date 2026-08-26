@@ -36,6 +36,15 @@ metadata with `layer` (for example `L0` through `L3`), `type`, `query_source`,
 and `strategy`. These fields describe where the adapter found the item; they do
 not bypass citation validation or upgrade a candidate to `verified`.
 
+Standalone assistant turns may additionally expose `retrieval_keys`,
+`context`, and `context_strategy=adjacent-session-turns`. A retrieval key is a
+bounded preceding user question used to associate a concise answer with the
+way it was asked; adjacent context stays inside the same session, layer, and
+ingest/request batch. It is never factual evidence. A key-only match reports
+`support.claim_support=associated` and `retrieval_key_is_evidence=false`, so it
+may appear in `verified` as an investigation lead but cannot enter
+`answerable` or suppress abstention.
+
 `support` is a lexical/structural diagnostic, not semantic entailment. A
 `direct` value means the inspected evidence window contains the extracted
 query terms; it does not prove relation direction, negation, or every part of
@@ -47,9 +56,11 @@ range, and excerpt, or a native memory backend returned a stable layer/id/eviden
 tuple with no disqualifying status. It does not mean every claim in the query
 is supported by one excerpt.
 
-`answerable` is the safe answer surface. It contains only verified results whose
-evidence window has `support.claim_support=direct`. `results` is an alias for
-`answerable`, not for every verified document. A response may therefore contain
+`answerable` is the safe answer surface. Repository evidence requires
+`support.claim_support=direct`; a prior assistant answer may also be partial
+when its own text independently matched the query. `associated` retrieval-key
+matches are never answerable. `results` is an alias for `answerable`, not for
+every verified document. A response may therefore contain
 verified documents while still returning `abstain=true`; this means retrieval
 found real citations but no returned excerpt supports the complete claim. Use
 `get`/`explain` with the citation's commit and line range, or answer only the

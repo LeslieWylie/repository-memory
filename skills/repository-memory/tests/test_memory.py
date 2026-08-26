@@ -137,7 +137,7 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(value["document_count"], len(value["documents"]))
         self.assertGreaterEqual(value["text_bytes"], 0)
         self.assertGreater(value["index_bytes"], 0)
-        self.assertEqual(VERSION, "0.7.17")
+        self.assertEqual(VERSION, "0.7.18")
 
     def test_multisource_search_has_verified_and_candidates(self):
         result = core.search(None, "Atlas evidence", limit=5)
@@ -2326,6 +2326,99 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(reflection["status"], "candidate")
         self.assertTrue(reflection["generated"])
         self.assertFalse(reflection["accepted"])
+
+    def test_standalone_answer_uses_the_user_question_as_a_retrieval_key(self):
+        """A concise answer need not repeat the vocabulary of its question."""
+        self.write_config({})
+        os.environ["REPOSITORY_MEMORY_AUTODISCOVER"] = "0"
+        from standalone_memory import standalone_memory_client
+
+        session = Path(self.temp.name) / "retrieval-key-session.json"
+        session.write_text(json.dumps({
+            "session_id": "retrieval-key-session",
+            "messages": [
+                {"role": "user", "content": "凌晨批处理任务为什么失败？"},
+                {"role": "assistant", "content": "连接池耗尽；上限从 10 调到 30 后恢复。"},
+                {"role": "user", "content": "后来稳定吗？"},
+                {"role": "assistant", "content": "连续三次回放都通过。"},
+            ],
+        }), encoding="utf-8")
+        core.ingest_session(None, str(session))
+
+        hits = standalone_memory_client().search("凌晨批处理任务为什么失败？", limit=3)
+        answers = [item for item in hits if item.get("memory_role") == "assistant"]
+        self.assertTrue(answers)
+        answer = answers[0]
+        self.assertIn("连接池耗尽", answer["content"])
+        self.assertEqual(answer["retrieval_keys"], ["凌晨批处理任务为什么失败？"])
+        self.assertEqual(answer["context"][0]["role"], "user")
+        self.assertIn("凌晨批处理", answer["context"][0]["content"])
+        self.assertEqual(len({item["id"] for item in hits}), len(hits))
+
+        surfaced = core.search(None, "凌晨批处理任务为什么失败？", scope="memory")
+        self.assertTrue(surfaced["abstain"], "association alone is not factual support")
+        surfaced_answer = next(item for item in surfaced["verified"] if item["memory"]["role"] == "assistant")
+        self.assertTrue(surfaced_answer["support"]["retrieval_key_match"])
+        self.assertFalse(surfaced_answer["support"]["retrieval_key_is_evidence"])
+        self.assertEqual(surfaced_answer["support"]["claim_support"], "associated")
+        self.assertEqual(surfaced_answer["context_strategy"], "adjacent-session-turns")
+
+    def test_retrieval_keys_do_not_persist_sensitive_questions(self):
+        self.write_config({})
+        os.environ["REPOSITORY_MEMORY_AUTODISCOVER"] = "0"
+        from standalone_memory import standalone_memory_client
+
+        client = standalone_memory_client()
+        secret = "token=sk-" + "abcdefghijklmnop"
+        session = Path(self.temp.name) / "sensitive-retrieval-key.json"
+        session.write_text(json.dumps({"session_id": "sensitive-key", "messages": [
+            {"role": "user", "content": f"为什么 {secret} 失效？"},
+            {"role": "assistant", "content": "需要重新配置调用方。"},
+        ]}), encoding="utf-8")
+        core.ingest_session(None, str(session))
+        connection = client._connect()
+        try:
+            row = connection.execute("SELECT metadata FROM records WHERE session_id=? AND layer='L1' AND role='assistant'", ("sensitive-key",)).fetchone()
+            fts = " ".join(str(value[0]) for value in connection.execute("SELECT content FROM records_fts")) if client._fts(connection) else ""
+        finally:
+            connection.close()
+        self.assertEqual(json.loads(row[0])["retrieval_keys"], [])
+        self.assertNotIn(secret, fts)
+        self.assertFalse(any(secret in " ".join(item.get("retrieval_keys") or []) for item in client.search(secret, limit=10)))
+
+    def test_adjacent_context_is_scoped_to_one_ingest_batch(self):
+        self.write_config({})
+        from standalone_memory import standalone_memory_client
+
+        client = standalone_memory_client()
+        client.ingest_aml(request_id="request-one", user_id="user-a", session_id="same-session", messages=[
+            {"role": "user", "content": "first batch outage cause?"},
+            {"role": "assistant", "content": "pool alpha exhausted"},
+        ])
+        client.ingest_aml(request_id="request-two", user_id="user-a", session_id="same-session", messages=[
+            {"role": "user", "content": "second batch release status?"},
+            {"role": "assistant", "content": "release beta completed"},
+        ])
+        first = next(item for item in client.search("first batch outage cause", limit=10) if "pool alpha" in item["content"])
+        second = next(item for item in client.search("second batch release status", limit=10) if "release beta" in item["content"])
+        self.assertIn("first batch", first["context"][0]["content"])
+        self.assertNotIn("second batch", first["context"][0]["content"])
+        self.assertIn("second batch", second["context"][0]["content"])
+
+    def test_legacy_lookup_refuses_ambiguous_same_index_rows(self):
+        self.write_config({})
+        from standalone_memory import standalone_memory_client
+
+        client = standalone_memory_client()
+        connection = client._connect()
+        try:
+            for record_id, content in (("legacy-a", "first old question"), ("legacy-b", "second old question")):
+                client._upsert(connection, record_id=record_id, layer="L1", session_id="legacy-session", message_index=0, role="user", content=content, metadata={})
+            connection.commit()
+            rows = connection.execute("SELECT * FROM records WHERE session_id='legacy-session'").fetchall()
+        finally:
+            connection.close()
+        self.assertEqual(client._row_lookup(rows), {})
 
     def test_standalone_memory_links_are_explicit_and_mmr_is_explainable(self):
         self.write_config({})

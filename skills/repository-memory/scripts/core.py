@@ -481,6 +481,18 @@ def normalize_item(item: dict[str, Any], view: SourceView, source_type: str, que
         normalized_terms = query_terms(query)
         normalized_carved = carved_query_terms(query) & set(normalized_terms)
         support = _claim_support(normalized_terms, str(excerpt or ""), start or 1, end or start or 1, real_terms=frozenset(set(normalized_terms) - normalized_carved), carved=frozenset(normalized_carved), path=path)
+        retrieval_keys = item.get("retrieval_keys") if isinstance(item.get("retrieval_keys"), list) else []
+        retrieval_text = "\n".join(str(value) for value in retrieval_keys).casefold()
+        key_matches = [term for term in normalized_terms if term.casefold() in retrieval_text]
+        if item.get("memory_role") == "assistant" and support.get("claim_support") == "unknown" and key_matches:
+            support = {
+                **support,
+                "matched_terms": key_matches,
+                "unmatched_terms": [term for term in normalized_terms if term not in key_matches],
+                "claim_support": "associated",
+                "retrieval_key_match": True,
+                "retrieval_key_is_evidence": False,
+            }
     support = support or {"matched_terms": [], "unmatched_terms": [], "coverage": 1.0, "claim_support": "unknown", "supporting_spans": []}
     result = {
         "id": result_id,
@@ -524,6 +536,9 @@ def normalize_item(item: dict[str, Any], view: SourceView, source_type: str, que
             ),
         },
         "related": item.get("related") or item.get("links") or [],
+        "retrieval_keys": item.get("retrieval_keys") or [],
+        "context": item.get("context") or [],
+        "context_strategy": item.get("context_strategy") or "none",
         "linked_evidence": linked_evidence,
         "memory": {
             "layer": memory_layer,

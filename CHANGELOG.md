@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.18
+
+- Index each standalone assistant memory under the immediately preceding user
+  question, following ActiveMemoryIndex's retrieval-key pattern without making
+  the question itself factual evidence.
+- Return bounded adjacent-session context and explicit
+  `retrieval_key_is_evidence=false` diagnostics, including read-time recovery
+  for records created before this release.
+- Refresh the audited local upstream comparison with current MemOS,
+  ActiveMemoryIndex, Cognee, Mem0, ReFind, and divergent Tencent/AML state.
+
 ## 0.7.17
 
 - Reject low-information acknowledgement/status turns from automatic L2 and

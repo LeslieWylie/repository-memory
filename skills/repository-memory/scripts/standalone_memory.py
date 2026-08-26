@@ -576,8 +576,11 @@ class StandaloneMemoryClient:
 
     def _upsert(self, connection: sqlite3.Connection, *, record_id: str, layer: str, session_id: str, message_index: int, role: str, content: str, timestamp: str = "", metadata: dict[str, Any] | None = None, status: str = "verified", generated: bool = False, accepted: bool = True, episode_id: str | None = None, turn_id: str | None = None, value: float | None = None, priority: float | None = None, alpha: float = 0.3, reflection: str | None = None) -> None:
         now = time.time()
-        metadata_value = json.dumps(metadata or {}, ensure_ascii=False, sort_keys=True)
+        metadata = metadata or {}
         spec = active_embedding_spec()
+        raw_retrieval_keys = metadata.get("retrieval_keys") if isinstance(metadata.get("retrieval_keys"), list) else []
+        metadata["retrieval_keys"] = [str(value) for value in raw_retrieval_keys if str(value).strip() and not SECRET_CONTENT.search(str(value))]
+        metadata_value = json.dumps(metadata, ensure_ascii=False, sort_keys=True)
         vector = vectorize(content)
         embedding = pack(vector)
         connection.execute(
@@ -595,7 +598,52 @@ class StandaloneMemoryClient:
         if self._fts(connection):
             connection.execute("DELETE FROM records_fts WHERE id = ?", (record_id,))
             connection.execute("INSERT INTO records_fts (id, content) VALUES (?, ?)", (record_id, content))
-        self._sync_links(connection, record_id, metadata or {})
+        self._sync_links(connection, record_id, metadata)
+
+    @staticmethod
+    def _row_metadata(row: sqlite3.Row) -> dict[str, Any]:
+        try:
+            value = json.loads(str(row["metadata"] or "{}"))
+        except json.JSONDecodeError:
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    @classmethod
+    def _lookup_key(cls, row: sqlite3.Row, message_index: int | None = None) -> tuple[str, str, str, int]:
+        metadata = cls._row_metadata(row)
+        batch = str(metadata.get("ingest_id") or metadata.get("request_id") or "legacy")
+        return (str(row["session_id"]), str(row["layer"]), batch, int(row["message_index"]) if message_index is None else message_index)
+
+    @classmethod
+    def _row_lookup(cls, rows: list[sqlite3.Row]) -> dict[tuple[str, str, str, int], sqlite3.Row]:
+        lookup: dict[tuple[str, str, str, int], sqlite3.Row | None] = {}
+        for row in rows:
+            key = cls._lookup_key(row)
+            lookup[key] = row if key not in lookup else None
+        return {key: row for key, row in lookup.items() if row is not None}
+
+    @classmethod
+    def _retrieval_keys(cls, row: sqlite3.Row, lookup: dict[tuple[str, str, str, int], sqlite3.Row]) -> list[str]:
+        metadata = cls._row_metadata(row)
+        raw_keys = metadata.get("retrieval_keys") if isinstance(metadata, dict) else []
+        keys = [str(value).strip() for value in raw_keys if str(value).strip() and not SECRET_CONTENT.search(str(value))] if isinstance(raw_keys, list) else []
+        if str(row["role"] or "").casefold() == "assistant":
+            previous = lookup.get(cls._lookup_key(row, int(row["message_index"]) - 1))
+            if previous is not None and str(previous["role"] or "").casefold() == "user":
+                question = str(previous["content"] or "").strip()
+                if question and not SECRET_CONTENT.search(question) and question not in keys:
+                    keys.append(question)
+        return keys[:3]
+
+    @classmethod
+    def _adjacent_context(cls, row: sqlite3.Row, lookup: dict[tuple[str, str, str, int], sqlite3.Row]) -> list[dict[str, Any]]:
+        context = []
+        index = int(row["message_index"])
+        for adjacent_index in (index - 1, index + 1):
+            adjacent = lookup.get(cls._lookup_key(row, adjacent_index))
+            if adjacent is not None:
+                context.append({"id": str(adjacent["id"]), "role": str(adjacent["role"] or ""), "content": str(adjacent["content"] or "")[:512], "message_index": int(adjacent["message_index"])})
+        return context
 
     @staticmethod
     def _sync_links(connection: sqlite3.Connection, record_id: str, metadata: dict[str, Any]) -> None:
@@ -706,6 +754,8 @@ class StandaloneMemoryClient:
                     continue
                 session_count += 1
                 episode_id = f"episode:{hashlib.sha256(session_id.encode('utf-8')).hexdigest()[:24]}"
+                ingest_basis = json.dumps(messages, ensure_ascii=False, sort_keys=True)
+                ingest_id = hashlib.sha256(f"{session_id}\0{ingest_basis}".encode("utf-8")).hexdigest()[:24]
                 for index, message in enumerate(messages):
                     content = message["content"]
                     if SECRET_CONTENT.search(content):
@@ -713,7 +763,10 @@ class StandaloneMemoryClient:
                         continue
                     role = message["role"]
                     turn_id = f"{episode_id}:turn:{index // 2}"
-                    metadata = {"session_id": session_id, "message_index": index, "episode_id": episode_id, "turn_id": turn_id, "pipeline": "standalone+memos-lifecycle"}
+                    retrieval_keys = []
+                    if role.casefold() == "assistant" and index > 0 and messages[index - 1]["role"].casefold() == "user" and not SECRET_CONTENT.search(messages[index - 1]["content"]):
+                        retrieval_keys = [messages[index - 1]["content"]]
+                    metadata = {"session_id": session_id, "message_index": index, "episode_id": episode_id, "ingest_id": ingest_id, "turn_id": turn_id, "pipeline": "standalone+memos-lifecycle", "retrieval_keys": retrieval_keys}
                     self._upsert(connection, record_id=_stable_id("L0", session_id, index, role, content), layer="L0", session_id=session_id, message_index=index, role=role, content=content, timestamp=message["timestamp"], metadata=metadata, episode_id=episode_id, turn_id=turn_id)
                     self._upsert(connection, record_id=_stable_id("L1", session_id, index, role, content), layer="L1", session_id=session_id, message_index=index, role=role, content=content, timestamp=message["timestamp"], metadata=metadata, episode_id=episode_id, turn_id=turn_id, alpha=0.3)
                     written_l0 += 1
@@ -809,6 +862,11 @@ class StandaloneMemoryClient:
                     "user_id_hash": scope[4:-1],
                     "session_id_hash": hashed_session,
                 }
+                if role.casefold() == "assistant" and index > 0:
+                    previous = messages[index - 1]
+                    previous_content = str(previous.get("content") or "").strip() if isinstance(previous, dict) else ""
+                    if isinstance(previous, dict) and str(previous.get("role") or "").casefold() == "user" and not SECRET_CONTENT.search(previous_content):
+                        metadata["retrieval_keys"] = [previous_content]
                 digest = hashlib.sha256(f"{request_id}\0{index}\0{role}\0{content}".encode("utf-8")).hexdigest()[:32]
                 for layer in ("L0", "L1"):
                     self._upsert(
@@ -859,9 +917,11 @@ class StandaloneMemoryClient:
         max_epoch = max(row_epochs, default=0.0)
         epoch_span = max(0.0, max_epoch - min_epoch)
         ranked = []
+        lookup = self._row_lookup(rows)
         for row, row_epoch in zip(rows, row_epochs):
             content = str(row["content"])
-            matched = [term for term in terms if term in content.casefold()]
+            searchable_text = "\n".join([content, *self._retrieval_keys(row, lookup)]).casefold()
+            matched = [term for term in terms if term in searchable_text]
             semantic_score = cosine(query_vector, unpack(row["embedding"], int(row["embedding_dim"] or EMBEDDING_DIMENSION)))
             if not matched and semantic_score < 0.12:
                 continue
@@ -894,7 +954,9 @@ class StandaloneMemoryClient:
         now = time.time()
         ranked = []
         seen_content: dict[str, dict[str, Any]] = {}
-        for row in self._rows(query, limit):
+        rows = self._rows(query, limit)
+        lookup = self._row_lookup(rows)
+        for row in rows:
             content = str(row["content"])
             # Drop the question before it can compete — see ``is_question_turn``.
             # Everything excluded here is already discarded downstream by the
@@ -902,7 +964,9 @@ class StandaloneMemoryClient:
             # remove a result that used to be served.
             if is_question_turn(row["role"], content):
                 continue
-            matched = [term for term in terms if term in content.casefold()]
+            retrieval_keys = self._retrieval_keys(row, lookup)
+            searchable_text = "\n".join([content, *retrieval_keys]).casefold()
+            matched = [term for term in terms if term in searchable_text]
             semantic_score = cosine(query_vector, unpack(row["embedding"], int(row["embedding_dim"] or EMBEDDING_DIMENSION)))
             if not matched and semantic_score < 0.12:
                 continue
@@ -934,6 +998,7 @@ class StandaloneMemoryClient:
                 "recency_score": recency_score,
                 "_relevance": relevance,
                 "_promoted": promoted,
+                "retrieval_keys": retrieval_keys,
                 "_vector": unpack(row["embedding"], int(row["embedding_dim"] or EMBEDDING_DIMENSION)),
             }
             # Byte-identical turns are one memory stored many times, not many
@@ -975,6 +1040,8 @@ class StandaloneMemoryClient:
                     item["semantic_score"],
                     recency_score=item["recency_score"],
                     related=self._related(connection, str(row["id"])),
+                    retrieval_keys=item.get("retrieval_keys") or [],
+                    context=self._adjacent_context(row, lookup),
                 )
                 result["ranking"] = {
                     "relevance": round(float(item.get("relevance", 0.0)), 6),
@@ -987,7 +1054,7 @@ class StandaloneMemoryClient:
             connection.close()
         return results
 
-    def _result(self, row: sqlite3.Row, matched: list[str], semantic_score: float = 0.0, *, recency_score: float = 0.0, related: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    def _result(self, row: sqlite3.Row, matched: list[str], semantic_score: float = 0.0, *, recency_score: float = 0.0, related: list[dict[str, Any]] | None = None, retrieval_keys: list[str] | None = None, context: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         record_id = str(row["id"])
         layer = str(row["layer"])
         content = str(row["content"])
@@ -1024,6 +1091,9 @@ class StandaloneMemoryClient:
             "recency_score": round(recency_score, 6),
             "retrieval_mode": "local-hybrid",
             "related": related if related is not None else [],
+            "retrieval_keys": retrieval_keys if retrieval_keys is not None else [],
+            "context": context if context is not None else [],
+            "context_strategy": "adjacent-session-turns" if context else "none",
             "updated_at": row["updated_at"],
             "_native_memory": True,
             "_memory_backend": self.backend,

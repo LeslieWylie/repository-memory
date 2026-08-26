@@ -6,10 +6,12 @@ silently become a second runtime or a second canonical source.
 
 | Project | Reference commit | License | What we reuse | What stays out of the default install |
 | --- | --- | --- | --- | --- |
-| [MemOS](https://github.com/MemTensor/MemOS) | `b41c8996a8dcb9df81998cced68d11457ce950c3` | Apache-2.0; local plugin MIT | L1/L2/L3 vocabulary, ordered timeline, tool outcome feedback, lazy local model loading | Neo4j/Qdrant deployment, its competing OpenClaw plugin, relaxed induction thresholds |
-| [Cognee](https://github.com/topoteretes/cognee) | `b948f88d48befe58e8b10e6b833adacdce4e0ddd` | Apache-2.0 | Explicit graph/relationship expansion as a future provider seam | Mandatory graph/vector service and a second document store |
+| [MemOS](https://github.com/MemTensor/MemOS) | `9119efe5554e61a94b669df5eb84cc1b8ef3c0ab` | Apache-2.0; local plugin MIT | L1/L2/L3 vocabulary, ordered timeline, tool outcome feedback, lazy local model loading | Neo4j/Qdrant deployment, its competing OpenClaw plugin, relaxed induction thresholds |
+| [ActiveMemoryIndex](https://github.com/cpacker/active-memory-index) | `ada43aef41a50a3a5c1a80e979446417e9308777` | MIT | Index an answer under the user's preceding question and return bounded neighboring turns | Its required model/API service and agentic second pass as a default |
+| [ReFind](https://github.com/imlrz/ReFind) | `a80175ca0eeb52a938d7cab7a602bc780de8a577` | MIT | Conversation/session retrieval fusion and a future opt-in deep-search seam | Mandatory iterative model calls in the default local path |
+| [Cognee](https://github.com/topoteretes/cognee) | `690c0ec023719a2a277dc893cdecfec1ca8012cc` | Apache-2.0 | Explicit graph/relationship expansion as a future provider seam | Mandatory graph/vector service and a second document store |
 | [TencentDB Agent Memory](https://github.com/Tencent/TencentDB-Agent-Memory) | `fe3230f176f1bf5832fee79d12494bbc2d19a8aa` | MIT | Layer lifecycle, bounded host capture, explicit read-back discipline, and optional MemoryKnowledge service | TencentDB/TCVDB as the fact authority and its competing memory slot |
-| [Mem0](https://github.com/mem0ai/mem0) | `001c235229be8795e3834520467bd0d661ed8f34` | Apache-2.0 | Small provider boundary and feedback-oriented API shape | Hosted/vector database defaults and a competing memory authority |
+| [Mem0](https://github.com/mem0ai/mem0) | `39bc02330563764e7d4465f1ecff5f002d94da1a` | Apache-2.0 | Small provider boundary and feedback-oriented API shape | Hosted/vector database defaults and a competing memory authority |
 | [MemPalace](https://github.com/MemPalace/mempalace) | `639c69a1d6be41a04964ceb72a3d29d6f45629e9` | MIT | Local-first retention and original-record preservation ideas | Its server deployment and unrelated personal-memory semantics |
 | [Hindsight](https://github.com/vectorize-io/hindsight) | `ec9cc702ec55898bcac0db9c9e598305772ad7ad` | MIT | Retention/recall concepts, and the pattern of treating CJK segmentation as a named, swappable tokenizer choice | No code copied into the runtime |
 | [jieba](https://github.com/fxsjy/jieba) | `0.42.1` (PyPI) | MIT | CJK query segmentation, as an optional `cjk` extra | The `lac_small` paddle models and the paddle backend, which are never imported; no user dictionary is loaded |
@@ -46,6 +48,12 @@ left as adapter promises:
 - MemOS-style lifecycle metadata is represented by layer, status, source,
   session, version and read-back fields; feedback remains explicit and does not
   silently rewrite a fact.
+- ActiveMemoryIndex's question-key pattern is implemented without generated
+  queries: an assistant turn is indexed under the immediately preceding user
+  question, while the stored answer remains the only factual evidence. Search
+  returns that key plus at most one neighboring message on either side, marks
+  the key as non-evidence, and reconstructs keys for older rows at read time so
+  no destructive migration is required.
 - Hindsight's separation between retention, recall and reflection is reflected
   in separate `memory-retain`, `search`, `memory-observe`, `memory-reflect`,
   and supervisor paths.
@@ -136,12 +144,26 @@ home-directory layout is user data and this file is public:
 
 ```text
 <references-root>/MemOS-reference
+<references-root>/memory-references/active-memory-index
 <references-root>/memory-references/cognee
 <references-root>/memory-references/tencentdb-agent-memory
 <references-root>/memory-references/mem0
 <references-root>/memory-references/mempalace
 <references-root>/memory-references/hindsight
+<references-root>/memory-references/refind
 ```
+
+## 2026-08-26 local reference refresh
+
+All clean local reference checkouts were fetched and fast-forwarded. MemOS,
+ActiveMemoryIndex, Cognee, Mem0, and the Tencent mirror moved; Hindsight,
+MemPalace, and ReFind were already current. The separate TencentCloud checkout
+contains local changes and was fetched only, never merged. Its
+`origin/feat/server_team` is `147d52c`; the clean `Tencent/...` mirror is a
+two-commit divergent branch at `c0cf94f`, so neither branch is described as a
+linear successor of the other. The Agent Memory Leaderboard checkout is also
+one local commit and one remote commit apart and was intentionally left
+unmerged.
 
 Do not add resolved absolute paths to Skill instructions or user
 configuration — or to this file. `personal-absolute-path` in
