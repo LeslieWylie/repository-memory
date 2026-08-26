@@ -137,7 +137,7 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(value["document_count"], len(value["documents"]))
         self.assertGreaterEqual(value["text_bytes"], 0)
         self.assertGreater(value["index_bytes"], 0)
-        self.assertEqual(VERSION, "0.7.16")
+        self.assertEqual(VERSION, "0.7.17")
 
     def test_multisource_search_has_verified_and_candidates(self):
         result = core.search(None, "Atlas evidence", limit=5)

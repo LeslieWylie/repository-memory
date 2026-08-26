@@ -139,11 +139,10 @@ class DeliveryContractTest(unittest.TestCase):
         self.assertEqual(by_id[untraceable["id"]]["checks"]["provenance_kind"], "none")
         self.assertEqual(store.get(untraceable["id"])["result"]["status"], "candidate")
 
-    def test_activation_reaches_every_projection_of_the_memory(self) -> None:
-        # A pull hydrates the same memory back into the store as a central
-        # wrapper linked by provenance.source_memory_id.  Activating either
-        # projection must activate both, or the exporter -- which prefers the
-        # local original -- keeps publishing candidate state forever.
+    def test_activation_uses_the_source_identity_after_wrapper_dedup(self) -> None:
+        # A pull may hydrate the same memory back as a central wrapper linked
+        # by provenance.source_memory_id.  Publish now collapses that wrapper
+        # onto the source identity, so activation has one row to update.
         store = team_memory_store()
         original = store.publish({
             "type": "solution",
@@ -152,19 +151,76 @@ class DeliveryContractTest(unittest.TestCase):
             "provenance": {"agent_id": "yaole", "citations": ["README.md"]},
             "confidence": 0.8,
         })["memory"]
-        wrapper = store.publish({
+        wrapper_receipt = store.publish({
             "id": "team:central:team_l1_00000000000000000000feed",
             "type": "solution",
             "title": "A reusable solution that was hydrated back",
             "content": "A concrete reusable solution with enough content to review and act on.",
             "provenance": {"agent_id": "yaole", "central_id": "team_l1_00000000000000000000feed", "source_memory_id": original["id"]},
             "confidence": 0.8,
-        })["memory"]
+        })
+        self.assertTrue(wrapper_receipt["duplicate"])
+        wrapper = wrapper_receipt["memory"]
+        self.assertEqual(wrapper["id"], original["id"])
         result = store.activate(wrapper["id"], reviewer="reviewer")
         self.assertEqual(result["status"], "active")
-        self.assertIn(original["id"], result["activated_siblings"])
+        self.assertEqual(result["activated_siblings"], [])
         self.assertEqual(store.get(original["id"])["result"]["status"], "active")
         self.assertEqual(store.get(original["id"])["result"]["reviewed_by"], "reviewer")
+
+    def test_publish_collapses_a_central_wrapper_onto_its_source_lineage(self) -> None:
+        store = team_memory_store()
+        original = store.publish({
+            "type": "solution",
+            "title": "One source-backed solution",
+            "content": "A concrete source-backed solution that should have one durable identity.",
+            "provenance": {"agent_id": "yaole", "citations": ["README.md"]},
+            "confidence": 0.8,
+        })["memory"]
+
+        receipt = store.publish({
+            "id": "team:central:team_l1_00000000000000000000abcd",
+            "type": "solution",
+            "title": "One source-backed solution",
+            "content": "A concrete source-backed solution that should have one durable identity.",
+            "provenance": {
+                "agent_id": "yaole",
+                "central_id": "team_l1_00000000000000000000abcd",
+                "source_memory_id": original["id"],
+            },
+            "confidence": 0.8,
+        })
+
+        self.assertTrue(receipt["duplicate"])
+        self.assertEqual(receipt["memory"]["id"], original["id"])
+        self.assertEqual(store.health()["record_count"], 1)
+
+    def test_lineage_dedup_requires_matching_canonical_identity_and_merges_review_state(self) -> None:
+        store = team_memory_store()
+        original = store.publish({
+            "type": "failure", "title": "Connection pool finding",
+            "content": "The pool was exhausted and this exact statement is the canonical finding.",
+            "scope": {"repo": "demo"}, "provenance": {"agent_id": "yaole"}, "confidence": 0.8,
+        })["memory"]
+        different = store.publish({
+            "type": "solution", "title": "Connection pool fix",
+            "content": "Increase the pool after measuring contention; this is a distinct conclusion.",
+            "provenance": {"source_memory_id": original["id"]}, "confidence": 0.8,
+        })
+        self.assertFalse(different["duplicate"])
+
+        reviewed = store.publish({
+            "id": "team:central:team_l1_reviewed", "type": "failure", "title": "Connection pool finding",
+            "content": "The pool was exhausted and this exact statement is the canonical finding.",
+            "scope": {"repo": "demo"},
+            "provenance": {"central_id": "team_l1_reviewed", "source_memory_id": original["id"]},
+            "status": "active", "reviewed_by": "reviewer", "activated_at": "2026-08-26T00:00:00+00:00",
+            "confidence": 0.8,
+        })
+        self.assertTrue(reviewed["duplicate"])
+        self.assertEqual(reviewed["memory"]["id"], original["id"])
+        self.assertEqual(reviewed["memory"]["status"], "active")
+        self.assertEqual(reviewed["memory"]["reviewed_by"], "reviewer")
 
 
     def test_skill_frontmatter_version_matches_the_release(self) -> None:

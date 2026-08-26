@@ -477,6 +477,7 @@ class SQLiteTeamMemoryBackend:
         valid_from = str(payload.get("valid_from") or now)
         valid_until = str(payload.get("valid_until") or "") or None
         def operation(connection: sqlite3.Connection) -> dict[str, Any]:
+            lineage_duplicate = False
             existing = connection.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
             if existing is None and idempotency:
                 # ``idempotency_key`` is UNIQUE, so a row published under an
@@ -484,7 +485,33 @@ class SQLiteTeamMemoryBackend:
                 # alone would miss it and turn a re-publish into an
                 # IntegrityError instead of the documented duplicate receipt.
                 existing = connection.execute("SELECT * FROM memories WHERE idempotency_key = ?", (idempotency,)).fetchone()
+            source_memory_id = str(provenance.get("source_memory_id") or "").strip()
+            central_id = str(provenance.get("central_id") or "").strip()
+            if existing is None and source_memory_id and central_id:
+                normalized_source = source_memory_id if source_memory_id.startswith("team:") else "team:" + source_memory_id
+                source_row = connection.execute("SELECT * FROM memories WHERE id = ?", (normalized_source,)).fetchone()
+                if source_row is not None:
+                    source_scope = json.loads(source_row["scope"] or "{}")
+                    same_identity = (
+                        source_row["memory_type"] == memory_type
+                        and str(source_row["content"] or "").strip() == content.strip()
+                        and source_scope == scope
+                    )
+                    if same_identity:
+                        existing = source_row
+                        lineage_duplicate = True
             if existing:
+                # A reviewed canonical wrapper carries lifecycle information
+                # back to its source row.  Identity was checked above, so this
+                # updates one memory rather than creating a second projection.
+                if lineage_duplicate and status == "active" and existing["status"] != "active":
+                    revision, origin_node, parent = self._next_revision(existing, self.node_id)
+                    connection.execute(
+                        "UPDATE memories SET status = 'active', reviewed_by = ?, activated_at = ?, updated_at = ?, revision = ?, origin_node = ?, parent_revision = ? WHERE id = ?",
+                        (reviewed_by, activated_at or now, now, revision, origin_node, parent, existing["id"]),
+                    )
+                    existing = connection.execute("SELECT * FROM memories WHERE id = ?", (existing["id"],)).fetchone()
+                    self._append_revision(connection, existing)
                 return {"schema_version": 1, "ok": True, "duplicate": True, "memory": self._row(existing), "canonical_repo_changed": False}
             superseded_row = connection.execute("SELECT * FROM memories WHERE id = ?", (supersedes,)).fetchone() if supersedes else None
             parent_revision = self._revision_id(superseded_row["revision"], superseded_row["origin_node"]) if superseded_row else None

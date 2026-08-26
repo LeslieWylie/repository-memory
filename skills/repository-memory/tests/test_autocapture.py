@@ -8,7 +8,7 @@ from pathlib import Path
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from autocapture import candidate_markdown, candidate_path, normalize_turn, should_create_candidate
+from autocapture import candidate_markdown, candidate_path, candidate_quality, normalize_turn, should_create_candidate
 
 
 class AutoCaptureTest(unittest.TestCase):
@@ -58,6 +58,40 @@ class AutoCaptureTest(unittest.TestCase):
             ],
         })
         self.assertFalse(should_create_candidate(turn))
+
+    def test_status_acknowledgement_does_not_become_durable_memory(self):
+        turn = normalize_turn({
+            "messages": [
+                {"role": "user", "content": "MR 开了吗？"},
+                {"role": "assistant", "content": "已看到，MR !33 已打开，当前对应提交 8c867512，后续等待流水线完成。"},
+            ],
+        })
+        quality = candidate_quality(turn)
+        self.assertFalse(quality["eligible"])
+        self.assertEqual(quality["reason"], "low_information_acknowledgement")
+
+    def test_short_explicit_blocker_is_still_durable(self):
+        turn = normalize_turn({
+            "messages": [
+                {"role": "user", "content": "现在为什么连不上？"},
+                {"role": "assistant", "content": "确认，当前阻塞点是 Mac 未启用远程登录，22 端口超时，不是公钥问题。"},
+            ],
+        })
+        quality = candidate_quality(turn)
+        self.assertTrue(quality["eligible"])
+        self.assertEqual(quality["reason"], "durable_signal")
+
+    def test_short_root_cause_is_durable_but_unfinished_ack_is_not(self):
+        root_cause = normalize_turn({"messages": [
+            {"role": "user", "content": "故障原因？"},
+            {"role": "assistant", "content": "根因是连接池耗尽；上限从 10 调到 30 后恢复。"},
+        ]})
+        unfinished = normalize_turn({"messages": [
+            {"role": "user", "content": "修好了吗？"},
+            {"role": "assistant", "content": "收到，修复尚未完成，正在等待流水线。"},
+        ]})
+        self.assertTrue(should_create_candidate(root_cause))
+        self.assertFalse(should_create_candidate(unfinished))
 
     def test_recall_injection_is_not_recaptured_as_memory(self):
         turn = normalize_turn({

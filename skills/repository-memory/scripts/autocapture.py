@@ -26,6 +26,18 @@ DURABLE_HINTS = re.compile(
     r"决定|完成|修复|实现|计划|偏好|记住|配置|提交|合并|阻塞|结论|以后|迁移|上线|规则|decision|done|fixed|implemented|plan|prefer|remember|config|commit|merge|blocked|conclusion|policy",
     re.I,
 )
+ACKNOWLEDGEMENT = re.compile(
+    r"^(?:已看到|收到|好的|好[的了]?|明白|确认收到|noted|got it|acknowledged)",
+    re.I,
+)
+STRONG_DURABLE_HINTS = re.compile(
+    r"决定|根因|原因是|验证|发现|约束|不能|必须|恢复|修复|实现|偏好|记住|配置|阻塞|结论|以后|迁移|规则|decision|root cause|verified|found|constraint|must|cannot|recovered|fixed|implemented|prefer|remember|config|blocked|conclusion|policy",
+    re.I,
+)
+UNFINISHED_PROGRESS = re.compile(
+    r"尚未|还没|未完成|正在|等待|待(?:处理|确认|合并|发布)|in progress|not (?:done|fixed|complete)|waiting|pending",
+    re.I,
+)
 INJECTED_CONTEXT = re.compile(
     r"<(?:relevant-memories|user-persona|relevant-scenes|scene-navigation|memory-tools-guide|"
     r"current_task_context|history_task_context)[^>]*>[\s\S]*?</(?:relevant-memories|user-persona|"
@@ -164,10 +176,46 @@ def normalize_turn(payload: dict[str, Any], *, max_messages: int = 24, max_messa
     }
 
 
-def should_create_candidate(turn: dict[str, Any], min_answer_chars: int = 80) -> bool:
+def candidate_quality(
+    turn: dict[str, Any],
+    min_answer_chars: int = 80,
+    substantive_answer_chars: int = 240,
+) -> dict[str, Any]:
     answers = [message["content"] for message in turn["messages"] if message["role"] == "assistant"]
     answer = answers[-1] if answers else ""
-    return len(answer) >= min_answer_chars or bool(DURABLE_HINTS.search(answer))
+    answer_chars = len(answer)
+    durable = bool(DURABLE_HINTS.search(answer))
+    strong_durable = bool(STRONG_DURABLE_HINTS.search(answer))
+    acknowledgement = bool(ACKNOWLEDGEMENT.search(answer))
+    if acknowledgement and UNFINISHED_PROGRESS.search(answer):
+        reason = "low_information_acknowledgement"
+        eligible = False
+    elif strong_durable:
+        reason = "durable_signal"
+        eligible = True
+    elif acknowledgement and answer_chars < substantive_answer_chars:
+        reason = "low_information_acknowledgement"
+        eligible = False
+    elif durable:
+        reason = "durable_signal"
+        eligible = True
+    elif answer_chars >= min_answer_chars:
+        reason = "substantive_answer"
+        eligible = True
+    else:
+        reason = "too_short"
+        eligible = False
+    return {
+        "eligible": eligible,
+        "reason": reason,
+        "answer_chars": answer_chars,
+        "durable_signal": durable,
+        "acknowledgement": acknowledgement,
+    }
+
+
+def should_create_candidate(turn: dict[str, Any], min_answer_chars: int = 80) -> bool:
+    return bool(candidate_quality(turn, min_answer_chars=min_answer_chars)["eligible"])
 
 
 def candidate_identity(turn: dict[str, Any]) -> str:

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.17
+
+- Reject low-information acknowledgement/status turns from automatic L2 and
+  Team Memory candidate capture while preserving short explicit decisions,
+  blockers, fixes, configuration, and policy statements.
+- Collapse hydrated central wrappers onto their `source_memory_id` at publish
+  time so one durable memory lineage does not occupy multiple local rows.
+- Replace the raw diagnostic GUI with a Chinese read-only “memory base” demo:
+  live L0-L3 and Team Memory populations, citation-backed answerable evidence,
+  investigative leads, and a visible negative-query abstention path.
+
 ## 0.7.16
 
 - Collapse auto-captured Team Memory candidates by `(agent, session, kind)`:

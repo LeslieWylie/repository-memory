@@ -1319,11 +1319,12 @@ def capture_turn(root: Path | None, payload: Any, source_id: str | None = None) 
     and can only be changed by an explicit promotion.
     """
 
-    from autocapture import candidate_markdown, candidate_path, candidate_store_path, normalize_turn, should_create_candidate
+    from autocapture import candidate_markdown, candidate_path, candidate_quality, candidate_store_path, normalize_turn
 
     if not isinstance(payload, dict):
         raise ValueError("capture-turn payload must be a JSON object")
     turn = normalize_turn(payload)
+    quality = candidate_quality(turn)
     native = native_memory_client()
     identity = native.config.identity if native.configured else {}
     # Run ids are only unique within a host/session.  Include the configured
@@ -1387,8 +1388,8 @@ def capture_turn(root: Path | None, payload: Any, source_id: str | None = None) 
                 break
             time.sleep(0.25)
 
-    candidate: dict[str, Any] = {"created": False, "status": "skipped", "reason": "not durable", "backend": "native-pipeline"}
-    if should_create_candidate(turn) and native.configured and l0["l0_verified"]:
+    candidate: dict[str, Any] = {"created": False, "status": "skipped", "reason": quality["reason"], "backend": "native-pipeline"}
+    if quality["eligible"] and native.configured and l0["l0_verified"]:
         # Do not call scenario/write here: the native endpoint is update-only
         # and a fabricated local file is not an L2 memory.  L2 creation belongs
         # to the MemoryCore scene extractor triggered by conversation/add.
@@ -1449,8 +1450,8 @@ def capture_turn(root: Path | None, payload: Any, source_id: str | None = None) 
     # Shared Team Memory is intentionally narrower than raw conversation
     # capture.  A durable answer becomes a reviewable candidate only when it
     # contains a reusable decision, failure, discovery, solution, or handoff.
-    team_candidate: dict[str, Any] = {"created": False, "status": "skipped", "reason": "not durable"}
-    if should_create_candidate(turn):
+    team_candidate: dict[str, Any] = {"created": False, "status": "skipped", "reason": quality["reason"], "quality": quality}
+    if quality["eligible"]:
         answer = next((item["content"] for item in reversed(turn["messages"]) if item["role"] == "assistant"), "")
         if re.search(r"决定|选择|采用|策略|decision|policy|选择", answer, re.IGNORECASE):
             memory_type = "decision"
