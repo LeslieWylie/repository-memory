@@ -1463,18 +1463,45 @@ def capture_turn(root: Path | None, payload: Any, source_id: str | None = None) 
         else:
             memory_type = "discovery"
         try:
-            team_result = team_memory_store().publish({
-                "type": memory_type,
-                "title": answer[:140].splitlines()[0] if answer else memory_type,
-                "content": answer,
-                "scope": {"workspace": Path(turn.get("workspace") or "").name if turn.get("workspace") else None},
-                "provenance": {"agent": turn.get("agent_id"), "session": turn.get("session_id"), "run_id": turn.get("run_id")},
-                "confidence": 0.4,
-                "status": "candidate",
-                "idempotency_key": f"capture:{key}",
-            })
-            team_memory = team_result.get("memory") if isinstance(team_result.get("memory"), dict) else {}
-            team_candidate = {"created": True, "status": "candidate", "id": team_memory.get("id"), "memory_type": memory_type, "duplicate": team_result.get("duplicate", False), "evidence_status": "candidate"}
+            store = team_memory_store()
+            # Autocapture fires once per assistant turn, so one conversation
+            # can stack a dozen candidates about one thing.  Text similarity
+            # cannot separate that storm from real work, but provenance can:
+            # one (agent, session, kind) is one thing, and the fullest turn
+            # stands for it.  Sessions were measured to arrive longest-first
+            # and decay into wrap-up remarks, so a later, shorter turn is not
+            # a refinement -- it adds nothing and is dropped rather than
+            # allowed to retire the substantive row.  Reviewed records are
+            # never touched, and a superseded row keeps its content and
+            # revision history.
+            representative = store.session_representative(
+                author_agent=turn.get("agent_id"),
+                session=turn.get("session_id"),
+                memory_type=memory_type,
+            )
+            if representative is not None and int(representative["length"]) >= len(answer):
+                team_candidate = {
+                    "created": False,
+                    "status": "represented",
+                    "id": representative["id"],
+                    "memory_type": memory_type,
+                    "reason": "session already holds a fuller candidate of this kind",
+                }
+            else:
+                supersedes = representative["id"] if representative else None
+                team_result = store.publish({
+                    "type": memory_type,
+                    "title": answer[:140].splitlines()[0] if answer else memory_type,
+                    "content": answer,
+                    "scope": {"workspace": Path(turn.get("workspace") or "").name if turn.get("workspace") else None},
+                    "provenance": {"agent": turn.get("agent_id"), "session": turn.get("session_id"), "run_id": turn.get("run_id")},
+                    "confidence": 0.4,
+                    "status": "candidate",
+                    "supersedes": supersedes,
+                    "idempotency_key": f"capture:{key}",
+                })
+                team_memory = team_result.get("memory") if isinstance(team_result.get("memory"), dict) else {}
+                team_candidate = {"created": True, "status": "candidate", "id": team_memory.get("id"), "memory_type": memory_type, "duplicate": team_result.get("duplicate", False), "supersedes": supersedes, "evidence_status": "candidate"}
         except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error) as exc:
             team_candidate = {"created": False, "status": "error", "reason": str(exc)[:240]}
 
@@ -2252,6 +2279,7 @@ def build_parser() -> argparse.ArgumentParser:
     supervisor_parser = common("supervise"); supervisor_parser.add_argument("--lane", choices=("team", "memory", "all"), default="all"); supervisor_parser.add_argument("--all", action="store_true"); supervisor_parser.add_argument("--apply", action="store_true"); supervisor_parser.add_argument("--reviewer"); supervisor_parser.add_argument("--command", dest="supervisor_command", help="JSON argv array for the optional supervisor model"); supervisor_parser.add_argument("--min-confidence", type=float, default=0.7); supervisor_parser.add_argument("--limit", type=int, default=100); supervisor_parser.add_argument("--json", action="store_true")
     benchmark_parser = common("benchmark"); benchmark_parser.add_argument("--suite", choices=("public", "agentmemories", "locomo", "longmemeval", "rlvr"), required=True); benchmark_parser.add_argument("--data"); benchmark_parser.add_argument("--queries"); benchmark_parser.add_argument("--qrels"); benchmark_parser.add_argument("--limit", type=int, default=5); benchmark_parser.add_argument("--revision"); benchmark_parser.add_argument("--semantic-model", help="Run an isolated A/B with a configured local Hugging Face model"); benchmark_parser.add_argument("--semantic-download", action="store_true", help="Allow this benchmark to download the explicit semantic model"); benchmark_parser.add_argument("--json", action="store_true")
     compact_parser = common("team-compact"); compact_parser.add_argument("--keep", type=int, default=1); compact_parser.add_argument("--json", action="store_true")
+    collapse_parser = common("team-collapse"); collapse_parser.add_argument("--apply", action="store_true", help="write the collapse; omit for a dry run"); collapse_parser.add_argument("--json", action="store_true")
     memorycore = sub.add_parser("memorycore")
     memorycore.add_argument("action", choices=["configure", "install", "start", "stop", "status", "promote-l3"])
     memorycore.add_argument("--memorycore-root")
@@ -2438,7 +2466,7 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
                 return _mcp_dispatch(name, arguments)
             return serve(dispatch)
         gate_failed = False
-        root = None if args.command in {"init", "source", "doctor", "sync", "search", "get", "explain", "feedback", "promote", "publish", "team-activate", "team-export", "team-import", "team-configure", "team-sync", "team-publish", "team-status", "team-evaluate", "team-compact", "supervise", "benchmark", "context", "supersede", "memory-timeline", "memory-observe", "memory-reflect", "memory-retain", "ingest-session", "capture-turn", "knowledge", "memmy", "memos", "gui", "semantic", "memory", "memorycore"} else resolve_root(root_arg)
+        root = None if args.command in {"init", "source", "doctor", "sync", "search", "get", "explain", "feedback", "promote", "publish", "team-activate", "team-export", "team-import", "team-configure", "team-sync", "team-publish", "team-status", "team-evaluate", "team-compact", "team-collapse", "supervise", "benchmark", "context", "supersede", "memory-timeline", "memory-observe", "memory-reflect", "memory-retain", "ingest-session", "capture-turn", "knowledge", "memmy", "memos", "gui", "semantic", "memory", "memorycore"} else resolve_root(root_arg)
         if args.command in {"init", "source"} and root_arg:
             root = resolve_root(root_arg)
         if args.command == "doctor":
@@ -2520,6 +2548,11 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
 
             backend = team_memory_backend()
             value = backend.compact(keep=args.keep)
+        elif args.command == "team-collapse":
+            from team_memory import team_memory_backend
+
+            backend = team_memory_backend()
+            value = backend.collapse_session_candidates(apply=args.apply)
         elif args.command == "context":
             value = memory_context(root if root_arg else None, args.query, limit=args.limit, source_id=getattr(args, "source", None), repo=args.repo, issue=args.issue, branch=args.branch, agent=args.agent, local=args.local)
         elif args.command == "supersede":

@@ -22,6 +22,7 @@ from typing import Any
 
 from knowledge import KnowledgeClient, _config_path, _read_config
 from memorycore_service import _credentials
+from runtime_source import prepare_runtime_source
 
 
 LABEL = os.environ.get("REPOSITORY_MEMORY_KNOWLEDGE_LAUNCHD_LABEL", "com.repository-memoryknowledge")
@@ -87,6 +88,8 @@ def configure(args: argparse.Namespace) -> dict[str, Any]:
     memory = current.get("memorycore") if isinstance(current.get("memorycore"), dict) else {}
     knowledge = _knowledge_config()
     root = Path(args.root).expanduser().resolve() if args.root else (Path(str(knowledge.get("root"))).expanduser().resolve() if knowledge.get("root") else _bundled_root().resolve())
+    if root == _bundled_root().resolve():
+        root = prepare_runtime_source("MemoryKnowledge", _bundled_root())
     state_dir = Path(args.state_dir).expanduser() if args.state_dir else Path(str(knowledge.get("state_dir") or Path.home() / ".local" / "share" / "repository-memory" / "memoryknowledge")).expanduser()
     knowledge.update({
         "root": str(root),

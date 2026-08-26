@@ -8,7 +8,7 @@ silently become a second runtime or a second canonical source.
 | --- | --- | --- | --- | --- |
 | [MemOS](https://github.com/MemTensor/MemOS) | `b41c8996a8dcb9df81998cced68d11457ce950c3` | Apache-2.0; local plugin MIT | L1/L2/L3 vocabulary, ordered timeline, tool outcome feedback, lazy local model loading | Neo4j/Qdrant deployment, its competing OpenClaw plugin, relaxed induction thresholds |
 | [Cognee](https://github.com/topoteretes/cognee) | `b948f88d48befe58e8b10e6b833adacdce4e0ddd` | Apache-2.0 | Explicit graph/relationship expansion as a future provider seam | Mandatory graph/vector service and a second document store |
-| [TencentDB Agent Memory](https://github.com/Tencent/TencentDB-Agent-Memory) | `97f94654280b2932c35ba4806a491999ed244cc9` | MIT | Layer lifecycle and explicit read-back discipline | TencentDB service, Wiki/TCVDB and its memory slot |
+| [TencentDB Agent Memory](https://github.com/Tencent/TencentDB-Agent-Memory) | `fe3230f176f1bf5832fee79d12494bbc2d19a8aa` | MIT | Layer lifecycle, bounded host capture, explicit read-back discipline, and optional MemoryKnowledge service | TencentDB/TCVDB as the fact authority and its competing memory slot |
 | [Mem0](https://github.com/mem0ai/mem0) | `001c235229be8795e3834520467bd0d661ed8f34` | Apache-2.0 | Small provider boundary and feedback-oriented API shape | Hosted/vector database defaults and a competing memory authority |
 | [MemPalace](https://github.com/MemPalace/mempalace) | `639c69a1d6be41a04964ceb72a3d29d6f45629e9` | MIT | Local-first retention and original-record preservation ideas | Its server deployment and unrelated personal-memory semantics |
 | [Hindsight](https://github.com/vectorize-io/hindsight) | `ec9cc702ec55898bcac0db9c9e598305772ad7ad` | MIT | Retention/recall concepts, and the pattern of treating CJK segmentation as a named, swappable tokenizer choice | No code copied into the runtime |
@@ -179,4 +179,3 @@ Deliberately not adopted:
   optional.
 - `allowed-tools` frontmatter: enforcement varies by host and a wrong guess
   breaks the CLI fallback path; revisit when host behavior converges.
-

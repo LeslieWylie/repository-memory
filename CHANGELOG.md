@@ -2,6 +2,21 @@
 
 ## 0.7.16
 
+- Collapse auto-captured Team Memory candidates by `(agent, session, kind)`:
+  keep the fullest unreviewed record, preserve shorter turns as superseded
+  history, and expose an explicit dry-run-first `team-collapse` command for
+  older stores. Reviewed knowledge and records without session provenance are
+  never touched.
+- Exclude `node_modules`, `dist`, `.venv`, and Python caches from every managed
+  Skill copy. Optional MemoryKnowledge/MemoryCore service dependencies may live
+  beside the canonical installed Skill, but they must never inflate later host
+  installations or become part of the distributable source snapshot.
+- Run bundled TencentDB services from writable user-data copies so npm installs
+  and runtime compatibility patches never mutate the managed Skill source.
+- Pin the documented TencentDB Agent Memory reference to the same
+  `fe3230f176f1bf5832fee79d12494bbc2d19a8aa` archive recorded by the vendored
+  manifest.
+
 - Give every retrieval plane one query tokenizer (`tokenize_query.py`) with
   optional jieba word segmentation behind a new `cjk` extra. Previously four
   call sites tokenized CJK three different ways, and two of them — Team Memory

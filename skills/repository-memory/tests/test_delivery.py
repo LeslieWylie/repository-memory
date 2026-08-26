@@ -12,7 +12,9 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 from benchmark import run_benchmark
+from install import _copy_skill
 from provider_protocol import manifest, normalize_response
+from runtime_source import prepare_runtime_source
 from supervisor import supervise
 from team_memory import team_memory_store
 
@@ -50,6 +52,46 @@ class DeliveryContractTest(unittest.TestCase):
         value = normalize_response({"results": []}, operation="search", provider="fixture")
         self.assertEqual(value["provider"], "fixture")
         self.assertFalse(value["canonical_repo_changed"])
+
+    def test_managed_skill_copy_excludes_generated_runtime_dependencies(self) -> None:
+        source = Path(self.temp.name) / "source-skill"
+        destination = Path(self.temp.name) / "installed-skill"
+        (source / "vendor" / "MemoryCore" / "node_modules" / "package").mkdir(parents=True)
+        (source / "vendor" / "MemoryKnowledge" / "dist").mkdir(parents=True)
+        (source / ".venv" / "bin").mkdir(parents=True)
+        (source / "scripts" / "__pycache__").mkdir(parents=True)
+        (source / "vendor" / "MemoryCore" / "index.ts").write_text("export {};\n", encoding="utf-8")
+        (source / "vendor" / "MemoryCore" / "node_modules" / "package" / "index.js").write_text("runtime\n", encoding="utf-8")
+        (source / "vendor" / "MemoryKnowledge" / "dist" / "server.js").write_text("build\n", encoding="utf-8")
+        (source / ".venv" / "bin" / "python").write_text("runtime\n", encoding="utf-8")
+        (source / "scripts" / "__pycache__" / "module.pyc").write_bytes(b"runtime")
+
+        _copy_skill(source, destination)
+
+        self.assertTrue((destination / "vendor" / "MemoryCore" / "index.ts").is_file())
+        self.assertFalse((destination / "vendor" / "MemoryCore" / "node_modules").exists())
+        self.assertFalse((destination / "vendor" / "MemoryKnowledge" / "dist").exists())
+        self.assertFalse((destination / ".venv").exists())
+        self.assertFalse((destination / "scripts" / "__pycache__").exists())
+
+    def test_bundled_component_runs_from_separate_writable_tree(self) -> None:
+        source = Path(self.temp.name) / "bundled" / "MemoryCore"
+        (source / "src").mkdir(parents=True)
+        (source / "src" / "server.ts").write_text("export {};\n", encoding="utf-8")
+        (source / "node_modules" / "package").mkdir(parents=True)
+        (source / "node_modules" / "package" / "index.js").write_text("runtime\n", encoding="utf-8")
+
+        destination = prepare_runtime_source("MemoryCore", source)
+
+        self.assertNotEqual(destination, source.resolve())
+        self.assertEqual((destination / "src" / "server.ts").read_text(encoding="utf-8"), "export {};\n")
+        self.assertFalse((destination / "node_modules").exists())
+
+        (destination / "node_modules" / "kept").mkdir(parents=True)
+        (source / "src" / "server.ts").write_text("export const refreshed = true;\n", encoding="utf-8")
+        prepare_runtime_source("MemoryCore", source)
+        self.assertTrue((destination / "node_modules" / "kept").is_dir())
+        self.assertIn("refreshed", (destination / "src" / "server.ts").read_text(encoding="utf-8"))
 
     def test_supervisor_holds_without_model_and_applies_with_explicit_model(self) -> None:
         candidate = team_memory_store().publish({

@@ -912,6 +912,134 @@ class RepositoryMemoryTest(unittest.TestCase):
         # The ASCII path must keep using the index it can actually match on.
         self.assertFalse(store.search("rlvr-auto-survey")["abstain"])
 
+    def test_one_session_keeps_its_fullest_candidate_instead_of_stacking(self):
+        # Autocapture fires once per assistant turn.  A single conversation
+        # therefore deposits one candidate per turn, and those turns are
+        # semantically redundant but lexically too varied to dedupe by content
+        # (a real 42-minute thread ran 0.19-0.34 pairwise token overlap, under
+        # the 0.72 scored by two genuinely different answers).  Provenance is
+        # the signal that works: same agent, same session, same kind.
+        store = TeamMemoryStore(Path(self.temp.name) / "session.sqlite3")
+
+        def capture(content: str, *, session: str, memory_type: str = "discovery", agent: str = "yaole"):
+            """Stand in for the capture path in core.py."""
+            representative = store.session_representative(author_agent=agent, session=session, memory_type=memory_type)
+            if representative is not None and int(representative["length"]) >= len(content):
+                return None, representative["id"]
+            supersedes = representative["id"] if representative else None
+            published = store.publish({
+                "type": memory_type,
+                "title": content[:40],
+                "content": content,
+                "provenance": {"agent": agent, "session": session},
+                "supersedes": supersedes,
+            })
+            return published["memory"]["id"], supersedes
+
+        first, none_yet = capture("不能打包或发送本地 access token。", session="s-1")
+        self.assertIsNone(none_yet)
+        second, superseded = capture("私发也不行,我不能导出本机 access token 或 Cookie,这类值只交换名字。", session="s-1")
+        self.assertEqual(superseded, first)
+
+        # The earlier turn is retired, not deleted: content survives for audit
+        # and the live candidate is the fuller one.
+        self.assertEqual(store.get(first)["result"]["status"], "superseded")
+        self.assertIn("access token", store.get(first)["result"]["content"])
+        self.assertEqual(store.get(second)["result"]["status"], "candidate")
+        # A superseded row must leave the answer surface.
+        self.assertNotIn(first, [item["id"] for item in store.search("access token")["candidates"]])
+
+        # Sessions were measured to arrive longest-first and decay into wrap-up
+        # remarks, so a later, shorter turn is not a refinement.  It must not
+        # retire the substantive row -- that inversion is what made an earlier
+        # recency rule retire the best row in four of seven real storms.
+        wrapup, stands = capture("好的,收到。", session="s-1")
+        self.assertIsNone(wrapup)
+        self.assertEqual(stands, second)
+        self.assertEqual(store.get(second)["result"]["status"], "candidate")
+
+        # A different session is a different conversation; it must not collapse.
+        other, other_supersedes = capture("这台机器的 SSH 服务未启用,22 端口未监听。", session="s-2")
+        self.assertIsNone(other_supersedes)
+        self.assertEqual(store.get(other)["result"]["status"], "candidate")
+        self.assertEqual(store.get(second)["result"]["status"], "candidate")
+
+        # Same session but a different kind is a different claim.
+        decision, decision_supersedes = capture("决定:凭据只交换名字,不交换值。", session="s-1", memory_type="decision")
+        self.assertIsNone(decision_supersedes)
+        self.assertEqual(store.get(decision)["result"]["status"], "candidate")
+
+    def test_session_collapse_never_retracts_a_reviewed_record(self):
+        # Superseding an activated record would silently withdraw knowledge a
+        # human already accepted, so review is the hard floor for this collapse.
+        store = TeamMemoryStore(Path(self.temp.name) / "reviewed.sqlite3")
+        reviewed = store.publish({
+            "type": "discovery",
+            "title": "网关鉴权",
+            "content": "H3 网关配置 H3_API_KEY 后对 /v1/* 强制 Bearer。",
+            "provenance": {"agent": "yaole", "session": "s-9"},
+        })["memory"]["id"]
+        store.activate(reviewed, reviewer="武垚乐")
+
+        self.assertIsNone(store.session_representative(author_agent="yaole", session="s-9", memory_type="discovery"))
+        self.assertEqual(store.get(reviewed)["result"]["status"], "active")
+
+        # A record with no session carries no signal at all, so it is left alone.
+        self.assertIsNone(store.session_representative(author_agent="yaole", session=None, memory_type="discovery"))
+        self.assertIsNone(store.session_representative(author_agent=None, session="s-9", memory_type="discovery"))
+
+    def test_collapse_session_candidates_is_a_dry_run_until_applied(self):
+        # The same rule the capture path now enforces, applied to rows captured
+        # before it existed.  It must never fire without being asked.
+        store = TeamMemoryStore(Path(self.temp.name) / "collapse.sqlite3")
+        # Shaped like a real storm: the substantive turn lands first and the
+        # session decays into wrap-up remarks.
+        lengths = [700, 90, 90, 120]
+        ids = []
+        for index, length in enumerate(lengths):
+            ids.append(store.publish({
+                "type": "discovery",
+                "title": f"turn {index}",
+                "content": f"第 {index} 轮:" + "详" * length,
+                "provenance": {"agent": "yaole", "session": "s-storm"},
+            })["memory"]["id"])
+        substantive = ids[0]
+        keeper = store.publish({
+            "type": "discovery",
+            "title": "another session",
+            "content": "另一个会话里的独立发现。",
+            "provenance": {"agent": "yaole", "session": "s-other"},
+        })["memory"]["id"]
+        orphan = store.publish({
+            "type": "discovery",
+            "title": "no session",
+            "content": "没有会话来源的记录,没有信号可用。",
+            "provenance": {"agent": "yaole"},
+        })["memory"]["id"]
+
+        dry = store.collapse_session_candidates()
+        self.assertFalse(dry["applied"])
+        self.assertEqual(dry["collapsed"], 3)
+        self.assertEqual(dry["candidates_without_session"], 1)
+        # Nothing moved on a dry run.
+        self.assertEqual(store.get(ids[1])["result"]["status"], "candidate")
+
+        applied = store.collapse_session_candidates(apply=True)
+        self.assertTrue(applied["applied"])
+        self.assertEqual(applied["collapsed"], 3)
+        # The fullest turn stands even though three later turns follow it.
+        self.assertEqual(store.get(substantive)["result"]["status"], "candidate")
+        for retired in ids[1:]:
+            self.assertEqual(store.get(retired)["result"]["status"], "superseded")
+            self.assertEqual(store.get(retired)["result"]["superseded_by"], substantive)
+            # Retired, not deleted.
+            self.assertTrue(store.get(retired)["result"]["content"])
+        self.assertEqual(store.get(keeper)["result"]["status"], "candidate")
+        self.assertEqual(store.get(orphan)["result"]["status"], "candidate")
+
+        # Idempotent: a second pass has nothing left to collapse.
+        self.assertEqual(store.collapse_session_candidates(apply=True)["collapsed"], 0)
+
     def test_an_unreachable_carved_fragment_is_dropped_from_the_requirement(self):
         # The builtin n-gram path still manufactures fragments no document
         # contains, so the corpus probe that drops them stays live.  Terms are

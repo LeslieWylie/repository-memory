@@ -61,6 +61,7 @@ py-modules = [
   "memorycore_service",
   "models",
   "repository_memory",
+  "runtime_source",
   "snapshot",
   "semantic_repository",
   "team_memory",

@@ -29,6 +29,7 @@ from memorycore import (
     _read_json,
     _secret_from_keychain,
 )
+from runtime_source import prepare_runtime_source
 
 # Kept stable for upgrades of the existing user-level service.  It is an
 # operational identifier, not part of the Skill/agent contract; deployments
@@ -323,6 +324,9 @@ def configure(args: argparse.Namespace) -> dict[str, Any]:
     root = Path(args.root).expanduser().resolve() if args.root else discover_root()
     if root is None:
         raise RuntimeError("MemoryCore source not found; pass --memorycore-root")
+    bundled = Path(__file__).resolve().parents[1] / "vendor" / "tencentdb-agent-memory-reference" / "MemoryCore"
+    if root == bundled.resolve():
+        root = prepare_runtime_source("MemoryCore", bundled)
     current = _config()
     memory = _memory_config()
     model_ref = args.model or memory.get("llm_model") or os.environ.get("REPOSITORY_MEMORY_LLM_MODEL_REF") or ""

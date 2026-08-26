@@ -508,6 +508,114 @@ class SQLiteTeamMemoryBackend:
             return {"schema_version": 1, "ok": True, "duplicate": False, "memory": self._row(row), "write_operation": "explicit", "canonical_repo_changed": False}
         return self._write(operation)
 
+    def session_representative(self, *, author_agent: str | None, session: str | None, memory_type: str) -> dict[str, Any] | None:
+        """Return the un-reviewed candidate that stands for one session.
+
+        Autocapture emits one candidate per assistant turn, so a single
+        conversation can deposit a dozen rows about one thing: measured across
+        one 42-minute thread, pairwise token-set overlap ran 0.19-0.34, below
+        the 0.72 scored by two genuinely different answers.  Text similarity
+        cannot separate a storm from real work, so the grouping comes from
+        provenance instead -- one (agent, session, kind) is one thing.
+
+        Which row stands for the group is a separate question, and recency
+        answers it wrong.  Measured over the seven real storms in this store,
+        candidates arrive longest-first and decay into wrap-up remarks: one
+        session ran 2732 chars, then 100, 123, 56, and closed on 65.  Keeping
+        the newest retired the substantive row in four of the seven; keeping
+        the longest kept it in all seven.  So the fullest statement stands and
+        ties fall back to the newest.
+
+        Only candidates are considered.  Superseding a reviewed record would
+        silently retract knowledge a human already accepted, and a record
+        without a session carries no grouping signal at all, so both are left
+        alone.
+        """
+
+        if not session or not author_agent:
+            return None
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                "SELECT id, content, provenance FROM memories WHERE status = 'candidate' AND author_agent = ? AND memory_type = ? ORDER BY created_at",
+                (str(author_agent), memory_type),
+            ).fetchall()
+        finally:
+            connection.close()
+        best: dict[str, Any] | None = None
+        for row in rows:
+            provenance = _parse(row["provenance"], {})
+            if str(provenance.get("session") or provenance.get("session_id") or "") != str(session):
+                continue
+            length = len(str(row["content"] or ""))
+            # `>=` walks the created_at ordering, so an equal-length tie leaves
+            # the newest holding the slot.
+            if best is None or length >= int(best["length"]):
+                best = {"id": str(row["id"]), "length": length}
+        return best
+
+    def collapse_session_candidates(self, *, apply: bool = False) -> dict[str, Any]:
+        """Retire the per-turn pile-up one conversation leaves behind.
+
+        Capture predating the session-scoped supersede in the autocapture path
+        recorded every assistant turn as its own candidate, so a single thread
+        could deposit twenty rows about one thing.  This applies the same rule
+        retroactively: within one (agent, session, kind) the fullest candidate
+        stands and the rest are superseded by it.  See
+        `session_representative` for why the fullest rather than the newest.
+
+        Defaults to a dry run.  Reviewed records and candidates with no session
+        are never touched, and superseded rows keep their content and revision
+        history -- this retires rows, it does not delete them.
+        """
+
+        def operation(connection: sqlite3.Connection) -> dict[str, Any]:
+            groups: dict[tuple[str, str, str], list[sqlite3.Row]] = {}
+            no_session = 0
+            for row in connection.execute("SELECT * FROM memories WHERE status = 'candidate' ORDER BY created_at").fetchall():
+                provenance = _parse(row["provenance"], {})
+                session = str(provenance.get("session") or provenance.get("session_id") or "")
+                agent = str(row["author_agent"] or "")
+                if not session or not agent:
+                    no_session += 1
+                    continue
+                groups.setdefault((agent, session, str(row["memory_type"])), []).append(row)
+
+            now = _now()
+            collapsed: list[dict[str, Any]] = []
+            for (agent, session, memory_type), rows in groups.items():
+                if len(rows) < 2:
+                    continue
+                # `rows` is in created_at order, so max() on length alone
+                # leaves the earliest of an equal-length tie holding the slot;
+                # the index term flips that back to the newest.
+                winner = max(enumerate(rows), key=lambda pair: (len(str(pair[1]["content"] or "")), pair[0]))[1]
+                for row in rows:
+                    if row["id"] == winner["id"]:
+                        continue
+                    collapsed.append({"id": str(row["id"]), "agent": agent, "session": session, "memory_type": memory_type, "superseded_by": str(winner["id"])})
+                    if not apply:
+                        continue
+                    revision, origin_node, parent = self._next_revision(row, self.node_id)
+                    connection.execute(
+                        "UPDATE memories SET status = 'superseded', superseded_by = ?, updated_at = ?, revision = ?, origin_node = ?, parent_revision = ? WHERE id = ?",
+                        (str(winner["id"]), now, revision, origin_node, parent, row["id"]),
+                    )
+                    self._append_revision(connection, connection.execute("SELECT * FROM memories WHERE id = ?", (row["id"],)).fetchone())
+            remaining = int(connection.execute("SELECT COUNT(*) FROM memories WHERE status = 'candidate'").fetchone()[0])
+            return {
+                "schema_version": 1,
+                "ok": True,
+                "applied": bool(apply),
+                "collapsed": len(collapsed),
+                "records": collapsed,
+                "candidates_without_session": no_session,
+                "candidates_remaining": remaining if apply else remaining - len(collapsed),
+                "canonical_repo_changed": False,
+            }
+
+        return self._write(operation)
+
     def activate(self, memory_id: str, reviewer: str | None = None) -> dict[str, Any]:
         """Promote one candidate after explicit human/agent review."""
 
@@ -929,6 +1037,8 @@ class TeamMemoryBackend(Protocol):
 
     def health(self) -> dict[str, Any]: ...
     def publish(self, payload: dict[str, Any], *, default_status: str = "candidate") -> dict[str, Any]: ...
+    def session_representative(self, *, author_agent: str | None, session: str | None, memory_type: str) -> dict[str, Any] | None: ...
+    def collapse_session_candidates(self, *, apply: bool = False) -> dict[str, Any]: ...
     def activate(self, memory_id: str, reviewer: str | None = None) -> dict[str, Any]: ...
     def get(self, memory_id: str, *, include_feedback: bool = True) -> dict[str, Any]: ...
     def search(self, query: str, *, limit: int = 10, repo: str | None = None, issue: str | None = None, branch: str | None = None, agent: str | None = None, include_candidates: bool = True) -> dict[str, Any]: ...

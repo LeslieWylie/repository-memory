@@ -95,8 +95,23 @@ def _canonical_skill() -> Path:
     return _data_home() / "repository-memory" / "skill" / SKILL_NAME
 
 
+GENERATED_INSTALL_DIRS = {"__pycache__", "node_modules", "dist", ".venv"}
+
+
 def _ignore(_directory: str, names: list[str]) -> set[str]:
-    return {name for name in names if name == "__pycache__" or name.endswith((".pyc", ".pyo"))}
+    """Keep runtime/build products out of every managed Skill copy.
+
+    The canonical Skill is itself used as the source for host installations.
+    Optional services may install Node dependencies beside their vendored
+    reference source, so copying only Python cache exclusions can turn one
+    local service setup into a multi-gigabyte distributable Skill.
+    """
+
+    return {
+        name
+        for name in names
+        if name in GENERATED_INSTALL_DIRS or name.endswith((".pyc", ".pyo"))
+    }
 
 
 def _copy_skill(source: Path, destination: Path) -> None:
