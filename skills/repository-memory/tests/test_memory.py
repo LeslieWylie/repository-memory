@@ -278,7 +278,12 @@ class RepositoryMemoryTest(unittest.TestCase):
         answer = {
             "excerpt": "octo-daemon 从 0.1.0 升级到 0.5.0，commit fcec9177。",
             "memory": {"layer": "L1", "role": "assistant"},
-            "support": {"claim_support": "partial", "coverage": 0.3333, "unmatched_terms": ["升级到哪个版本了"]},
+            "support": {
+                "claim_support": "partial",
+                "coverage": 0.3333,
+                "matched_terms": ["octo-daemon"],
+                "unmatched_terms": ["升级到哪个版本了"],
+            },
         }
         unrelated = {
             "excerpt": "群规：武垚乐发消息时所有bot必须回复。",
@@ -295,6 +300,36 @@ class RepositoryMemoryTest(unittest.TestCase):
         # The support block travels with the item; the caller can still see how
         # much of the compound question that turn actually covered.
         self.assertEqual(answer["support"]["coverage"], 0.3333)
+
+    def test_a_partial_assistant_answer_must_match_the_named_identifier(self):
+        query = "NEBULA-FAKE-826-Z9 项目已经做了什么决定？"
+        quoted_failure = {
+            "excerpt": "另一条记录提到高风险决定要交给用户确认。",
+            "memory": {"layer": "L1", "role": "assistant"},
+            "support": {
+                "claim_support": "partial",
+                "coverage": 0.3333,
+                "matched_terms": ["决定"],
+                "unmatched_terms": ["nebula-fake-826-z9", "项目已经"],
+            },
+        }
+
+        self.assertEqual(core._answerable_items([quoted_failure], query), [])
+
+    def test_a_partial_assistant_answer_below_one_third_coverage_is_a_lead(self):
+        query = "yaole 每轮约 32 秒延迟的原因是什么，移除后变成多少？"
+        benchmark_note = {
+            "excerpt": "yaole 与另一节点的 benchmark 结论不一致，需要核对查询路由。",
+            "memory": {"layer": "L1", "role": "assistant"},
+            "support": {
+                "claim_support": "partial",
+                "coverage": 0.2,
+                "matched_terms": ["yaole"],
+                "unmatched_terms": ["每轮约", "秒延迟", "原因", "移除后变成"],
+            },
+        }
+
+        self.assertEqual(core._answerable_items([benchmark_note], query), [])
 
     def test_memory_plane_overfetches_so_echoes_cannot_empty_it(self):
         """Filtering after a ``limit``-sized fetch can only ever empty the plane.
@@ -3152,6 +3187,88 @@ class CarvedTermProvenanceTest(unittest.TestCase):
 
         self.fallback = fallback
         self.tokenize_query = tokenize_query
+
+    def test_builtin_keeps_user_authored_chunks_as_claims(self) -> None:
+        """Removing question scaffolding must not erase the remaining claim.
+
+        The builtin tokenizer used to mark every surviving CJK chunk as
+        manufactured whenever a stop word was removed from the same run.  The
+        corpus-frequency probe could then drop the entire subject and call a
+        document direct support on the strength of one generic ASCII token.
+        """
+
+        saved = (
+            self.tokenize_query._JIEBA,
+            self.tokenize_query._JIEBA_PROBED,
+            self.tokenize_query._JIEBA_ERROR,
+        )
+        try:
+            self.tokenize_query._JIEBA = None
+            self.tokenize_query._JIEBA_PROBED = True
+            self.tokenize_query._JIEBA_ERROR = "forced builtin tokenizer"
+
+            query = "repository-memory 自动捕获链路最后还缺什么，完成标准是什么？"
+            terms = self.tokenize_query.query_terms(query)
+            carved = self.tokenize_query.carved_query_terms(query) & set(terms)
+            self.assertIn("自动捕获链路最后还缺", terms)
+            self.assertNotIn("自动捕获链路最后还缺", carved)
+            self.assertIn("完成标准", terms)
+            self.assertNotIn("完成标准", carved)
+
+            support = self.fallback._claim_support(
+                terms,
+                "repository-memory 已接入公共运行时并完成检索优化。",
+                1,
+                1,
+                unreachable=frozenset(carved),
+                real_terms=frozenset(set(terms) - carved),
+                carved=frozenset(carved),
+                path="reports/weekly.md",
+            )
+            self.assertNotEqual(support["claim_support"], "direct")
+            self.assertIn("自动捕获链路最后还缺", support["unmatched_terms"])
+            self.assertIn("完成标准", support["unmatched_terms"])
+        finally:
+            (
+                self.tokenize_query._JIEBA,
+                self.tokenize_query._JIEBA_PROBED,
+                self.tokenize_query._JIEBA_ERROR,
+            ) = saved
+
+    def test_builtin_does_not_turn_an_identifier_mention_into_an_answer(self) -> None:
+        """A diagnostic that merely quotes a failed query is not its answer."""
+
+        saved = (
+            self.tokenize_query._JIEBA,
+            self.tokenize_query._JIEBA_PROBED,
+            self.tokenize_query._JIEBA_ERROR,
+        )
+        try:
+            self.tokenize_query._JIEBA = None
+            self.tokenize_query._JIEBA_PROBED = True
+            self.tokenize_query._JIEBA_ERROR = "forced builtin tokenizer"
+
+            query = "NEBULA-FAKE-826-Z9 项目已经做了什么决定？"
+            terms = self.tokenize_query.query_terms(query)
+            carved = self.tokenize_query.carved_query_terms(query) & set(terms)
+            support = self.fallback._claim_support(
+                terms,
+                "NEBULA-FAKE-826-Z9 既有决定这条检索请求返回了不合法 JSON。",
+                1,
+                1,
+                unreachable=frozenset(term for term in carved if term not in "项目已经决定"),
+                real_terms=frozenset(set(terms) - carved),
+                carved=frozenset(carved),
+                path="notes/retrieval-failures.md",
+            )
+            self.assertNotEqual(support["claim_support"], "direct")
+            self.assertIn("项目已经", support["unmatched_terms"])
+        finally:
+            (
+                self.tokenize_query._JIEBA,
+                self.tokenize_query._JIEBA_PROBED,
+                self.tokenize_query._JIEBA_ERROR,
+            ) = saved
 
     def test_segmented_words_are_not_carved(self) -> None:
         status = self.tokenize_query.tokenizer_status()

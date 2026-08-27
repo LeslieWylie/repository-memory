@@ -207,7 +207,12 @@ def _carved_run_terms(run: str) -> list[tuple[str, bool]]:
         piece = piece.strip()
         if not piece:
             continue
-        terms.append((piece, piece != run))
+        # The stop-word cut changed the surrounding run, but each surviving
+        # chunk is still text the user wrote contiguously.  Only the sliding
+        # windows below are manufactured word-boundary guesses.  Marking the
+        # chunk carved let the corpus-frequency probe erase the whole subject
+        # and answer from a generic identifier that happened to remain.
+        terms.append((piece, False))
         for width in (2, 3, 4):
             if len(piece) < width:
                 continue

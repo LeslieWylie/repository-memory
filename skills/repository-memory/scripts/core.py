@@ -683,24 +683,49 @@ def _answerable_items(items: list[dict[str, Any]], query: str = "") -> list[dict
     conversation memory does not make the system careful, it makes it answer
     with the question and abstain on the answer.
 
-    So an assistant turn is answerable when retrieval matched something in it
-    at all (``claim_support`` is not ``unknown``).  Its role establishes that
-    it is an answer; retrieval establishes that it is about this query.  The
-    support block travels with the item, so a caller that wants to know how
-    much of a compound question a given turn covers can still read
-    ``coverage`` and ``unmatched_terms`` — nothing is hidden, and the
-    repository plane's abstention guarantee is untouched.
+    So an assistant turn may be answerable at ``partial``, but not merely
+    because one word matched.  It must cover at least one third of the claim;
+    when the query names an ASCII identifier, that identifier must be among the
+    matched terms.  These two bounds preserve paraphrased prior answers while
+    rejecting measured leaks where only ``yaole`` (20% coverage) or the generic
+    word ``决定`` matched a question about ``NEBULA-FAKE-826-Z9``.
     """
 
     answerable = []
     for item in items:
         if _is_query_echo(item, query):
             continue
-        support = str((item.get("support") or {}).get("claim_support") or "")
+        support_block = item.get("support") if isinstance(item.get("support"), dict) else {}
+        support = str(support_block.get("claim_support") or "")
         role = str(((item.get("memory") or {}) if isinstance(item.get("memory"), dict) else {}).get("role") or "").strip().casefold()
-        if support == "direct" or (role == "assistant" and support == "partial"):
+        if support == "direct" or (role == "assistant" and support == "partial" and _assistant_partial_is_answerable(support_block, query)):
             answerable.append(item)
     return answerable
+
+
+def _assistant_partial_is_answerable(support: dict[str, Any], query: str) -> bool:
+    """Bound the relaxed claim gate used only for prior assistant answers."""
+
+    try:
+        coverage = float(support.get("coverage") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if coverage < 0.333:
+        return False
+
+    identifiers = {
+        term.casefold()
+        for term in query_terms(query)
+        if len(term) >= 3 and re.search(r"[a-z0-9]", term, re.IGNORECASE)
+    }
+    if not identifiers:
+        return True
+    matched = {
+        str(term).strip().casefold()
+        for term in support.get("matched_terms", [])
+        if str(term).strip()
+    }
+    return bool(identifiers & matched)
 
 
 def _fallback_items(view: SourceView, query: str, limit: int, deep: bool, *, stale: bool = False) -> list[dict[str, Any]]:
