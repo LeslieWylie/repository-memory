@@ -24,6 +24,7 @@ EXTENSIONS = {".md", ".mdx", ".txt", ".rst", ".yaml", ".yml", ".json"}
 SECRET_NAME = re.compile(r"(^|/)(\.env(?:\.|$)|.*\.(?:pem|key|p12|pfx|secret|secrets?))$", re.IGNORECASE)
 SECRET_CONTENT = re.compile(r"-----BEGIN .*PRIVATE KEY-----|(?:api[_-]?key|access[_-]?token|password|secret)\s*[:=]\s*['\"]?[A-Za-z0-9_\-/.+=]{16,}|\bsk-[A-Za-z0-9_-]{16,}", re.IGNORECASE)
 DATE_RE = re.compile(r"20\d{2}[-/]\d{1,2}(?:[-/]\d{1,2})?|20\d{2}-W\d{1,2}", re.IGNORECASE)
+PERSONAL_TEMPORAL_LAYERS = {"standup", "standups", "daily", "diary", "diaries", "journal", "journals"}
 GENERIC_SUPPORT_TERMS = {
     "note", "report", "weekly", "paper", "model", "card", "update", "result",
     # Question-framing nouns of the 历史/进展/情况 family, measured leaking:
@@ -96,6 +97,41 @@ def _layer_matches(layer: str, query_terms: set[str]) -> bool:
     return bool(query_terms & aliases)
 
 
+def _concept_groups(terms: list[str]) -> list[list[str]]:
+    """Collapse expanded forms back onto the term they were expanded from.
+
+    ``search`` hands the window picker the *expanded* term list — raw query
+    terms plus ``_compound_parts`` plus ``_term_forms`` — because all of those
+    forms are worth matching.  They are not worth *counting* separately: they
+    are restatements of one query concept, so counting each occurrence lets a
+    single query term outvote several distinct ones.
+
+    Measured on ``rlvr-auto-survey`` at ``4c53230``, query ``terminal-bench-rl
+    Novita sandbox 验收通过率``.  Line 2508 of ``standup/李宁.md`` scored 9 —
+    ``terminal`` twice, ``bench`` twice and ``rl`` five times, every one of them
+    a fragment of the same term ``terminal-bench-rl``, several of them from
+    ``verl`` and ``train_grpo_verl_async`` rather than from the project name at
+    all.  Line 976, which carries ``novita``, ``sandbox`` *and* the answer
+    ``87/89``, scored 3 and lost.  The cited window landed 1500 lines from the
+    answer, in an unrelated debugging session.
+
+    Grouping is by substring, which also collapses the CJK n-grams
+    ``验收``/``通过率`` onto ``验收通过率``.  Two unrelated query terms that
+    happen to share a substring are merged and counted once; that under-counts
+    by one at worst, where counting fragments over-counted fivefold.
+    """
+
+    groups: list[list[str]] = []
+    for term in sorted({term for term in terms if term}, key=len, reverse=True):
+        for group in groups:
+            if term in group[0]:
+                group.append(term)
+                break
+        else:
+            groups.append([term])
+    return groups
+
+
 def _evidence_window(text: str, terms: list[str], max_lines: int = 12) -> tuple[str, int, int]:
     """Return a compact, multi-line window around the strongest evidence.
 
@@ -107,6 +143,7 @@ def _evidence_window(text: str, terms: list[str], max_lines: int = 12) -> tuple[
     file_lines = text.splitlines()
     if not file_lines:
         return "", 1, 1
+    groups = _concept_groups(terms)
     # A Markdown heading that carries a query term names a whole section about
     # it; a body line carrying the same term is inside some *other* section,
     # mentioning it in passing.  Weight headings above body mentions, or the
@@ -114,14 +151,25 @@ def _evidence_window(text: str, terms: list[str], max_lines: int = 12) -> tuple[
     # first: measured live, `## 2026-08-18` at line 77 lost to an incident
     # retro inside the 08-20 section that referenced the date once, and the
     # question about 08-18 was answered partial out of the wrong section.
-    def _line_score(line: str) -> int:
-        score = sum(line.casefold().count(term) for term in terms)
-        if score and line.lstrip().startswith("#"):
-            score += 1
-        return score
+    def _line_score(line: str) -> tuple[int, int]:
+        """Rank by breadth of the claim covered, then by density.
+
+        Distinct concepts first: a line touching three parts of the question is
+        better evidence than a line repeating one part six times, and only the
+        first ordering survives the compound-term expansion described in
+        ``_concept_groups``.  Occurrences stay as the tie-break so that among
+        lines covering the same concepts the one that says the most wins.
+        """
+
+        folded = line.casefold()
+        occurrences = [sum(folded.count(form) for form in group) for group in groups]
+        covered = sum(1 for count in occurrences if count)
+        if covered and line.lstrip().startswith("#"):
+            covered += 1
+        return covered, sum(occurrences)
 
     line_scores = [_line_score(line) for line in file_lines]
-    matching = [index for index, score in enumerate(line_scores) if score]
+    matching = [index for index, score in enumerate(line_scores) if score[0]]
     if not matching:
         start = 0
         end = min(len(file_lines), start + max_lines)
@@ -155,6 +203,42 @@ def _evidence_window(text: str, terms: list[str], max_lines: int = 12) -> tuple[
     return "\n".join(file_lines[start:end]), start + 1, end
 
 
+def _latest_dated_section_window(text: str, terms: list[str], max_lines: int = 12) -> tuple[str, int, int]:
+    """Pick evidence inside the newest dated Markdown section.
+
+    A per-person standup usually keeps the person's name in the filename and
+    only dates in its section headings.  Searching the whole file for that
+    name lets an old body sentence such as "等待李小明决定" pull a question
+    about what 李小明 is doing *recently* into the old section.  For an
+    unbounded recent/latest request, date is the primary structural signal:
+    first select the newest dated section, then run the normal evidence picker
+    inside that section.  Explicit date queries keep using the ordinary window
+    path so the requested historical section can still win.
+    """
+
+    file_lines = text.splitlines()
+    dated_headings: list[tuple[tuple[int, int, int], int]] = []
+    for index, line in enumerate(file_lines):
+        if not line.lstrip().startswith("#"):
+            continue
+        match = DATE_RE.search(line)
+        if not match:
+            continue
+        parts = [int(part) for part in re.findall(r"\d+", match.group(0))[:3]]
+        dated_headings.append((tuple((*parts, 0, 0)[:3]), index))
+    if not dated_headings:
+        return _evidence_window(text, terms, max_lines=max_lines)
+
+    _date, section_start = max(dated_headings, key=lambda item: (item[0], -item[1]))
+    section_end = next(
+        (index for _value, index in dated_headings if index > section_start),
+        len(file_lines),
+    )
+    section = "\n".join(file_lines[section_start:section_end])
+    excerpt, local_start, local_end = _evidence_window(section, terms, max_lines=max_lines)
+    return excerpt, section_start + local_start, section_start + local_end
+
+
 def _term_supported(term: str, excerpt_value: str) -> bool:
     """Report whether the excerpt actually carries this query term.
 
@@ -178,6 +262,77 @@ def _term_supported(term: str, excerpt_value: str) -> bool:
             if term[index:index + width] in excerpt_value:
                 return True
     return False
+
+
+def _claim_units(support_terms: list[str]) -> list[tuple[str, tuple[str, ...]]]:
+    """Reduce expanded terms to the claims the user actually made.
+
+    ``search`` hands claim support the *expanded* term list, because every form
+    is worth matching.  They are not each worth *requiring*: they are
+    restatements of one question, and counting them separately makes the
+    denominator a property of the tokenizer rather than of the question.
+    Measured on the public fixture, ``citation-first repository memory verified
+    candidates abstain`` — six words — became nine requirements, because
+    ``citation-first`` also contributed ``first`` and the inflected ``verified``
+    and ``candidates`` also contributed the stems ``verifi`` and ``candidate``.
+    A coverage threshold cannot mean anything stable while the divisor moves
+    with how many stems the tokenizer happened to emit.
+
+    The two expansion origins are not the same kind of term, so they do not get
+    the same treatment:
+
+    ``_term_forms`` produces inflections of one word.  ``verified`` and
+    ``verifi`` are one claim, and evidence writing either has proven it, so
+    they are grouped and matching any form matches the group.  Requiring the
+    exact inflection instead would refuse a document that wrote the singular.
+
+    ``_compound_parts`` splits a name the user delimited.  The parts are recall
+    aids, not claims: they let ``terminal-bench-rl`` retrieve a document that
+    wrote the name with a space.  Crediting them as claims lets a document
+    prove a name it never uses — on ``rlvr-auto-survey`` at ``4c53230``,
+    ``standup/李宁.md`` matched ``terminal`` and ``bench`` while never naming
+    ``terminal-bench-rl``, and collected five sixths coverage for it.  So the
+    parts are dropped and the compound alone stays required.
+
+    Grouping is by derived form rather than by substring, which is why an
+    ordinary substring coincidence survives: ``rest`` is not in
+    ``_term_forms("restaurant")``, so two independent words that happen to
+    nest stay two claims.
+    """
+
+    ordered = list(dict.fromkeys(term for term in support_terms if term))
+    longest_first = sorted(ordered, key=len, reverse=True)
+    parts: set[str] = set()
+    for term in longest_first:
+        for part in _compound_parts(term):
+            if part != term and part in ordered:
+                parts.add(part)
+    remaining = [term for term in ordered if term not in parts]
+    if not remaining:
+        # Every term was a fragment of some other term that is itself gone.
+        # Keeping the fragments is better than requiring nothing, which would
+        # report ``direct`` for evidence that proved nothing at all.
+        remaining = ordered
+    owners: dict[str, str] = {}
+    for term in remaining:
+        owner = next(
+            (
+                candidate for candidate in sorted(remaining, key=len, reverse=True)
+                if candidate != term and len(candidate) > len(term) and term in _term_forms(candidate)
+            ),
+            None,
+        )
+        if owner is not None:
+            owners[term] = owner
+    heads = [term for term in remaining if term not in owners]
+    forms: dict[str, list[str]] = {head: [head] for head in heads}
+    for term, owner in owners.items():
+        # An owner that is itself owned would strand its group; walk up to the
+        # term that actually survived as a head.
+        while owner in owners:
+            owner = owners[owner]
+        forms[owner].append(term)
+    return [(head, tuple(forms[head])) for head in heads]
 
 
 def _claim_support(
@@ -287,6 +442,7 @@ def _claim_support(
             retained = [term for term in raw_support_terms if term in set(retained) | set(restored)]
         if retained:
             support_terms = retained
+    claims = _claim_units(support_terms)
     excerpt_value = excerpt.casefold()
     evidence_value = f"{path} {excerpt}".casefold() if path else excerpt_value
     # A date the evidence wrote in Chinese proves a query that normalized to
@@ -296,23 +452,28 @@ def _claim_support(
     aliases = date_aliases(evidence_value)
     if aliases:
         evidence_value = f"{evidence_value} {' '.join(aliases)}"
-    matched = [term for term in support_terms if _term_supported(term, evidence_value)]
-    unmatched = [term for term in support_terms if not _term_supported(term, evidence_value)]
-    if not support_terms or len(matched) == len(support_terms):
+    matched = [head for head, forms in claims if any(_term_supported(form, evidence_value) for form in forms)]
+    unmatched = [head for head, forms in claims if not any(_term_supported(form, evidence_value) for form in forms)]
+    if not claims or len(matched) == len(claims):
         status = "direct"
     elif matched:
         status = "partial"
     else:
         status = "unknown"
+    forms_by_head = dict(claims)
     spans = []
     for offset, line in enumerate(excerpt.splitlines()):
-        line_terms = [term for term in matched if _term_supported(term, line.casefold())]
+        folded_line = line.casefold()
+        line_terms = [
+            head for head in matched
+            if any(_term_supported(form, folded_line) for form in forms_by_head[head])
+        ]
         if line_terms:
             spans.append({"line_start": line_start + offset, "line_end": line_start + offset, "terms": line_terms})
     return {
         "matched_terms": matched,
         "unmatched_terms": unmatched,
-        "coverage": round(len(matched) / len(support_terms), 4) if support_terms else 1.0,
+        "coverage": round(len(matched) / len(claims), 4) if claims else 1.0,
         "claim_support": status,
         "supporting_spans": spans,
     }
@@ -373,7 +534,7 @@ def _preferred_layers(query: str, available_layers: set[str]) -> set[str]:
         if personal_request and not re.search(r"report|weekly|monthly|周报|报告|结论|summary|finding", value, re.IGNORECASE):
             personal_layers = {
                 layer for layer in available_layers
-                if layer.casefold() in {"standup", "standups", "daily", "diary", "diaries", "journal", "journals"}
+                if layer.casefold() in PERSONAL_TEMPORAL_LAYERS
             }
             if personal_layers:
                 return personal_layers
@@ -542,10 +703,12 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
         loaded_documents.append((relative, text))
     documents = loaded_documents
     semantic_scores: dict[str, float] = {}
+    semantic_spans: dict[str, tuple[int, int]] = {}
     semantic_candidates: set[str] = set()
     semantic_index = source.metadata.get("semantic_index") if isinstance(source.metadata, dict) else None
     if isinstance(semantic_index, dict) and semantic_index.get("available") is True:
         semantic_paths = semantic_index.get("paths") if isinstance(semantic_index.get("paths"), list) else []
+        semantic_chunks = semantic_index.get("chunks") if isinstance(semantic_index.get("chunks"), list) else []
         vector_store = semantic_index.get("vector_store")
         dimension = int(semantic_index.get("dimension") or 0)
         semantic_vectors = semantic_index.get("vectors") if isinstance(semantic_index.get("vectors"), list) else []
@@ -566,7 +729,16 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
                 if end > len(vector_store):
                     break
                 score = sum(left * right for left, right in zip(query_vector, vector_store[start:end]))
-                semantic_scores[str(relative)] = max(-1.0, min(1.0, score))
+                key = str(relative)
+                bounded = max(-1.0, min(1.0, score))
+                if key not in semantic_scores or bounded > semantic_scores[key]:
+                    semantic_scores[key] = bounded
+                    if offset < len(semantic_chunks) and isinstance(semantic_chunks[offset], dict):
+                        chunk = semantic_chunks[offset]
+                        line_start = int(chunk.get("line_start") or 0)
+                        line_end = int(chunk.get("line_end") or 0)
+                        if line_start > 0 and line_end >= line_start:
+                            semantic_spans[key] = (line_start, line_end)
         else:
             # Backward-compatible reader for older derived caches.
             for relative, vector in zip(semantic_paths, semantic_vectors):
@@ -769,7 +941,18 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
             term for term in [*raw_terms, *terms]
             if term not in {"what", "latest", "recent", "source", "evidence", "citation", "model", "paper", "benchmark", "report", "note", "section"}
         ))
-        excerpt, excerpt_start, excerpt_end = _evidence_window(text, excerpt_terms or terms)
+        semantic_span = semantic_spans.get(relative)
+        if temporal_candidate and not date_terms and layer.casefold() in PERSONAL_TEMPORAL_LAYERS:
+            excerpt, excerpt_start, excerpt_end = _latest_dated_section_window(text, excerpt_terms or terms)
+        elif semantic_candidate and matched == 0 and semantic_span:
+            file_lines = text.splitlines()
+            span_start, span_end = semantic_span
+            semantic_text = "\n".join(file_lines[span_start - 1:span_end])
+            excerpt, local_start, local_end = _evidence_window(semantic_text, excerpt_terms or terms)
+            excerpt_start = span_start + local_start - 1
+            excerpt_end = span_start + local_end - 1
+        else:
+            excerpt, excerpt_start, excerpt_end = _evidence_window(text, excerpt_terms or terms)
         dates = [
             tuple(int(part) for part in re.findall(r"\d+", value)[:3])
             for value in (document_metadata.get(relative, {}).get("dates", []) if isinstance(document_metadata.get(relative), dict) else [])

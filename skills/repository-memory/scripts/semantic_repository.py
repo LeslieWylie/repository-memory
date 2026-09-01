@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import datetime as dt
 import array
+import hashlib
 import json
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -21,13 +23,22 @@ from typing import Any
 from discovery import config_path, read_config
 from local_embedding import (
     GATEWAY_ALIASES,
+    GATEWAY_MAX_CHARS,
     embedding_status,
     encode_document_vectors,
 )
 from local_index import index_path
 from models import SourceView
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+# Keep stored chunk provenance inside the exact payload bound used by the
+# configured gateway.  Otherwise metadata could cite lines that were silently
+# truncated before embedding.
+SEMANTIC_CHUNK_MAX_CHARS = GATEWAY_MAX_CHARS
+SEMANTIC_INCREMENTAL_MAX_NEW_CHUNKS = 96
+_DATED_MARKDOWN_HEADING = re.compile(
+    r"^#{1,3}\s+20\d{2}(?:-\d{1,2}(?:-\d{1,2})?|年\d{1,2}月(?:\d{1,2}日)?)"
+)
 
 
 def _meta_path(view: SourceView, deep: bool) -> Path:
@@ -44,6 +55,95 @@ def _load_meta(path: Path) -> dict[str, Any] | None:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     return value if isinstance(value, dict) and value.get("schema_version") == SCHEMA_VERSION else None
+
+
+def _chunk_payload(path: str, text: str, line_start: int, line_end: int) -> dict[str, Any]:
+    encoded_text = f"{path}\n{text}"
+    return {
+        "path": path,
+        "line_start": line_start,
+        "line_end": line_end,
+        "digest": hashlib.sha256(encoded_text.encode("utf-8")).hexdigest(),
+        "text": encoded_text,
+    }
+
+
+def _bounded_section_chunks(path: str, lines: list[str], line_offset: int) -> list[dict[str, Any]]:
+    """Split one Markdown section without losing physical line provenance."""
+
+    if not lines:
+        return []
+    content_limit = max(512, SEMANTIC_CHUNK_MAX_CHARS - len(path) - 1)
+    chunks: list[dict[str, Any]] = []
+    start = 0
+    while start < len(lines):
+        end = start
+        size = 0
+        while end < len(lines):
+            line_size = len(lines[end]) + 1
+            if end > start and size + line_size > content_limit:
+                break
+            size += line_size
+            end += 1
+            if size >= content_limit:
+                break
+        # One generated/minified line can exceed the provider guard.  Keep its
+        # physical line locator while slicing the text into bounded payloads.
+        if end == start + 1 and len(lines[start]) > content_limit:
+            for offset in range(0, len(lines[start]), content_limit):
+                chunks.append(_chunk_payload(
+                    path,
+                    lines[start][offset:offset + content_limit],
+                    line_offset + start + 1,
+                    line_offset + start + 1,
+                ))
+        else:
+            chunks.append(_chunk_payload(
+                path,
+                "\n".join(lines[start:end]),
+                line_offset + start + 1,
+                line_offset + end,
+            ))
+        start = max(end, start + 1)
+    return chunks
+
+
+def document_chunks(path: str, text: str) -> list[dict[str, Any]]:
+    """Return stable, line-addressable semantic chunks for one document.
+
+    Small documents remain one vector.  Long dated Markdown is split at date
+    headings before applying the provider-size bound.  That seam matters for
+    append/prepend-heavy standups: adding today's dated section creates one new
+    digest while yesterday's section keeps its vector even though every later
+    physical line number moved.  Ordinary headings are deliberately not chunk
+    boundaries: generated indexes and heading-dense notes otherwise create
+    hundreds of tiny vectors with no retrieval benefit.
+    """
+
+    lines = text.splitlines()
+    if len(path) + 1 + len(text) <= SEMANTIC_CHUNK_MAX_CHARS:
+        return [_chunk_payload(path, text, 1, max(1, len(lines)))]
+    markdown = Path(path).suffix.casefold() in {".md", ".mdx"}
+    boundaries = [
+        index for index, line in enumerate(lines)
+        if markdown and _DATED_MARKDOWN_HEADING.match(line)
+    ]
+    if not boundaries or boundaries[0] != 0:
+        boundaries.insert(0, 0)
+    boundaries.append(len(lines))
+    chunks: list[dict[str, Any]] = []
+    for start, end in zip(boundaries, boundaries[1:]):
+        chunks.extend(_bounded_section_chunks(path, lines[start:end], start))
+    return chunks
+
+
+def _all_chunks(local_index: dict[str, Any]) -> list[dict[str, Any]]:
+    chunks: list[dict[str, Any]] = []
+    for item in local_index.get("documents", []) if isinstance(local_index, dict) else []:
+        if not isinstance(item, dict) or not item.get("path"):
+            continue
+        chunks.extend(document_chunks(str(item["path"]), str(item.get("text") or "")))
+    return chunks
 
 
 def _atomic_bytes(destination: Path, content: bytes) -> None:
@@ -144,9 +244,61 @@ def load(view: SourceView, deep: bool = False) -> dict[str, Any] | None:
         **metadata,
         "vector_store": vectors,
         "available": True,
+        "indexed": True,
         "strategy": "local-hybrid",
         "native_neural_model": metadata.get("provider") != "builtin",
     }
+
+
+def _prior_chunk_vectors(
+    view: SourceView,
+    deep: bool,
+    *,
+    provider: str,
+    model: str,
+    dimension: int,
+) -> tuple[dict[str, Any], array.array, dict[str, int]] | None:
+    """Load the newest compatible chunk cache from an earlier commit."""
+
+    current = _meta_path(view, deep)
+    suffix = "-deep.json.semantic.json" if deep else "-default.json.semantic.json"
+    candidates = sorted(
+        (path for path in current.parent.glob(f"*{suffix}") if path != current),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )
+    for metadata_path in candidates:
+        metadata = _load_meta(metadata_path)
+        if not metadata:
+            continue
+        if (
+            metadata.get("provider") != provider
+            or metadata.get("model") != model
+            or int(metadata.get("dimension") or 0) != dimension
+        ):
+            continue
+        chunks = metadata.get("chunks") if isinstance(metadata.get("chunks"), list) else []
+        if not chunks:
+            continue
+        vectors_path = Path(str(metadata.get("vectors_path") or metadata_path.with_suffix(".bin")))
+        try:
+            raw = vectors_path.read_bytes()
+            vectors = array.array("f")
+            vectors.frombytes(raw)
+        except (OSError, ValueError, OverflowError):
+            continue
+        if sys.byteorder != "little":
+            vectors.byteswap()
+        if len(vectors) != len(chunks) * dimension:
+            continue
+        offsets = {
+            str(chunk.get("digest")): offset
+            for offset, chunk in enumerate(chunks)
+            if isinstance(chunk, dict) and chunk.get("digest")
+        }
+        if offsets:
+            return metadata, vectors, offsets
+    return None
 
 
 def _deferred(reason: str) -> dict[str, Any]:
@@ -170,17 +322,25 @@ def ensure(
 ) -> dict[str, Any]:
     """Build or load the semantic cache for an already-built Git index.
 
-    ``build=False`` is the request path for a large source: loading a cache that
-    already exists costs one file read, while building one costs an encode of
-    the whole corpus.  Deferring the *build* is what keeps a first query fast;
-    deferring the *load* as well would mean a cache could be paid for once and
-    then never used.  A missing cache returns before the readiness probe so the
-    common no-cache case stays free.
+    ``build=False`` is the request path for a large source.  A genuinely new
+    source still defers before probing the provider, but a later commit may
+    reuse chunk vectors from the newest compatible cache and encode only a
+    bounded delta.  This keeps a daily standup repository semantic after its
+    first explicit sync instead of invalidating the entire corpus on every
+    commit.
     """
 
-    if not build:
-        cached = _load_meta(_meta_path(view, deep))
-        if not cached or cached.get("commit") != view.commit or not _vectors_path(view, deep).exists():
+    metadata_path = _meta_path(view, deep)
+    vectors_file = _vectors_path(view, deep)
+    metadata = _load_meta(metadata_path)
+    current_cache_exists = bool(metadata and metadata.get("commit") == view.commit and vectors_file.exists())
+    if not build and not current_cache_exists:
+        suffix = "-deep.json.semantic.json" if deep else "-default.json.semantic.json"
+        prior_metadata_exists = any(
+            candidate != metadata_path and _load_meta(candidate)
+            for candidate in metadata_path.parent.glob(f"*{suffix}")
+        )
+        if not prior_metadata_exists:
             return _deferred("large_repository_first_pass")
     configured = embedding_status(probe=True, allow_download=allow_download)
     if not configured.get("configured") or configured.get("available") is not True:
@@ -200,8 +360,6 @@ def ensure(
     provider = str(configured["provider"])
     model = str(configured["model"])
     dimension = int(configured["dimension"])
-    metadata = _load_meta(_meta_path(view, deep))
-    vectors_file = _vectors_path(view, deep)
     if (
         metadata
         and metadata.get("commit") == view.commit
@@ -213,23 +371,86 @@ def ensure(
         loaded = load(view, deep)
         if loaded:
             return loaded
-    if not build:
-        # A cache exists but does not describe the provider/model/dimension in
-        # force now.  ``vectorize`` at query time uses the *current* provider,
-        # so scoring those vectors would compare two different embedding spaces.
-        # Defer instead, and let the rescue path rebuild if lexical finds nothing.
+    if not build and current_cache_exists and metadata:
         return _deferred("semantic_cache_signature_mismatch")
-    documents = local_index.get("documents") if isinstance(local_index, dict) else []
-    paths = [str(item.get("path")) for item in documents if isinstance(item, dict) and item.get("path")]
-    texts = [
-        f"{item.get('path')}\n{str(item.get('text') or '')[:12000]}"
-        for item in documents
-        if isinstance(item, dict) and item.get("path")
-    ]
-    vectors, dimension, effective = encode_document_vectors(texts, allow_download=allow_download)
-    del texts
-    if not dimension or len(vectors) != len(paths) * dimension:
-        return {**configured, "indexed": False, "strategy": "lexical", "error": "semantic encoder returned no document vectors"}
+
+    chunks = _all_chunks(local_index)
+    if not chunks:
+        return {**configured, "indexed": False, "strategy": "lexical", "error": "semantic index has no document chunks"}
+    prior = _prior_chunk_vectors(view, deep, provider=provider, model=model, dimension=dimension)
+    if not build and prior is None:
+        # A cache exists, but not in the embedding space the current query
+        # encoder uses.  Never compare vectors from two providers/models.
+        return _deferred("semantic_cache_signature_mismatch")
+
+    prior_metadata, prior_vectors, prior_offsets = prior or ({}, array.array("f"), {})
+    missing_by_digest: dict[str, dict[str, Any]] = {}
+    reused_chunk_count = 0
+    for chunk in chunks:
+        digest = str(chunk["digest"])
+        if digest in prior_offsets:
+            reused_chunk_count += 1
+        else:
+            missing_by_digest.setdefault(digest, chunk)
+    missing = list(missing_by_digest.values())
+    if not build and len(missing) > SEMANTIC_INCREMENTAL_MAX_NEW_CHUNKS:
+        return {
+            **_deferred("incremental_delta_too_large"),
+            "reused_chunk_count": reused_chunk_count,
+            "missing_chunk_count": len(missing),
+            "incremental_limit": SEMANTIC_INCREMENTAL_MAX_NEW_CHUNKS,
+        }
+
+    encoded = array.array("f")
+    effective = configured
+    if missing:
+        encoded, encoded_dimension, effective = encode_document_vectors(
+            [str(chunk["text"]) for chunk in missing],
+            allow_download=allow_download,
+        )
+        if not encoded_dimension or len(encoded) != len(missing) * encoded_dimension:
+            return {**configured, "indexed": False, "strategy": "lexical", "error": "semantic encoder returned no chunk vectors"}
+        effective_provider = str(effective.get("provider") or provider)
+        effective_model = str(effective.get("model") or model)
+        compatible_with_prior = (
+            not prior
+            or (
+                effective_provider == provider
+                and effective_model == model
+                and encoded_dimension == dimension
+            )
+        )
+        if not compatible_with_prior:
+            # A gateway can fail after its readiness probe and fall back to the
+            # builtin encoder.  Reusing gateway vectors beside builtin vectors
+            # would silently corrupt similarity.  The explicit build path may
+            # restart as a full, single-space encode; a search stays lexical.
+            if not build:
+                return _deferred("incremental_encoder_changed")
+            prior_metadata, prior_vectors, prior_offsets = {}, array.array("f"), {}
+            reused_chunk_count = 0
+            missing = chunks
+            encoded, encoded_dimension, effective = encode_document_vectors(
+                [str(chunk["text"]) for chunk in missing],
+                allow_download=allow_download,
+            )
+            if not encoded_dimension or len(encoded) != len(missing) * encoded_dimension:
+                return {**configured, "indexed": False, "strategy": "lexical", "error": "semantic encoder returned no chunk vectors"}
+        dimension = encoded_dimension
+
+    encoded_offsets = {str(chunk["digest"]): offset for offset, chunk in enumerate(missing)}
+    vectors = array.array("f")
+    for chunk in chunks:
+        digest = str(chunk["digest"])
+        if digest in prior_offsets:
+            offset = prior_offsets[digest] * dimension
+            vectors.extend(prior_vectors[offset:offset + dimension])
+        else:
+            offset = encoded_offsets[digest] * dimension
+            vectors.extend(encoded[offset:offset + dimension])
+    if len(vectors) != len(chunks) * dimension:
+        return {**configured, "indexed": False, "strategy": "lexical", "error": "semantic chunk assembly was incomplete"}
+
     # Describe the vectors that were actually produced, not the ones that were
     # requested.  An optional provider can fail after the readiness check and
     # leave the corpus to the local projection; recording the configured triple
@@ -237,6 +458,7 @@ def ensure(
     # the whole index on every later search.
     provider = str(effective.get("provider") or provider)
     model = str(effective.get("model") or model)
+    paths = [str(chunk["path"]) for chunk in chunks]
     metadata = {
         "schema_version": SCHEMA_VERSION,
         "source": view.spec.id,
@@ -247,6 +469,15 @@ def ensure(
         "dimension": dimension,
         "native_neural_model": bool(effective.get("native_neural_model")),
         "paths": paths,
+        "chunks": [
+            {key: chunk[key] for key in ("path", "line_start", "line_end", "digest")}
+            for chunk in chunks
+        ],
+        "document_count": len(set(paths)),
+        "chunk_count": len(chunks),
+        "reused_chunk_count": reused_chunk_count,
+        "encoded_chunk_count": len(missing),
+        "incremental_from_commit": prior_metadata.get("commit") if prior_metadata else None,
         "built_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "vectors_path": str(vectors_file),
     }
@@ -311,7 +542,8 @@ def summary(value: dict[str, Any] | None) -> dict[str, Any]:
 
     if not isinstance(value, dict):
         return {"configured": False, "available": False, "strategy": "lexical"}
-    result = {key: item for key, item in value.items() if key not in {"vectors", "vector_store", "paths"}}
+    result = {key: item for key, item in value.items() if key not in {"vectors", "vector_store", "paths", "chunks"}}
     if isinstance(value.get("paths"), list):
-        result["document_count"] = len(value["paths"])
+        result["chunk_count"] = len(value["paths"])
+        result["document_count"] = len(set(str(path) for path in value["paths"]))
     return result

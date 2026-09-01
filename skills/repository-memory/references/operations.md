@@ -62,6 +62,8 @@ repository-memory memory-reflect --query "..." [--session-id <id>] --limit N --j
 repository-memory evaluate --queries <queries.jsonl> --qrels <qrels.jsonl> [--revision <commit>] [--scope repository|memory|all] --json
 repository-memory semantic status --json
 repository-memory semantic configure --model <hugging-face-model-id> [--download] --json
+repository-memory semantic service-install --model <hugging-face-model-id> --json
+repository-memory semantic service-status|service-stop --json
 repository-memory team-evaluate --records <records.jsonl> --queries <queries.jsonl> --qrels <qrels.jsonl> [--gate] --json
 repository-memory team-compact [--keep N] --json
 repository-memory memorycore configure|start|stop|status

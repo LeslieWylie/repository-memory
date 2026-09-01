@@ -33,6 +33,7 @@ from local_embedding import (
     EMBEDDING_DIMENSION,
     active_embedding_spec,
     cosine,
+    encode_document_vectors,
     embedding_status,
     pack,
     unpack,
@@ -298,14 +299,26 @@ class StandaloneMemoryClient:
                   OR embedding_model != ? OR embedding_dim != ?""",
             (spec["provider"], spec["model"], spec["dimension"]),
         ).fetchall()
-        for row in rows:
-            vector = vectorize(str(row[1]))
+        if not rows:
+            return
+        vectors, width, effective = encode_document_vectors(str(row[1]) for row in rows)
+        if not width or len(vectors) != len(rows) * width:
+            return
+        # Encode the migration as one corpus operation.  Neural providers are
+        # efficient in batches; calling ``vectorize`` once per record made a
+        # 1,600-row provider switch take minutes.  Record the encoder that
+        # actually answered, since a gateway may fail after its readiness
+        # probe and return a same-width local fallback.
+        provider = str(effective.get("provider") or spec["provider"])
+        model = str(effective.get("model") or spec["model"])
+        for index, row in enumerate(rows):
+            start = index * width
+            vector = list(vectors[start:start + width])
             connection.execute(
                 "UPDATE records SET embedding=?, embedding_provider=?, embedding_model=?, embedding_dim=? WHERE id=?",
-                (pack(vector), spec["provider"], spec["model"], len(vector), str(row[0])),
+                (pack(vector), provider, model, width, str(row[0])),
             )
-        if rows:
-            connection.commit()
+        connection.commit()
 
     @staticmethod
     def _fts(connection: sqlite3.Connection) -> bool:

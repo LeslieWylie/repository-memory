@@ -243,6 +243,8 @@ model:
 repository-memory semantic status --json
 repository-memory semantic configure \
   --model <hugging-face-model-id> --download --json
+repository-memory semantic service-install \
+  --model <hugging-face-model-id> --json
 repository-memory sync --all --json
 ```
 
@@ -258,6 +260,13 @@ The MCP installer records the verified Python runtime that loaded the model.
 This matters on hosts with multiple Python installations: a model installed in
 one interpreter is not silently assumed to be available to another MCP
 process.
+
+`semantic service-install` keeps that same local encoder resident behind a
+loopback-only launchd service. This is the recommended mode for CLI and hook
+traffic: vectors keep the Hugging Face model identity, while short-lived
+processes avoid paying the model cold-start cost on every recall. If the
+service is unavailable, the runtime can still load the already-cached model in
+process and reports the active transport in semantic status.
 
 ## Shared Team Memory
 

@@ -37,10 +37,27 @@ By default, the runtime fetches a remote reference and indexes a disposable snap
 
 When fetch or an adapter fails, the runtime may use conservative local exact evidence. Such fallback results must identify the fallback in diagnostics and cannot be upgraded merely because they are textually similar.
 
+Repository semantic state is a derived, same-source cache. Documents that fit
+the encoder bound remain one chunk; long dated Markdown is split at stable date
+sections and then bounded by size, with physical line locators retained. Chunk
+digests let a compatible cache from the previous commit supply vectors for
+unchanged sections, while a normal large-repository search encodes only a
+bounded changed set. A source with no compatible prior cache still requires an
+explicit sync before semantic retrieval is advertised.
+
+For frequent CLI or hook recall, a configured Hugging Face model can run as a
+resident loopback service. This changes only the transport: provider, model,
+dimension, persisted vectors, lexical evidence guards, and citation rules stay
+the same. If the resident process is unavailable, the runtime may load the
+cached model in-process and must report that transport explicitly.
+
 Natural-language CJK questions are handled inside the runtime. The lexical
 fallback keeps normal path/ASCII tokens, adds short CJK fragments for entity
 matching, and routes personal temporal questions such as “某人最近在做什么”
 to source layers named `standup`, `daily`, `diary`, or `journal` when present.
+Inside a multi-date personal file, an unbounded recent/latest request selects
+the newest dated Markdown section before choosing its citation window; an
+explicit date request still selects the named historical section.
 This is query parsing, not semantic retrieval: `diagnostics.retrieval_mode`
 remains `lexical` and the response must still carry a valid citation.
 
