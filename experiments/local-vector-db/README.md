@@ -32,4 +32,3 @@ mode is useful for measuring persistence and vector-store behavior without a
 daemon. If a later workload requires concurrent writers, remote clients, or a
 large corpus, the same collection contract should be tested against a Qdrant
 server before integration.
-
