@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=69,<81"]
+requires = ["setuptools>=69,<85"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -19,14 +19,14 @@ repository-memory-aml = "aml_server:main"
 
 [project.optional-dependencies]
 test = [
-  "pytest>=8,<9",
+  "pytest>=8,<10",
   "pytest-cov>=6,<8",
 ]
 cjk = [
   "jieba>=0.42,<1",
 ]
 semantic = [
-  "sentence-transformers>=3,<6",
+  "sentence-transformers>=3,<7",
   "torch>=2.2",
   "transformers>=4.40",
 ]
