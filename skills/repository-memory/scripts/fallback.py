@@ -203,7 +203,7 @@ def _evidence_window(text: str, terms: list[str], max_lines: int = 12) -> tuple[
     return "\n".join(file_lines[start:end]), start + 1, end
 
 
-def _latest_dated_section_window(text: str, terms: list[str], max_lines: int = 12) -> tuple[str, int, int]:
+def _latest_dated_section_window(text: str, terms: list[str], max_lines: int = 12, anchors: list[str] | None = None) -> tuple[str, int, int]:
     """Pick evidence inside the newest dated Markdown section.
 
     A per-person standup usually keeps the person's name in the filename and
@@ -229,7 +229,24 @@ def _latest_dated_section_window(text: str, terms: list[str], max_lines: int = 1
     if not dated_headings:
         return _evidence_window(text, terms, max_lines=max_lines)
 
-    _date, section_start = max(dated_headings, key=lambda item: (item[0], -item[1]))
+    eligible = dated_headings
+    if anchors:
+        windows = []
+        for date, start in dated_headings:
+            end = next((i for _d, i in dated_headings if i > start), len(file_lines))
+            boundaries = [start] + [i for i in range(start + 1, end)
+                if file_lines[i].lstrip().startswith("#") or (file_lines[i].lstrip().startswith("**") and file_lines[i].rstrip().endswith("**"))]
+            boundaries.append(end)
+            for left, right in pairwise(boundaries):
+                block = "\n".join(file_lines[left:right])
+                if all(anchor.casefold() in block.casefold() for anchor in anchors):
+                    excerpt, local_start, local_end = _evidence_window(block, terms, max_lines=max_lines)
+                    windows.append((date, sum(t in excerpt.casefold() for t in terms), -left, excerpt, left + local_start, left + local_end))
+        if windows:
+            best = max(windows, key=lambda value: value[:3])
+            return best[3], best[4], best[5]
+        return _evidence_window(text, terms, max_lines=max_lines)
+    _date, section_start = max(eligible, key=lambda item: (item[0], -item[1]))
     section_end = next(
         (index for _value, index in dated_headings if index > section_start),
         len(file_lines),
@@ -237,6 +254,25 @@ def _latest_dated_section_window(text: str, terms: list[str], max_lines: int = 1
     section = "\n".join(file_lines[section_start:section_end])
     excerpt, local_start, local_end = _evidence_window(section, terms, max_lines=max_lines)
     return excerpt, section_start + local_start, section_start + local_end
+
+
+def _requested_dated_section_window(text: str, terms: list[str], dates: list[str], max_lines: int = 12) -> tuple[str, int, int]:
+    """Do not answer an explicit date from another section of the same file.
+
+    Include its physical date heading in the bounded citation. For a general
+    daily-work question the section start is the answer, not an unrelated
+    later paragraph which happens to repeat the person's name.
+    """
+    file_lines = text.splitlines()
+    headings = [(i, line) for i, line in enumerate(file_lines)
+                if line.lstrip().startswith("#") and DATE_RE.search(line)]
+    matches = [(i, line) for i, line in headings if all(date in line for date in dates)]
+    if not matches:
+        return _evidence_window(text, terms, max_lines=max_lines)
+    best = max(matches, key=lambda pair: sum(term in pair[1].casefold() for term in terms))
+    start = best[0]
+    end = min(next((i for i, _line in headings if i > start), len(file_lines)), start + max_lines)
+    return "\n".join(file_lines[start:end]), start + 1, end
 
 
 def _term_supported(term: str, excerpt_value: str) -> bool:
@@ -387,7 +423,7 @@ def _claim_support(
 
     raw_support_terms = list(dict.fromkeys(
         term for term in query_terms
-        if (len(term) >= 3 or (len(term) >= 2 and all("\u3400" <= char <= "\u9fff" for char in term)))
+        if (len(term) >= 3 or (len(term) >= 2 and (any(char.isdigit() for char in term) or all("\u3400" <= char <= "\u9fff" for char in term))))
         and term not in GENERIC_SUPPORT_TERMS
     ))
     # A claim is something the user said.  A join this tokenizer manufactured
@@ -942,8 +978,13 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
             if term not in {"what", "latest", "recent", "source", "evidence", "citation", "model", "paper", "benchmark", "report", "note", "section"}
         ))
         semantic_span = semantic_spans.get(relative)
-        if temporal_candidate and not date_terms and layer.casefold() in PERSONAL_TEMPORAL_LAYERS:
-            excerpt, excerpt_start, excerpt_end = _latest_dated_section_window(text, excerpt_terms or terms)
+        if date_terms:
+            excerpt, excerpt_start, excerpt_end = _requested_dated_section_window(text, excerpt_terms or terms, date_terms)
+        elif latest and not date_terms:
+            topic_anchors = [term for term in raw_terms if re.search(r"[a-zA-Z]", term)
+                             and term not in {"latest", "recent", "current", "result", "results", "what", "the", "is"}]
+            topic_anchors += [term for term in raw_terms if re.fullmatch(r"([㐀-鿿])(?:到|对)\1", term)]
+            excerpt, excerpt_start, excerpt_end = _latest_dated_section_window(text, excerpt_terms or terms, anchors=topic_anchors)
         elif semantic_candidate and matched == 0 and semantic_span:
             file_lines = text.splitlines()
             span_start, span_end = semantic_span
@@ -962,7 +1003,15 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
                 tuple(int(part) for part in value.replace("/", "-").replace("-W", "-").split("-") if part.isdigit())
                 for value in DATE_RE.findall(relative)
             ]
-        latest_score = max(dates, default=(0, 0, 0)) if temporal_candidate else (0, 0, 0)
+        if latest and not date_terms:
+            # Date the selected evidence, never an unrelated newest section.
+            heading_dates = []
+            for line in text.splitlines()[:excerpt_start]:
+                if line.lstrip().startswith("#") and DATE_RE.search(line):
+                    heading_dates = [tuple(int(p) for p in re.findall(r"\d+", DATE_RE.search(line).group(0))[:3])]
+            dates = heading_dates or [tuple(int(p) for p in re.findall(r"\d+", d)[:3]) for d in DATE_RE.findall(relative)]
+        dates = [d for d in dates if len(d) >= 3 and 1 <= d[1] <= 12 and 1 <= d[2] <= 31]
+        latest_score = max(dates, default=(0, 0, 0)) if latest else (0, 0, 0)
         latest_score = tuple((*latest_score, 0, 0)[:3])
         start, end = locate(source.path, relative, excerpt)
         if start is None:
@@ -1075,6 +1124,7 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
                 if str(target) in all_document_by_path
             ],
             "citation": {"source": "repository", "backend": "repository-local-structured", "repository": source.spec.repository, "commit": source.commit, "path": relative, "memory_id": f"{source.spec.id}:{relative}", "line_start": start, "line_end": end, "evidence": excerpt, "generated": False, "accepted": None, "valid": bool(start and end), "stale": False},
+            "evidence_date": "-".join(f"{v:02d}" for v in latest_score) if latest_score[0] else None,
             "_score": (
                 sum(min(haystack.count(term), 4) * (6 + 18 * term_idf.get(term, 1.0)) for term in terms)
                 + raw_coverage * 220
@@ -1103,7 +1153,7 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
                 + (72 if relative.split("/", 1)[0] in preferred_layers else 0)
                 + layer_bonus
                 + (4 if relative.startswith(("papers/", "models/", "people/", "benchmarks/", "survey/", "reports/", "notes/")) else 0)
-                + (latest_score[0] * 1000000 + latest_score[1] * 10000 + latest_score[2] * 100 if temporal_candidate else 0)
+                + ((latest_score[0] * 10000 + latest_score[1] * 100 + latest_score[2]) * 1000000 if latest and float(support.get("coverage") or 0) >= 0.5 and not any(re.search(r"[0-9]|([㐀-鿿])(?:到|对)\1", term) for term in support.get("unmatched_terms", [])) else 0)
             ),
         })
     hits.sort(key=lambda item: (-int(item.pop("_score", 0)), str(item.get("path") or "")))

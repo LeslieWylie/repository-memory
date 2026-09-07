@@ -326,7 +326,29 @@ def expand(query: str) -> list[tuple[str, bool]]:
     """Expand a query into ``(term, carved)`` pairs."""
 
     expanded: list[tuple[str, bool]] = []
-    for token in WORD_RE.findall(str(query or "")):
+    # Repeated endpoint constructions (端到端, 点对点) are whole concepts;
+    # their internal function word must not erase both one-character ends.
+    expanded.extend((m.group(0), False) for m in re.finditer(r"([㐀-鿿])(?:到|对)\1", str(query or "")))
+    for original in WORD_RE.findall(str(query or "")):
+        if (CJK_CHAR.search(original) and re.search(r"[A-Za-z]", original)
+                and not any(stop in original for stop in STOP_TERMS)):
+            # Keep a short mixed product label as an additional recall form,
+            # but never let it replace the separately required identifier.
+            expanded.append((original.casefold(), True))
+    # Dates and identifiers must survive without user-inserted spaces:
+    # ``2026年8月18日林小明`` and ``ORBIT-907项目`` are not all-CJK words.
+    # Preserve the original token machinery for non-CJK languages; split
+    # only the script boundary, and normalize full Chinese dates first.
+    def normalize_date(match: re.Match[str]) -> str:
+        iso = _iso_form(*match.groups())
+        if iso:
+            return " " + iso + " "
+        expanded.append((match.group(0).casefold(), False))
+        return " "
+    question = re.sub(r"(?:完成了|做了)(?:哪些|什么)(?:工作|事情)?|工作进展", " ", str(query or ""))
+    value = CJK_DATE.sub(normalize_date, question)
+    value = re.sub(r"(?<=[A-Za-z0-9_./:@-])(?=[㐀-鿿])|(?<=[㐀-鿿])(?=[A-Za-z0-9_./:@-])", " ", value)
+    for token in WORD_RE.findall(value):
         value = token.casefold()
         if not CJK_CHAR.search(value):
             expanded.append((value, False))

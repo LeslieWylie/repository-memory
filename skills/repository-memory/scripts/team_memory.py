@@ -275,6 +275,8 @@ class SQLiteTeamMemoryBackend:
         retention_details: list[dict[str, Any]] = []
         try:
             total = int(connection.execute("SELECT COUNT(*) FROM memories").fetchone()[0])
+            unique_content = int(connection.execute("SELECT COUNT(DISTINCT trim(content)) FROM memories").fetchone()[0])
+            last_recorded = connection.execute("SELECT MAX(created_at) FROM memories").fetchone()[0]
             by_status = {str(row[0]): int(row[1]) for row in connection.execute("SELECT status, COUNT(*) FROM memories GROUP BY status")}
             by_type = {str(row[0]): int(row[1]) for row in connection.execute("SELECT memory_type, COUNT(*) FROM memories GROUP BY memory_type")}
             feedback = int(connection.execute("SELECT COUNT(*) FROM memory_feedback").fetchone()[0])
@@ -307,6 +309,8 @@ class SQLiteTeamMemoryBackend:
             "status": "ready",
             "path": str(self.path),
             "record_count": total,
+            "quality": {"unique_content_count": unique_content, "duplicate_content_rows": total - unique_content,
+                        "last_recorded_at": last_recorded, "count_unit": "stored rows, not independent facts"},
             "by_status": by_status,
             "by_type": by_type,
             "feedback_count": feedback,
@@ -405,6 +409,7 @@ class SQLiteTeamMemoryBackend:
         return False
 
     def _row(self, row: sqlite3.Row, feedback: list[sqlite3.Row] | None = None) -> dict[str, Any]:
+        from evidence_quality import attribution, statement_kind
         scope = _parse(row["scope"], {})
         provenance = _parse(row["provenance"], {})
         feedback_rows = feedback or []
@@ -431,6 +436,8 @@ class SQLiteTeamMemoryBackend:
             "scope": scope,
             "provenance": provenance,
             "author_agent": row["author_agent"],
+            "attribution": attribution(recorded_by=row["author_agent"], provenance=provenance, path=provenance.get("canonical_path")),
+            "statement_kind": statement_kind("assistant", row["content"]),
             "reviewed_by": row["reviewed_by"],
             "activated_at": row["activated_at"],
             "confidence": float(row["confidence"]),
@@ -703,6 +710,7 @@ class SQLiteTeamMemoryBackend:
         return {"schema_version": 1, "found": True, "id": memory_id, "source": "team-memory", "result": value, "canonical_repo_changed": False}
 
     def search(self, query: str, *, limit: int = 10, repo: str | None = None, issue: str | None = None, branch: str | None = None, agent: str | None = None, include_candidates: bool = True) -> dict[str, Any]:
+        from evidence_quality import statement_kind, missing_identifiers
         terms = _terms(query)
         connection = self._connect()
         try:
@@ -724,6 +732,7 @@ class SQLiteTeamMemoryBackend:
             feedback_map.setdefault(str(item["memory_id"]), []).append(item)
         ranked: list[tuple[float, str, dict[str, Any]]] = []
         expired_count = 0
+        ineligible_count = 0
         now = datetime.now(timezone.utc)
         for row in rows:
             if row["status"] == "superseded" or row["status"] == "stale":
@@ -732,6 +741,9 @@ class SQLiteTeamMemoryBackend:
                 expired_count += 1
                 continue
             if row["status"] == "candidate" and not include_candidates:
+                continue
+            if statement_kind("assistant", row["content"]) != "statement" or missing_identifiers(query, row["content"]):
+                ineligible_count += 1
                 continue
             scope = _parse(row["scope"], {})
             if repo and repo.casefold() not in str(scope.get("repo") or scope.get("repository") or "").casefold():
@@ -755,6 +767,20 @@ class SQLiteTeamMemoryBackend:
                 score += 0.4
             ranked.append((score, str(row["id"]), self._row(row, feedback)))
         ranked.sort(key=lambda item: (-item[0], item[1]))
+        # Preserve every source ID for get/readback, but one imported copy
+        # must not consume another result slot. Scope and lifecycle remain
+        # separate: identical text in different projects is not one record.
+        unique: dict[tuple[str, ...], tuple[float, str, dict[str, Any]]] = {}
+        for score, identity, item in ranked:
+            key = (item["content"].strip(), _json(item["scope"]), str(item.get("author_agent") or ""),
+                   item["status"], str(item.get("valid_from") or ""), str(item.get("valid_until") or ""))
+            if key in unique:
+                unique[key][2]["aliases"].append(identity)
+            else:
+                item["aliases"] = [identity]
+                unique[key] = (score, identity, item)
+        duplicate_count = len(ranked) - len(unique)
+        ranked = list(unique.values())
         active = [item for score, _id, item in ranked if item["status"] == "active"][:limit]
         candidates = [item for score, _id, item in ranked if item["status"] == "candidate"][:limit]
         return {
@@ -765,7 +791,9 @@ class SQLiteTeamMemoryBackend:
             "active": active,
             "candidates": candidates,
             "abstain": not active,
-            "diagnostics": {"result_count": len(active), "candidate_count": len(candidates), "expired_count": expired_count, "query_terms": terms, "filters": {"repo": repo, "issue": issue, "branch": branch, "agent": agent}},
+            "diagnostics": {"result_count": len(active), "candidate_count": len(candidates), "expired_count": expired_count,
+                            "duplicate_results_collapsed": duplicate_count, "ineligible_records": ineligible_count,
+                            "query_terms": terms, "filters": {"repo": repo, "issue": issue, "branch": branch, "agent": agent}},
         }
 
     def feedback(self, memory_id: str, rating: str, note: str = "", agent: str | None = None, feedback_id: str | None = None) -> dict[str, Any]:

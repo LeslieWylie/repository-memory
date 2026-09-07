@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 
 from discovery import data_root
+from evidence_quality import statement_kind, missing_identifiers, attribution
 from local_embedding import (
     EMBEDDING_DIMENSION,
     active_embedding_spec,
@@ -128,9 +129,7 @@ def is_question_turn(role: str | None, content: str | None) -> bool:
     states a fact ("我们升级到了 0.5.0") is not a question and stays.
     """
 
-    if str(role or "").strip().casefold() != "user":
-        return False
-    return str(content or "").strip().endswith(_INTERROGATIVE_ENDINGS)
+    return statement_kind(role, content) == "question"
 
 
 def _is_accepted(row: sqlite3.Row) -> bool:
@@ -353,6 +352,8 @@ class StandaloneMemoryClient:
         connection = self._connect()
         try:
             counts = self._counts(connection)
+            last_recorded = connection.execute("SELECT MAX(created_at) FROM records WHERE layer='L0'").fetchone()[0]
+            mirrored = int(connection.execute("SELECT count(*) FROM records a WHERE a.layer='L1' AND EXISTS (SELECT 1 FROM records b WHERE b.layer='L0' AND b.session_id=a.session_id AND b.message_index=a.message_index AND b.content=a.content)").fetchone()[0])
             fts = self._fts(connection)
             vector_count = int(connection.execute(
                 "SELECT COUNT(*) FROM records WHERE embedding_model=? AND embedding_dim=?",
@@ -388,6 +389,9 @@ class StandaloneMemoryClient:
             "status": "ready",
             "path": str(self.path),
             "record_count": sum(counts.values()),
+            "quality": {"last_capture_at": last_recorded, "l1_verbatim_trace_count": mirrored,
+                        "capture_age_seconds": round(time.time() - last_recorded) if last_recorded else None,
+                        "l1_extraction": "extractive traces; no LLM fact extraction configured"},
             "index": "fts5" if fts else "sqlite-scan",
             "embedding": {
                 **spec,
@@ -654,6 +658,9 @@ class StandaloneMemoryClient:
         index = int(row["message_index"])
         for adjacent_index in (index - 1, index + 1):
             adjacent = lookup.get(cls._lookup_key(row, adjacent_index))
+            if adjacent is None and str(row["layer"]) == "L1":
+                session, _layer, batch, offset = cls._lookup_key(row, adjacent_index)
+                adjacent = lookup.get((session, "L0", batch, offset))
             if adjacent is not None:
                 context.append({"id": str(adjacent["id"]), "role": str(adjacent["role"] or ""), "content": str(adjacent["content"] or "")[:512], "message_index": int(adjacent["message_index"])})
         return context
@@ -781,9 +788,11 @@ class StandaloneMemoryClient:
                         retrieval_keys = [messages[index - 1]["content"]]
                     metadata = {"session_id": session_id, "message_index": index, "episode_id": episode_id, "ingest_id": ingest_id, "turn_id": turn_id, "pipeline": "standalone+memos-lifecycle", "retrieval_keys": retrieval_keys}
                     self._upsert(connection, record_id=_stable_id("L0", session_id, index, role, content), layer="L0", session_id=session_id, message_index=index, role=role, content=content, timestamp=message["timestamp"], metadata=metadata, episode_id=episode_id, turn_id=turn_id)
-                    self._upsert(connection, record_id=_stable_id("L1", session_id, index, role, content), layer="L1", session_id=session_id, message_index=index, role=role, content=content, timestamp=message["timestamp"], metadata=metadata, episode_id=episode_id, turn_id=turn_id, alpha=0.3)
                     written_l0 += 1
-                    written_l1 += 1
+                    if statement_kind(role, content) == "statement":
+                        metadata = {**metadata, "extraction_method": "statement_trace", "source_record_ids": [_stable_id("L0", session_id, index, role, content)], "fact_verified": False}
+                        self._upsert(connection, record_id=_stable_id("L1", session_id, index, role, content), layer="L1", session_id=session_id, message_index=index, role=role, content=content, timestamp=message["timestamp"], metadata=metadata, episode_id=episode_id, turn_id=turn_id, alpha=0.3)
+                        written_l1 += 1
                 if messages:
                     l2_candidates += 1 if self._project_candidate(connection, session_id, messages) else 0
             connection.commit()
@@ -793,7 +802,7 @@ class StandaloneMemoryClient:
             raise ValueError("session input contains no valid role/content messages")
         return {
             "backend": self.backend,
-            "pipeline": "standalone L0 raw conversation -> deterministic L1 atomic",
+            "pipeline": "L0 raw conversation -> eligible L1 statement traces (not independently verified facts)",
             "lifecycle": "memos-style episode/turn boundaries + feedback-weighted candidate pool",
             "sessions": session_count,
             "l0_recorded": written_l0,
@@ -975,7 +984,9 @@ class StandaloneMemoryClient:
             # Everything excluded here is already discarded downstream by the
             # answer surface, so this widens what reaches the caller; it cannot
             # remove a result that used to be served.
-            if is_question_turn(row["role"], content):
+            if statement_kind(row["role"], content) != "statement":
+                continue
+            if missing_identifiers(query, content):
                 continue
             retrieval_keys = self._retrieval_keys(row, lookup)
             searchable_text = "\n".join([content, *retrieval_keys]).casefold()
@@ -1093,6 +1104,9 @@ class StandaloneMemoryClient:
             # answer surface could not tell a captured user turn from an
             # assistant answer and had to guess from the text.
             "memory_role": row["role"],
+            "statement_kind": statement_kind(row["role"], content),
+            "attribution": attribution(provenance=self._row_metadata(row)),
+            "extraction": {"method": self._row_metadata(row).get("extraction_method", "verbatim_trace"), "source_role": row["role"], "fact_verified": False},
             "tier": tier,
             "ref_kind": ref_kind,
             "ref_id": record_id,

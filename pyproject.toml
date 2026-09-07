@@ -47,6 +47,7 @@ py-modules = [
   "eval_gate",
   "evaluate",
   "fallback",
+  "evidence_quality",
   "index",
   "install",
   "knowledge",

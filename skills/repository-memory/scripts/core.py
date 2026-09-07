@@ -47,6 +47,7 @@ from discovery import (
     resolve_root,
 )
 from fallback import SECRET_CONTENT, SECRET_NAME, _claim_support, query_terms
+from evidence_quality import attribution, statement_kind, missing_identifiers, ownership_supported, requested_team
 from tokenize_query import carved_query_terms
 from fallback import search as fallback_search
 from tokenize_query import tokenizer_status
@@ -508,6 +509,10 @@ def normalize_item(item: dict[str, Any], view: SourceView, source_type: str, que
         "line_end": end,
         "excerpt": excerpt,
         "support": support,
+        "attribution": item.get("attribution") or attribution(provenance=provenance if isinstance(provenance, dict) else {}, path=path),
+        "statement_kind": item.get("statement_kind"),
+        "extraction": item.get("extraction"),
+        "evidence_date": item.get("evidence_date"),
         "evidence_status": status,
         "generated": generated,
         "accepted": accepted,
@@ -723,14 +728,27 @@ def _answerable_items(items: list[dict[str, Any]], query: str = "") -> list[dict
     """
 
     answerable = []
+    current_query = bool(re.search(r"最新|最近|目前|当前|latest|recent|current", query, re.I))
+    evidence_dates = [str(item.get("evidence_date")) for item in items if item.get("evidence_date")]
+    newest_date = max(evidence_dates, default="")
     seen_repository = False
     for item in items:
-        if _is_query_echo(item, query):
+        if current_query and newest_date and item.get("path") and str(item.get("evidence_date") or "") < newest_date:
+            item["temporal_assessment"] = "historical_lead_not_current_answer"
+            continue
+        if _is_query_echo(item, query if not item.get("path") or isinstance(item.get("memory"), dict) else ""):
+            continue
+        if not ownership_supported(query, item):
+            item["scope_assessment"] = {"requested_team": requested_team(query), "supported": False, "reason": "work_ownership_not_established"}
             continue
         support_block = item.get("support") if isinstance(item.get("support"), dict) else {}
         support = str(support_block.get("claim_support") or "")
         memory_block = item.get("memory") if isinstance(item.get("memory"), dict) else None
         role = str((memory_block or {}).get("role") or "").strip().casefold()
+        if memory_block is not None:
+            body = str(item.get("excerpt") or item.get("content") or "")
+            if statement_kind(role, body) != "statement" or missing_identifiers(query, body):
+                continue
         # No memory block at all is what distinguishes a repository citation
         # from a conversation record.  A memory backend that reports no role
         # still carries the block, so it keeps the ``direct`` bar rather than
@@ -1051,6 +1069,11 @@ def _package_search(query: str, mode: str, scope: str, views: list[SourceView], 
         # answer before the model sees it.
         "groups": groups if scope in {"all", "auto"} else None,
         "answered_by": answered_by,
+        "answer_policy": {
+            "ownership": "A recorder, author, tool name or personal standup is not proof that the requested team performed the work. Attribute only explicitly supported work ownership.",
+            "freshness": "Use the current repository evidence before historical conversation summaries; check later dated sections for updates. A pinned old commit proves only its historical state.",
+            "readback": "verified means the source was read back, not that its content answers the question or establishes real-world truth.",
+        },
         "sources": [_source_payload(view) for view in views],
         "verified": selected["verified"][:limit],
         "candidates": selected["candidates"][:limit],
@@ -1167,6 +1190,8 @@ def search(root: Path | None, query: str, limit: int = 5, deep: bool = False, so
                         continue
                     body = "\n".join(str(record.get(key) or "") for key in ("title", "summary", "content"))
                     support = _claim_support(team_terms, body, 1, max(1, body.count("\n") + 1), real_terms=frozenset(set(team_terms) - team_carved), carved=frozenset(team_carved))
+                    if not ownership_supported(query, record):
+                        support = {**support, "claim_support": "unknown"}
                     active_records.append({**record, "support": {key: support[key] for key in ("matched_terms", "unmatched_terms", "coverage", "claim_support")}})
                 active_records.sort(key=lambda item: -(item.get("support", {}).get("coverage") or 0.0))
                 groups["team"] = {
@@ -1187,6 +1212,15 @@ def search(root: Path | None, query: str, limit: int = 5, deep: bool = False, so
     ordered_candidates = [bucket for _score, _index, bucket in sorted(repository_candidate_buckets, key=lambda item: (-item[0], item[1]))]
     groups["repository"]["verified"] = _interleave_results(ordered_verified, limit)
     groups["repository"]["candidates"] = _interleave_results(ordered_candidates, limit)
+    personal_subjects = {
+        Path(str(item.get("path"))).stem for item in groups["repository"]["verified"]
+        if str(item.get("path") or "").split("/", 1)[0].casefold() in {"standup", "standups", "diary", "diaries", "journal", "journals", "people"}
+        and Path(str(item.get("path"))).stem in query
+    }
+    if personal_subjects:
+        for key in ("verified", "candidates"):
+            groups["memory"][key] = [item for item in groups["memory"][key]
+                if all(subject in str(item.get("excerpt") or "") for subject in personal_subjects)]
     echo_dropped = 0
     for name, group in groups.items():
         if name == "team":
@@ -1210,9 +1244,19 @@ def search(root: Path | None, query: str, limit: int = 5, deep: bool = False, so
         echo_dropped += (len(group["verified"]) - len(kept_verified)) + (len(group["candidates"]) - len(kept_candidates))
         group["verified"] = kept_verified[:limit]
         group["candidates"] = kept_candidates[:limit]
-        group["answerable"] = _answerable_items(group["verified"], echo_query)
+        group["answerable"] = _answerable_items(group["verified"], query)
         group["results"] = group["answerable"]
         group["abstain"] = not group["answerable"]
+    if re.search(r"最新|最近|目前|当前|latest|recent|current", query, re.I) and groups["repository"]["verified"]:
+        # Historical conversation is retained for audit, but cannot independently
+        # establish current state when a repository answer is available.
+        for plane in ("memory", "team"):
+            group = groups.get(plane, {})
+            group["historical_context"] = group.get("answerable", group.get("active", []))
+            group["answerable"] = []
+            group["results"] = []
+            group["abstain"] = True
+            group["answer_policy"] = "historical_context_only_for_current_repository_query"
     if echo_dropped:
         # Never a silent cap: say how much was removed, so a plane that looks
         # thin can be told apart from one that was crowded out by its own echo.
