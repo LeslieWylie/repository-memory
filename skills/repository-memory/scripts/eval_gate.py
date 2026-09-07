@@ -19,6 +19,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--revision", help="Evaluate a detached revision snapshot instead of a dirty worktree.")
     parser.add_argument("--min-strict-p1", type=float, default=0.80)
     parser.add_argument("--min-recall-at-5", type=float, default=0.80)
+    parser.add_argument("--min-answer-precision", type=float, default=1.0, help="Floor for answer_precision_at_1: of the queries that were served an answer, the share whose top answerable citation is gold.")
     args = parser.parse_args(argv)
     report = evaluate_queries(
         Path(args.root).expanduser().resolve(),
@@ -34,6 +35,12 @@ def main(argv: list[str] | None = None) -> int:
         "recall_at_5": report["recall_at_5"] >= args.min_recall_at_5,
         "citation_parseability": report["citation_parseability"] == 1.0,
         "negative_abstain_accuracy": report["negative_abstain_accuracy"] in (None, 1.0),
+        # Retrieval and the answer surface fail differently: a claim gate can
+        # let a document reach ``answerable`` without changing which documents
+        # were retrieved, so ``strict_precision_at_1`` above cannot see it.
+        # A query that must abstain must also serve nothing.
+        "negative_answer_leak": report["negative_answer_leak"] in (None, 0.0),
+        "answer_precision_at_1": report["answer_precision_at_1"] in (None,) or report["answer_precision_at_1"] >= args.min_answer_precision,
     }
     output = {
         "schema_version": 1,
@@ -50,6 +57,10 @@ def main(argv: list[str] | None = None) -> int:
                 "recall_at_5_micro",
                 "citation_parseability",
                 "negative_abstain_accuracy",
+                "answer_rate",
+                "answer_precision_at_1",
+                "answered_positive_total",
+                "negative_answer_leak",
                 "p50_latency_ms",
                 "p95_latency_ms",
             )

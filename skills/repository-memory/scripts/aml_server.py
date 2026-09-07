@@ -26,6 +26,12 @@ class AMLService:
     def __init__(self, api_key: str = ""):
         self.api_key = api_key
         self.memory = standalone_memory_client()
+        # Neural encoders have a real cold-start cost.  Pay it before the HTTP
+        # server begins accepting traffic, so the first Add/Search request is
+        # not the operation that discovers and loads a multi-hundred-megabyte
+        # model.  ``health`` also opens/migrates the SQLite store, making a
+        # successfully constructed service genuinely ready to answer.
+        self.memory.health()
 
     def authorized(self, headers: Any) -> bool:
         if not self.api_key:

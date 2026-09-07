@@ -137,3 +137,12 @@ Read the references only when needed:
 - `references/operations.md` — CLI commands and MCP handshake;
 - `references/host-guard.md` — host routing and the advisory guard;
 - `docs/team-memory-git-sync.md` — Git-backed multi-agent sync and review.
+
+### Evidence quality and ownership
+
+Read `attribution`, `extraction`, `evidence_date`, and `support` separately.
+A recorder or a mentioned tool is not the performer of the work. Do not assign
+work to a team without explicit source evidence. L1 statement traces have not
+been independently fact-checked. For current-state queries, historical context
+must not override current repository evidence; report an evidence gap when the
+latest citation is partial instead of substituting an older direct answer.

@@ -58,6 +58,7 @@ EMBEDDING_DIMENSION = 384
 HF_PROVIDER = "huggingface"
 HF_DEFAULT_MODEL = "Alibaba-NLP/gte-multilingual-base"
 HF_MAX_SEQUENCE_LENGTH = 512
+HF_MAX_CHARS = 12000
 HF_ALIASES = {"huggingface", "hf", "gte", "gte-multilingual"}
 
 GATEWAY_PROVIDER = "gateway"
@@ -86,6 +87,8 @@ GATEWAY_PROBE_TTL_MAX = 3600.0
 # a few seconds is not usable for indexing either, and the probe runs on the
 # search path -- so it never inherits the much longer batch timeout.
 GATEWAY_PROBE_TIMEOUT = 5.0
+HF_SERVICE_DEFAULT_TIMEOUT = 30.0
+HF_SERVICE_DEFAULT_BATCH = 16
 
 _WORD_RE = re.compile(r"[A-Za-z0-9_./:-]{2,}|[\u3400-\u9fff]+", re.UNICODE)
 _CJK_RE = re.compile(r"[\u3400-\u9fff]")
@@ -147,6 +150,29 @@ def _hf_config() -> tuple[bool, str, bool]:
     enabled = _semantic_enabled(config) and _configured_provider(config) in HF_ALIASES
     allow_download = bool(config.get("allow_download", False))
     return enabled, model, allow_download
+
+
+def _hf_service_config() -> dict[str, Any]:
+    """Return the optional loopback service transport for the HF encoder."""
+
+    config = _semantic_config()
+    enabled, model, _allow_download = _hf_config()
+    endpoint = str(
+        os.environ.get("REPOSITORY_MEMORY_SEMANTIC_SERVICE_ENDPOINT")
+        or config.get("service_endpoint")
+        or ""
+    ).strip().rstrip("/")
+    try:
+        timeout = float(config.get("service_timeout_seconds") or HF_SERVICE_DEFAULT_TIMEOUT)
+    except (TypeError, ValueError):
+        timeout = HF_SERVICE_DEFAULT_TIMEOUT
+    return {
+        "enabled": bool(enabled and endpoint),
+        "endpoint": endpoint,
+        "model": model,
+        "timeout": max(1.0, min(timeout, 300.0)),
+        "batch_size": _positive_int(config.get("service_batch_size"), HF_SERVICE_DEFAULT_BATCH, maximum=64),
+    }
 
 
 def _positive_int(raw: Any, default: int, *, maximum: int | None = None) -> int:
@@ -301,6 +327,14 @@ def _load_hf_encoder(*, allow_download: bool = False) -> Any | None:
     _HF_ERROR_KEY = cache_key
     try:
         from sentence_transformers import SentenceTransformer
+        try:
+            from transformers.utils import logging as transformers_logging
+
+            previous_transformers_verbosity = transformers_logging.get_verbosity()
+            transformers_logging.set_verbosity_error()
+        except (ImportError, AttributeError):
+            transformers_logging = None
+            previous_transformers_verbosity = None
 
         model_kwargs = {} if allow_download else {"local_files_only": True}
         if not allow_download:
@@ -313,12 +347,16 @@ def _load_hf_encoder(*, allow_download: bool = False) -> Any | None:
                 device = "mps" if torch.backends.mps.is_available() else "cpu"
             except Exception:
                 device = "cpu"
-        encoder = SentenceTransformer(
-            model,
-            trust_remote_code=True,
-            device=device,
-            model_kwargs=model_kwargs,
-        )
+        try:
+            encoder = SentenceTransformer(
+                model,
+                trust_remote_code=True,
+                device=device,
+                model_kwargs=model_kwargs,
+            )
+        finally:
+            if transformers_logging is not None and previous_transformers_verbosity is not None:
+                transformers_logging.set_verbosity(previous_transformers_verbosity)
         # Whole repository files can be long reports.  One vector per
         # document is a recall candidate, not the citation window; keep the
         # encoder bounded and let lexical citation search provide the exact
@@ -451,6 +489,76 @@ def _gateway_request(texts: list[str], config: dict[str, Any]) -> list[list[floa
     if any(len(vector) != width for vector in vectors):
         raise ValueError("endpoint returned vectors of mixed width")
     return vectors
+
+
+def _hf_service_health(config: dict[str, Any]) -> dict[str, Any]:
+    """Probe the local resident encoder without running an embedding."""
+
+    if not config.get("enabled"):
+        return {"ok": False, "dimension": None, "error": "local embedding service is not configured"}
+    request = urllib.request.Request(
+        f"{config['endpoint']}/health",
+        headers={"Accept": "application/json"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=min(float(config["timeout"]), 2.0)) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        dimension = int(payload.get("dimension") or 0) if isinstance(payload, dict) else 0
+        model = str(payload.get("model") or "") if isinstance(payload, dict) else ""
+        if not payload.get("ok") or not dimension or model != config["model"]:
+            raise ValueError("local embedding service model or dimension mismatch")
+        return {"ok": True, "dimension": dimension, "error": None}
+    except Exception as exc:
+        return {"ok": False, "dimension": None, "error": _scrub(exc)}
+
+
+def _hf_service_request(texts: list[str], config: dict[str, Any]) -> list[list[float]]:
+    """Encode through the resident loopback service without forwarding keys."""
+
+    body = {"model": config["model"], "input": texts}
+    request = urllib.request.Request(
+        f"{config['endpoint']}/v1/embeddings",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=float(config["timeout"])) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    rows = payload.get("data")
+    if not isinstance(rows, list) or len(rows) != len(texts):
+        raise ValueError(f"local service returned {len(rows) if isinstance(rows, list) else 0} vectors for {len(texts)} inputs")
+    ordered = sorted(rows, key=lambda row: int(row.get("index", 0)) if isinstance(row, dict) else 0)
+    vectors: list[list[float]] = []
+    for row in ordered:
+        values = row.get("embedding") if isinstance(row, dict) else None
+        if not isinstance(values, list) or not values:
+            raise ValueError("local service returned an empty embedding")
+        vectors.append(_normalize([float(value) for value in values]))
+    width = len(vectors[0]) if vectors else 0
+    if any(len(vector) != width for vector in vectors):
+        raise ValueError("local service returned vectors of mixed width")
+    return vectors
+
+
+def _hf_service_encode(values: list[str], config: dict[str, Any]) -> tuple[array.array, int] | None:
+    if not values or not config.get("enabled"):
+        return (array.array("f"), 0) if not values else None
+    buffer = array.array("f")
+    width = 0
+    size = max(1, int(config["batch_size"]))
+    try:
+        for start in range(0, len(values), size):
+            batch = [text[:HF_MAX_CHARS] for text in values[start:start + size]]
+            vectors = _hf_service_request(batch, config)
+            width = width or len(vectors[0])
+            if any(len(vector) != width for vector in vectors):
+                raise ValueError("local service returned vectors of mixed width")
+            for vector in vectors:
+                buffer.extend(vector)
+    except Exception:
+        return None
+    return buffer, width
 
 
 def _scrub(exc: BaseException) -> str:
@@ -597,6 +705,22 @@ def embedding_status(*, probe: bool = True, allow_download: bool = False) -> dic
             "strategy": "local-hybrid",
             "fallback": False,
         }
+    service = _hf_service_config()
+    service_result = _hf_service_health(service) if probe and service.get("enabled") else None
+    if service_result and service_result.get("ok"):
+        return {
+            "configured": True,
+            "available": True,
+            "provider": HF_PROVIDER,
+            "model": model,
+            "dimension": int(service_result["dimension"]),
+            "native_neural_model": True,
+            "strategy": "local-hybrid",
+            "fallback": False,
+            "download_allowed": bool(allow_download),
+            "transport": "local-service",
+            "service_endpoint": service["endpoint"],
+        }
     encoder = _load_hf_encoder(allow_download=allow_download) if probe else None
     if encoder is not None:
         return {
@@ -609,6 +733,9 @@ def embedding_status(*, probe: bool = True, allow_download: bool = False) -> dic
             "strategy": "local-hybrid",
             "fallback": False,
             "download_allowed": bool(allow_download),
+            "transport": "in-process",
+            "service_endpoint": service.get("endpoint") or None,
+            "service_error": service_result.get("error") if service_result else None,
         }
     return {
         "configured": True,
@@ -621,6 +748,9 @@ def embedding_status(*, probe: bool = True, allow_download: bool = False) -> dic
         "fallback": True,
         "download_allowed": bool(allow_download),
         "error": _HF_ERROR or "model is not cached or optional dependencies are unavailable",
+        "transport": "unavailable",
+        "service_endpoint": service.get("endpoint") or None,
+        "service_error": service_result.get("error") if service_result else None,
     }
 
 
@@ -698,9 +828,13 @@ def vectorize(text: str, dimension: int | None = None) -> list[float]:
             return list(encoded[0])
     enabled, _model, _allow_download = _hf_config()
     if enabled:
+        service = _hf_service_config()
+        encoded = _hf_service_encode([str(text or "")], service)
+        if encoded is not None and encoded[1]:
+            return list(encoded[0])
         encoder = _load_hf_encoder(allow_download=False)
         if encoder is not None:
-            values = encoder.encode([str(text or "")[:12000]], normalize_embeddings=True, show_progress_bar=False)[0]
+            values = encoder.encode([str(text or "")[:HF_MAX_CHARS]], normalize_embeddings=True, show_progress_bar=False)[0]
             return [float(value) for value in values]
     return _builtin_vector(text, dimension)
 
@@ -723,7 +857,7 @@ def encode_document_vectors(texts: Iterable[str], *, allow_download: bool = Fals
     """
 
     # Bound input size before tokenization as an additional memory guard.
-    values = [str(text or "")[:12000] for text in texts]
+    values = [str(text or "")[:HF_MAX_CHARS] for text in texts]
     gateway = _gateway_config()
     if gateway["enabled"] and not _gateway_recent_failure(gateway):
         encoded = _gateway_encode(values, gateway)
@@ -735,6 +869,22 @@ def encode_document_vectors(texts: Iterable[str], *, allow_download: bool = Fals
             return buffer, width, spec
     enabled, model, _configured_download = _hf_config()
     if enabled:
+        service = _hf_service_config()
+        encoded = _hf_service_encode(values, service)
+        if encoded is not None and (not values or len(encoded[0]) == len(values) * encoded[1]):
+            buffer, width = encoded
+            return buffer, width, {
+                "configured": True,
+                "available": True,
+                "provider": HF_PROVIDER,
+                "model": model,
+                "dimension": width,
+                "native_neural_model": True,
+                "strategy": "local-hybrid",
+                "fallback": False,
+                "transport": "local-service",
+                "service_endpoint": service.get("endpoint"),
+            }
         encoder = _load_hf_encoder(allow_download=allow_download)
         if encoder is not None:
             buffer = array.array("f")

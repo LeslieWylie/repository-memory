@@ -19,7 +19,7 @@ sys.path.insert(0, str(SCRIPTS))
 import core
 from citation import locate, validate
 from evaluate import evaluate_queries
-from fallback import _claim_support, _compound_parts, _fts_candidates, carved_query_terms, paths, query_terms
+from fallback import _claim_support, _compound_parts, _evidence_window, _fts_candidates, carved_query_terms, paths, query_terms
 from local_index import _ensure_fts, _ensure_path_fts
 from memorycore import MemoryCoreClient, MemoryCoreConfig, MemoryCoreError
 from memmy import MemmyClient, MemmyConfig
@@ -129,6 +129,42 @@ class RepositoryMemoryTest(unittest.TestCase):
             self.assertEqual(os.environ["REPOSITORY_MEMORY_SEMANTIC_ENABLED"], "1")
         self.assertNotIn("REPOSITORY_MEMORY_SEMANTIC_MODEL", os.environ)
         self.assertNotIn("REPOSITORY_MEMORY_SEMANTIC_ENABLED", os.environ)
+
+    def test_memory_embedding_backfill_batches_and_records_the_effective_encoder(self):
+        import array
+        from standalone_memory import StandaloneMemoryClient
+
+        connection = sqlite3.connect(":memory:")
+        connection.execute(
+            "CREATE TABLE records (id TEXT PRIMARY KEY, content TEXT, embedding BLOB, "
+            "embedding_provider TEXT, embedding_model TEXT, embedding_dim INTEGER)"
+        )
+        connection.executemany(
+            "INSERT INTO records(id, content) VALUES(?, ?)",
+            [("one", "first memory"), ("two", "second memory")],
+        )
+        captured: list[str] = []
+
+        def encode(values, *, allow_download=False):
+            captured.extend(list(values))
+            return array.array("f", [1.0, 0.0, 0.0, 1.0]), 2, {
+                "provider": "builtin",
+                "model": "fallback-model",
+                "dimension": 2,
+            }
+
+        requested = {"provider": "gateway", "model": "remote-model", "dimension": 2}
+        with patch("standalone_memory.active_embedding_spec", return_value=requested), patch(
+            "standalone_memory.encode_document_vectors", side_effect=encode
+        ):
+            StandaloneMemoryClient._backfill_embeddings(connection)
+
+        rows = connection.execute(
+            "SELECT embedding_provider, embedding_model, embedding_dim FROM records ORDER BY id"
+        ).fetchall()
+        connection.close()
+        self.assertEqual(captured, ["first memory", "second memory"])
+        self.assertEqual(rows, [("builtin", "fallback-model", 2), ("builtin", "fallback-model", 2)])
 
     def test_index_reports_scale_metadata(self):
         from local_index import build
@@ -330,6 +366,258 @@ class RepositoryMemoryTest(unittest.TestCase):
         }
 
         self.assertEqual(core._answerable_items([benchmark_note], query), [])
+
+    def test_a_near_complete_repository_citation_is_answerable(self):
+        """``direct`` is a filter applied after ranking, so it reaches downward.
+
+        Measured on the public fixture: ``repository memory conversation memory
+        separate groups`` ranked the gold ``README.md`` first at ``coverage
+        0.8333``, withheld it for the single unproven term, and answered from
+        ``docs/plugin-architecture.md`` at rank 5 — the one document scoring
+        ``direct``.  Withholding a near-complete top hit does not produce an
+        abstention, it produces an answer from further down.
+        """
+
+        near_complete = {
+            "excerpt": "Repository evidence and memory records are returned as separate groups.",
+            "support": {
+                "claim_support": "partial",
+                "coverage": 0.8333,
+                "matched_terms": ["repository", "memory", "separate", "groups", "group"],
+                "unmatched_terms": ["conversation"],
+            },
+        }
+
+        self.assertEqual(
+            core._answerable_items([near_complete], "repository memory conversation memory separate groups"),
+            [near_complete],
+        )
+
+    def test_a_repository_citation_missing_a_coined_term_is_not_answerable(self):
+        """A coined term is not paraphrasable, so leaving one unproven is fatal.
+
+        Coverage alone would admit this: five of six terms matched is the same
+        0.8333 as the case above.  What differs is *which* term is unproven.
+        And "was coined" is a narrower test than "looks like ASCII":
+        ``conversation`` above is an ordinary English word standing in for what
+        the document calls memory records, while a document that cannot show
+        ``terminal-bench-rl`` anywhere is not about that project however much
+        of the rest of the sentence it shares.  Rejecting every unproven Latin
+        token would have collapsed this gate back into ``direct`` for any
+        all-ASCII question and left the fixture query answering from rank 5.
+        """
+
+        wrong_subject = {
+            "excerpt": "Novita sandbox 接入 verl，89 题里 87 题通过。",
+            "support": {
+                "claim_support": "partial",
+                "coverage": 0.8333,
+                "matched_terms": ["novita", "sandbox", "terminal", "bench", "验收通过率"],
+                "unmatched_terms": ["terminal-bench-rl"],
+            },
+        }
+
+        self.assertEqual(core._answerable_items([wrong_subject], "terminal-bench-rl Novita sandbox 验收通过率"), [])
+
+    def test_a_near_complete_hit_below_rank_one_does_not_promote_itself(self):
+        """Span selection can make coverage describe twelve lines, not a file.
+
+        Coverage is computed over the selected span, so on a small document it
+        describes the document and on a 3000-line append-only file it describes
+        whatever span selection picked.  Measured on ``rlvr-auto-survey`` at
+        ``4c53230``: ``terminal-bench-rl Novita sandbox 验收通过率`` ranked
+        ``standup/李宁.md`` second — that file does hold the answer, at line 976
+        — and served its span at lines 2504-2515, about an unrelated debugging
+        session.  Rank 3 was the payload below: a different standup whose span
+        matches every identifier at ``coverage 0.8333``, and neither that span
+        nor its whole file contains the figure anywhere.
+
+        Admitting near-complete hits at any rank answers that query from rank 3.
+        Restricting the relaxation to the top repository hit leaves it
+        abstaining, which on this evidence is correct — the ranking had already
+        declined to call it the best evidence, and a near-complete claim
+        computed over a badly chosen span is not grounds to overrule that.
+        """
+
+        ranked_above = {
+            "excerpt": "verl fully_async_policy 的 sentinel 排查记录。",
+            "support": {
+                "claim_support": "partial",
+                "coverage": 0.3333,
+                "matched_terms": ["terminal", "bench"],
+                "unmatched_terms": ["terminal-bench-rl", "novita", "sandbox", "验收通过率"],
+            },
+        }
+        wrong_span_of_right_project = {
+            "excerpt": "新建 `terminal-bench-rl-novita-benchmark` 仓库，出 Novita backend 评测题。",
+            "support": {
+                "claim_support": "partial",
+                "coverage": 0.8333,
+                "matched_terms": ["terminal-bench-rl", "novita", "sandbox", "terminal", "bench"],
+                "unmatched_terms": ["验收通过率"],
+            },
+        }
+
+        query = "terminal-bench-rl Novita sandbox 验收通过率"
+        self.assertEqual(core._answerable_items([ranked_above, wrong_span_of_right_project], query), [])
+        # The same payload at rank 1 is admitted, so it is the rank bound doing
+        # the rejecting here and not one of the claim bounds.
+        self.assertEqual(
+            core._answerable_items([wrong_span_of_right_project], query),
+            [wrong_span_of_right_project],
+        )
+
+    def test_a_long_compound_question_needs_more_than_four_fifths(self):
+        """Coverage gets looser as the question gets longer; the ceiling does not.
+
+        Eight of ten terms is 0.8 — over the coverage floor — while still
+        leaving two parts of a compound question unanswered.  That is the
+        "half a question" case the ``direct`` bar existed to reject, so the
+        unproven-term ceiling has to bind where coverage stops binding.
+        """
+
+        two_parts_missing = {
+            "excerpt": "octo-daemon 的部署说明与回滚流程。",
+            "support": {
+                "claim_support": "partial",
+                "coverage": 0.8,
+                "matched_terms": ["octo-daemon", "部署", "回滚", "流程", "说明", "监控", "配置", "健康"],
+                "unmatched_terms": ["验证方式", "告警阈值"],
+            },
+        }
+
+        self.assertEqual(core._answerable_items([two_parts_missing], "octo-daemon 怎么部署"), [])
+
+    def test_the_repository_gate_does_not_reach_a_memory_record_without_a_role(self):
+        """A backend that reports no role still carries a memory block.
+
+        The repository gate keys on the *absence* of that block, not on an
+        empty role string, so a conversation record from a backend that omits
+        the role keeps the ``direct`` bar instead of inheriting a gate written
+        for Git documents.
+        """
+
+        roleless_memory = {
+            "excerpt": "Novita sandbox 接入 terminal-bench-rl，89 题里 87 题通过。",
+            "memory": {"layer": "L1", "type": "atomic"},
+            "support": {
+                "claim_support": "partial",
+                "coverage": 0.8333,
+                "matched_terms": ["terminal-bench-rl", "novita", "sandbox", "terminal", "bench"],
+                "unmatched_terms": ["验收通过率"],
+            },
+        }
+
+        self.assertEqual(core._answerable_items([roleless_memory], "terminal-bench-rl Novita sandbox 验收通过率"), [])
+
+    def test_expanded_forms_are_one_claim_not_several(self):
+        """The coverage divisor must be the question, not the tokenizer.
+
+        ``search`` passes the expanded term list to claim support because every
+        form is worth matching.  Counting each form as its own requirement makes
+        the divisor a property of how many stems the tokenizer happened to emit:
+        on the public fixture ``citation-first repository memory verified
+        candidates abstain`` — six words — became nine requirements, because
+        ``citation-first`` also contributed ``first`` and the inflections also
+        contributed ``verifi`` and ``candidate``.
+
+        The two origins are not the same kind of term.  An inflection is the
+        same word, so evidence writing either form proves the claim.  A part
+        split out of a name the user delimited is a recall aid, so it is not a
+        claim at all — see the compound test below.
+        """
+
+        expanded = [
+            "citation-first", "repository", "memory", "verified", "candidates", "abstain",
+            "first", "verifi", "candidate",
+        ]
+        support = _claim_support(
+            expanded,
+            "The runtime keeps repository memory candidates separate and will abstain,\n"
+            "and nothing is promoted until it is verified.",
+            1,
+            2,
+        )
+
+        # Six claims, not nine: the singular proves ``candidates`` and the stem
+        # proves ``verified``, and ``first`` was never a claim of its own.
+        self.assertEqual(
+            sorted(support["matched_terms"] + support["unmatched_terms"]),
+            sorted(["citation-first", "repository", "memory", "verified", "candidates", "abstain"]),
+        )
+        self.assertEqual(support["unmatched_terms"], ["citation-first"])
+        self.assertEqual(support["coverage"], round(5 / 6, 4))
+
+    def test_a_name_is_not_proven_by_the_words_inside_it(self):
+        """``_compound_parts`` splits a name for recall, not into claims.
+
+        The parts let ``terminal-bench-rl`` retrieve a document that wrote the
+        name with a space.  Crediting them as claims lets a document prove a
+        name it never uses: measured on ``rlvr-auto-survey`` at ``4c53230``,
+        ``standup/李宁.md`` matched ``terminal`` and ``bench`` while never
+        writing ``terminal-bench-rl``, and collected five sixths coverage for a
+        project it does not name — over the 0.8 answerability bar.
+        """
+
+        support = _claim_support(
+            ["terminal-bench-rl", "terminal", "bench", "novita", "sandbox", "验收通过率"],
+            "terminal 上跑 bench 的时候 novita sandbox 又断了一次，验收通过的那批不受影响。",
+            1,
+            1,
+        )
+
+        # Crediting the parts put this over the bar at five sixths.  The name
+        # itself is still unproven, so the claim is four terms and three of
+        # them are met.
+        self.assertEqual(support["unmatched_terms"], ["terminal-bench-rl"])
+        self.assertEqual(support["coverage"], 0.75)
+        self.assertLess(support["coverage"], core.REPOSITORY_PARTIAL_MIN_COVERAGE)
+
+    def test_an_ordinary_substring_coincidence_stays_two_claims(self):
+        """Collapsing is by derived form, not by substring.
+
+        ``rest`` nests inside ``restaurant`` and ``test`` inside ``unittest``,
+        but neither is a form the tokenizer derived from the other, so they stay
+        independent requirements.  Collapsing on substring alone would let a
+        document proving only the longer word claim both.
+        """
+
+        support = _claim_support(
+            ["restaurant", "rest", "unittest", "test"],
+            "Nothing in this line bears on the question.",
+            1,
+            1,
+        )
+
+        self.assertEqual(sorted(support["unmatched_terms"]), ["rest", "restaurant", "test", "unittest"])
+        self.assertEqual(support["coverage"], 0.0)
+
+    def test_the_cited_window_covers_the_question_rather_than_repeating_one_term(self):
+        """Breadth of the claim first, density only as the tie-break.
+
+        The window picker receives the same expanded list, so scoring by raw
+        occurrence count lets one query term outvote several distinct ones.
+        Measured on ``rlvr-auto-survey`` at ``4c53230`` with ``terminal-bench-rl
+        Novita sandbox 验收通过率``: the chosen window scored ``terminal`` twice,
+        ``bench`` twice and ``rl`` five times — every hit a fragment of one
+        term, several of them from ``verl`` rather than the project name — and
+        beat the window carrying ``novita``, ``sandbox`` and the answer.  The
+        citation landed 1500 lines away, in an unrelated debugging session.
+        """
+
+        text = "\n".join(
+            ["terminal bench rl verl verl verl verl"]      # one concept, seven hits
+            + ["filler"] * 40
+            + ["novita sandbox terminal-bench-rl 87/89"]   # three concepts, four hits
+            + ["filler"] * 40
+        )
+        terms = ["terminal-bench-rl", "terminal", "bench", "rl", "novita", "sandbox"]
+
+        excerpt, start, end = _evidence_window(text, terms, max_lines=3)
+
+        self.assertIn("87/89", excerpt)
+        self.assertLessEqual(start, 42)
+        self.assertGreaterEqual(end, 42)
 
     def test_memory_plane_overfetches_so_echoes_cannot_empty_it(self):
         """Filtering after a ``limit``-sized fetch can only ever empty the plane.
@@ -716,6 +1004,43 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(result["diagnostics"]["adapters"][0]["semantic"]["strategy"], "local-hybrid")
         self.assertFalse(result["diagnostics"]["adapters"][0]["semantic"]["native_neural_model"])
 
+    def test_chunk_semantics_aggregate_by_document_and_anchor_the_best_span(self):
+        import array
+
+        notes = self.alpha / "notes"
+        notes.mkdir()
+        long_lines = ["# Long record", *[f"filler line {index}" for index in range(1, 40)], "TAIL-EVIDENCE semantic chunk selected here"]
+        (notes / "long.md").write_text("\n".join(long_lines) + "\n", encoding="utf-8")
+        (notes / "other.md").write_text("# Other\n\nunrelated document\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.alpha), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(self.alpha), "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "semantic chunks"], check=True)
+        self.write_config({"sources": [{"id": "alpha", "root": str(self.alpha)}]})
+        semantic = {
+            "available": True,
+            "indexed": True,
+            "provider": "builtin",
+            "model": "fixture",
+            "dimension": 2,
+            "paths": ["notes/long.md", "notes/long.md", "notes/other.md"],
+            "chunks": [
+                {"path": "notes/long.md", "line_start": 1, "line_end": 20, "digest": "a"},
+                {"path": "notes/long.md", "line_start": 41, "line_end": 41, "digest": "b"},
+                {"path": "notes/other.md", "line_start": 1, "line_end": 3, "digest": "c"},
+            ],
+            # The second chunk of long.md is the semantic winner.  Aggregation
+            # must keep its max score instead of overwriting it with whichever
+            # duplicate path happens to be visited last.
+            "vector_store": array.array("f", [0.0, 1.0, 1.0, 0.0, 0.2, 0.8]),
+            "strategy": "local-hybrid",
+        }
+        with patch("core.ensure_semantic_index", return_value=semantic), patch("fallback.vectorize", return_value=[1.0, 0.0]):
+            result = core.search(None, "paraphrased intent", local=True)
+
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["verified"][0]["path"], "notes/long.md")
+        self.assertIn("TAIL-EVIDENCE", result["verified"][0]["excerpt"])
+        self.assertEqual(result["verified"][0]["line_start"], 41)
+
     def test_normal_sync_never_grants_model_download_permission(self):
         self.write_config({"sources": [{"id": "alpha", "root": str(self.alpha)}]})
         captured = {}
@@ -774,6 +1099,42 @@ class RepositoryMemoryTest(unittest.TestCase):
         self.assertEqual(result["verified"][0]["citation"]["valid"], True)
         self.assertIn("李小明", result["diagnostics"]["query_terms"])
         self.assertFalse(result["freshness"]["alpha"]["dirty"])
+
+    def test_personal_temporal_question_cites_the_latest_section_not_an_old_self_mention(self):
+        standup = self.alpha / "standup"
+        standup.mkdir()
+        (standup / "李小明.md").write_text(
+            "# 李小明\n\n"
+            "## 2026-09-01\n\n"
+            "**Done**\n"
+            "- 完成 Qwen 服务真实推理验证。\n"
+            "- 完成网关调用分析。\n"
+            "- 完成 H3 视频出片验证。\n"
+            "- 修正生产性能口径。\n"
+            "- 整理运行手册。\n"
+            "- 补齐回归记录。\n"
+            "- 核对远端提交。\n"
+            "- 验证工具调用。\n"
+            "- 固化一键命令。\n"
+            "- 记录当前阻塞。\n"
+            "- 给出下一步计划。\n\n"
+            "## 2026-08-25\n\n"
+            "**Next**\n"
+            "- 端口调整未执行，等待李小明决定。\n",
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "-C", str(self.alpha), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(self.alpha), "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "dated standup"], check=True)
+        self.write_config({"sources": [{"id": "alpha", "root": str(self.alpha)}]})
+
+        result = core.search(None, "去查李小明最近做什么", local=True)
+
+        self.assertFalse(result["abstain"])
+        self.assertEqual(result["verified"][0]["path"], "standup/李小明.md")
+        self.assertIn("2026-09-01", result["verified"][0]["excerpt"])
+        self.assertIn("Qwen 服务真实推理验证", result["verified"][0]["excerpt"])
+        self.assertNotIn("等待李小明决定", result["verified"][0]["excerpt"])
+        self.assertLess(result["verified"][0]["line_start"], 10)
 
     def test_cjk_temporal_scaffolding_does_not_become_query_terms(self):
         terms = query_terms("最近的模型评审")
@@ -3178,6 +3539,144 @@ class GatewayEmbeddingTest(unittest.TestCase):
         self.assertEqual(spec["provider"], "builtin")
 
 
+class HuggingFaceServiceTest(unittest.TestCase):
+    """A resident local encoder keeps HF identity without per-call loading."""
+
+    def setUp(self):
+        import local_embedding
+
+        self.local_embedding = local_embedding
+        self.directory = tempfile.TemporaryDirectory()
+        self._environ = dict(os.environ)
+        os.environ.update({
+            "XDG_CACHE_HOME": self.directory.name,
+            "XDG_CONFIG_HOME": self.directory.name,
+            "XDG_DATA_HOME": self.directory.name,
+            "REPOSITORY_MEMORY_SEMANTIC_ENABLED": "1",
+            "REPOSITORY_MEMORY_SEMANTIC_PROVIDER": "huggingface",
+            "REPOSITORY_MEMORY_SEMANTIC_MODEL": "local-test-model",
+            "REPOSITORY_MEMORY_SEMANTIC_SERVICE_ENDPOINT": "http://127.0.0.1:8493",
+        })
+        self.calls: list[dict] = []
+        self.addCleanup(self.reset_environment)
+        self.addCleanup(self.directory.cleanup)
+
+    def reset_environment(self):
+        os.environ.clear()
+        os.environ.update(self._environ)
+
+    def responder(self, request, timeout=None):
+        class Response:
+            def __init__(self, payload):
+                self.payload = json.dumps(payload).encode("utf-8")
+
+            def read(self):
+                return self.payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        self.calls.append({"url": request.full_url, "headers": dict(request.headers), "timeout": timeout})
+        if request.full_url.endswith("/health"):
+            return Response({"ok": True, "model": "local-test-model", "dimension": 3})
+        body = json.loads(request.data.decode("utf-8"))
+        return Response({"data": [
+            {"index": index, "embedding": [1.0, float(index + 1), 0.5]}
+            for index, _value in enumerate(body["input"])
+        ]})
+
+    def test_status_and_corpus_use_the_resident_service_without_forwarding_a_key(self):
+        with patch.object(self.local_embedding.urllib.request, "urlopen", self.responder), patch.object(
+            self.local_embedding, "_load_hf_encoder", side_effect=AssertionError("must not cold-load")
+        ):
+            status = self.local_embedding.embedding_status(probe=True)
+            vectors, spec = self.local_embedding.encode_documents(["first", "second"])
+
+        self.assertEqual(status["provider"], "huggingface")
+        self.assertEqual(status["transport"], "local-service")
+        self.assertEqual(status["dimension"], 3)
+        self.assertEqual(spec["provider"], "huggingface")
+        self.assertEqual(spec["transport"], "local-service")
+        self.assertEqual([len(vector) for vector in vectors], [3, 3])
+        self.assertTrue(all("Authorization" not in call["headers"] for call in self.calls))
+
+    def test_resident_server_exposes_the_narrow_embedding_contract(self):
+        from http.client import HTTPConnection
+        from http.server import ThreadingHTTPServer
+        from semantic_service import Handler
+
+        class Engine:
+            model = "local-test-model"
+            dimension = 2
+
+            @staticmethod
+            def encode(texts):
+                return [[1.0, float(index)] for index, _value in enumerate(texts)]
+
+        handler = type("TestEmbeddingHandler", (Handler,), {"engine": Engine()})
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            connection = HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+            connection.request("GET", "/health")
+            health = connection.getresponse()
+            self.assertEqual(health.status, 200)
+            self.assertEqual(json.loads(health.read())["dimension"], 2)
+
+            payload = {"model": "local-test-model", "input": ["one", "two"]}
+            connection.request("POST", "/v1/embeddings", body=json.dumps(payload), headers={"Content-Type": "application/json"})
+            response = connection.getresponse()
+            value = json.loads(response.read())
+            self.assertEqual(response.status, 200)
+            self.assertEqual([row["index"] for row in value["data"]], [0, 1])
+            connection.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_service_install_retries_the_launchd_teardown_race(self):
+        import semantic_service
+
+        plist = Path(self.directory.name) / "semantic.plist"
+        calls: list[tuple[str, ...]] = []
+        bootstrap_attempts = 0
+
+        def launchctl(*args):
+            nonlocal bootstrap_attempts
+            calls.append(tuple(args))
+            if args[0] == "print":
+                return False, "not loaded"
+            if args[0] == "bootstrap":
+                bootstrap_attempts += 1
+                return (bootstrap_attempts > 1, "Input/output error" if bootstrap_attempts == 1 else "")
+            return True, ""
+
+        configured = {
+            "configured": True,
+            "provider": "huggingface",
+            "model": "local-test-model",
+            "service_endpoint": "http://127.0.0.1:8493",
+            "config_path": str(Path(self.directory.name) / "config.json"),
+        }
+        with patch.object(semantic_service, "configure", return_value=configured), patch.object(
+            semantic_service, "plist_path", return_value=plist
+        ), patch.object(semantic_service, "_plist", return_value="<plist/>"), patch.object(
+            semantic_service, "_launchctl", side_effect=launchctl
+        ), patch.object(
+            semantic_service, "_health", return_value={"ok": True, "model": "local-test-model", "dimension": 3}
+        ), patch.object(semantic_service.time, "sleep", return_value=None):
+            result = semantic_service.install(model="local-test-model")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(bootstrap_attempts, 2)
+        self.assertTrue(any(call[0] == "kickstart" for call in calls))
+
+
 class CarvedTermProvenanceTest(unittest.TestCase):
     """A segmenter's words are claims; only the joins around them are guesses."""
 
@@ -3359,14 +3858,14 @@ class SemanticDeferralTest(unittest.TestCase):
 
         self.semantic_repository = semantic_repository
 
-    def _view(self, root: Path):
+    def _view(self, root: Path, commit: str | None = None):
         from models import SourceSpec, SourceView
 
         spec = SourceSpec(id="deferral", root=root, repository="deferral")
         return SourceView(
             spec=spec,
             path=root,
-            commit="c" * 40,
+            commit=commit or "c" * 40,
             branch="main",
             commit_type="local",
             dirty=False,
@@ -3383,6 +3882,22 @@ class SemanticDeferralTest(unittest.TestCase):
             self.assertTrue(result["deferred"])
             self.assertFalse(result["available"])
             self.assertEqual(result["defer_reason"], "large_repository_first_pass")
+
+    def test_public_summary_reports_counts_without_dumping_chunk_metadata(self) -> None:
+        summarized = self.semantic_repository.summary({
+            "available": True,
+            "paths": ["standup/a.md", "standup/a.md", "docs/b.md"],
+            "chunks": [
+                {"path": "standup/a.md", "line_start": 1, "line_end": 10},
+                {"path": "standup/a.md", "line_start": 11, "line_end": 20},
+                {"path": "docs/b.md", "line_start": 1, "line_end": 4},
+            ],
+        })
+
+        self.assertNotIn("paths", summarized)
+        self.assertNotIn("chunks", summarized)
+        self.assertEqual(summarized["document_count"], 2)
+        self.assertEqual(summarized["chunk_count"], 3)
 
     def test_signature_mismatch_defers_rather_than_scoring_two_spaces(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3420,6 +3935,89 @@ class SemanticDeferralTest(unittest.TestCase):
         # ``vectorize`` would encode the query in, so they must not be scored.
         self.assertTrue(result["deferred"])
         self.assertEqual(result["defer_reason"], "semantic_cache_signature_mismatch")
+
+    def test_heading_dense_documents_do_not_create_one_vector_per_heading(self) -> None:
+        text = "\n".join(
+            f"## Generated item {index}\ncompact metadata row {index}"
+            for index in range(900)
+        )
+
+        chunks = self.semantic_repository.document_chunks("notes/generated-index.md", text)
+
+        self.assertGreater(len(chunks), 1)
+        self.assertLess(len(chunks), 12)
+        self.assertTrue(all(len(item["text"]) <= self.semantic_repository.SEMANTIC_CHUNK_MAX_CHARS for item in chunks))
+
+    def test_later_commit_reuses_stable_markdown_chunks_and_encodes_only_the_delta(self) -> None:
+        import array
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            previous = self._view(root, "a" * 40)
+            current = self._view(root, "b" * 40)
+            long_section = "\n".join(f"- 历史工作记录 {index}" for index in range(1800))
+            old_text = (
+                "# 李小明\n\n"
+                "## 2026-08-31\n\n"
+                f"{long_section}\n"
+                "- 尾部结论：完成长文档语义覆盖。\n\n"
+                "## 2026-08-30\n\n"
+                "- 完成旧任务。\n"
+            )
+            new_text = (
+                "# 李小明\n\n"
+                "## 2026-09-01\n\n"
+                "- 完成今天新增的向量增量。\n\n"
+                + old_text.split("# 李小明\n\n", 1)[1]
+            )
+            calls: list[list[str]] = []
+
+            def encode(values, *, allow_download=False):
+                calls.append(list(values))
+                packed = array.array("f")
+                for position, _value in enumerate(values, 1):
+                    packed.extend([float(position), 0.0, 0.0, 0.0])
+                return packed, 4, {
+                    "provider": "gateway",
+                    "model": "text-embedding-v3",
+                    "dimension": 4,
+                    "native_neural_model": True,
+                }
+
+            status = {
+                "configured": True,
+                "available": True,
+                "provider": "gateway",
+                "model": "text-embedding-v3",
+                "dimension": 4,
+                "native_neural_model": True,
+            }
+            with patch.object(self.semantic_repository, "embedding_status", return_value=status), patch.object(
+                self.semantic_repository,
+                "encode_document_vectors",
+                side_effect=encode,
+            ):
+                first = self.semantic_repository.ensure(
+                    previous,
+                    {"documents": [{"path": "standup/李小明.md", "text": old_text}]},
+                    build=True,
+                )
+                second = self.semantic_repository.ensure(
+                    current,
+                    {"documents": [{"path": "standup/李小明.md", "text": new_text}]},
+                    build=False,
+                )
+
+        self.assertTrue(first["available"])
+        self.assertGreater(first["chunk_count"], 2)
+        self.assertTrue(all(len(value) <= self.semantic_repository.SEMANTIC_CHUNK_MAX_CHARS for value in calls[0]))
+        self.assertTrue(any("尾部结论" in value for value in calls[0]))
+        self.assertTrue(second["available"])
+        self.assertEqual(second["incremental_from_commit"], previous.commit)
+        self.assertEqual(second["reused_chunk_count"], first["chunk_count"])
+        self.assertEqual(second["encoded_chunk_count"], 1)
+        self.assertEqual(len(calls[1]), 1)
+        self.assertIn("2026-09-01", calls[1][0])
 
 
 if __name__ == "__main__":

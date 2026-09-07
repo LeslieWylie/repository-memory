@@ -47,6 +47,7 @@ from discovery import (
     resolve_root,
 )
 from fallback import SECRET_CONTENT, SECRET_NAME, _claim_support, query_terms
+from evidence_quality import attribution, statement_kind, missing_identifiers, ownership_supported, requested_team
 from tokenize_query import carved_query_terms
 from fallback import search as fallback_search
 from tokenize_query import tokenizer_status
@@ -508,6 +509,10 @@ def normalize_item(item: dict[str, Any], view: SourceView, source_type: str, que
         "line_end": end,
         "excerpt": excerpt,
         "support": support,
+        "attribution": item.get("attribution") or attribution(provenance=provenance if isinstance(provenance, dict) else {}, path=path),
+        "statement_kind": item.get("statement_kind"),
+        "extraction": item.get("extraction"),
+        "evidence_date": item.get("evidence_date"),
         "evidence_status": status,
         "generated": generated,
         "accepted": accepted,
@@ -668,9 +673,40 @@ def _answerable_items(items: list[dict[str, Any]], query: str = "") -> list[dict
     ``verified`` is deliberately document-level: it means the citation points
     at a real, fresh, non-pending document.  That is useful for recall and
     qrels evaluation, but it is not permission to answer a composite question.
-    For a repository citation the bar stays ``direct`` — the excerpt has to
-    carry every term of the claim, because a document quote that covers half a
-    question is exactly the case that produces a confident wrong answer.
+    A document quote that covers half a question is exactly the case that
+    produces a confident wrong answer, so a repository citation has to carry
+    very nearly the whole claim — but ``direct`` is not the same bar as "very
+    nearly".  ``direct`` is a *filter applied after ranking*, so on a question
+    where nothing scores ``direct`` at the top it does not abstain, it reaches
+    down the ranking for whatever does.  Measured on the public fixture:
+    ``repository memory conversation memory separate groups`` ranked the gold
+    ``README.md`` first at ``coverage 0.8333`` and ``docs/architecture.md``
+    second, withheld both, and answered from ``docs/plugin-architecture.md`` at
+    rank 5 — the one document that happened to match every term.  Retrieval
+    precision@1 was 1.0 and the served answer was wrong.  Coverage was
+    computed, reported, and then not consulted.
+
+    So a repository citation may be answerable at ``partial`` under bounds that
+    keep the "half a question" case out: see
+    ``_repository_partial_is_answerable`` for the three and what each rejects.
+    The relaxation applies to the *top-ranked* repository hit only, because
+    that is the whole of what it is for — not reaching down the ranking when
+    the best hit nearly answers.  Below rank 1 the ranking has already said
+    this is not the best evidence, and a near-complete claim should not
+    promote it past that.
+
+    That bound is doing real work, not tidiness.  Coverage is computed over the
+    selected span, so on a small document it describes the document, while on a
+    3000-line append-only file it describes twelve lines that span selection
+    happened to pick.  Measured on ``rlvr-auto-survey`` at ``4c53230``:
+    ``terminal-bench-rl Novita sandbox 验收通过率`` ranked ``standup/李宁.md``
+    second — that file does hold the answer, at line 976 — and served its span
+    at lines 2504-2515, about an unrelated debugging session.  Rank 3 was a
+    different standup scoring ``coverage 0.8333`` with only ``验收通过率``
+    unproven, and neither its span nor its whole file contains the figure at
+    all.  Admitting partial hits at any rank answers that query from rank 3;
+    restricting it to rank 1 leaves it abstaining, which on this evidence is
+    correct.  The gate is downstream of span selection and cannot repair it.
 
     A prior assistant turn is judged differently, and it has to be.
     ``_claim_support`` asks whether the excerpt contains every query term, so
@@ -692,15 +728,101 @@ def _answerable_items(items: list[dict[str, Any]], query: str = "") -> list[dict
     """
 
     answerable = []
+    current_query = bool(re.search(r"最新|最近|目前|当前|latest|recent|current", query, re.I))
+    evidence_dates = [str(item.get("evidence_date")) for item in items if item.get("evidence_date")]
+    newest_date = max(evidence_dates, default="")
+    seen_repository = False
     for item in items:
-        if _is_query_echo(item, query):
+        if current_query and newest_date and item.get("path") and str(item.get("evidence_date") or "") < newest_date:
+            item["temporal_assessment"] = "historical_lead_not_current_answer"
+            continue
+        if _is_query_echo(item, query if not item.get("path") or isinstance(item.get("memory"), dict) else ""):
+            continue
+        if not ownership_supported(query, item):
+            item["scope_assessment"] = {"requested_team": requested_team(query), "supported": False, "reason": "work_ownership_not_established"}
             continue
         support_block = item.get("support") if isinstance(item.get("support"), dict) else {}
         support = str(support_block.get("claim_support") or "")
-        role = str(((item.get("memory") or {}) if isinstance(item.get("memory"), dict) else {}).get("role") or "").strip().casefold()
-        if support == "direct" or (role == "assistant" and support == "partial" and _assistant_partial_is_answerable(support_block, query)):
+        memory_block = item.get("memory") if isinstance(item.get("memory"), dict) else None
+        role = str((memory_block or {}).get("role") or "").strip().casefold()
+        if memory_block is not None:
+            body = str(item.get("excerpt") or item.get("content") or "")
+            if statement_kind(role, body) != "statement" or missing_identifiers(query, body):
+                continue
+        # No memory block at all is what distinguishes a repository citation
+        # from a conversation record.  A memory backend that reports no role
+        # still carries the block, so it keeps the ``direct`` bar rather than
+        # falling into the repository gate.
+        is_repository = memory_block is None
+        top_repository = is_repository and not seen_repository
+        if is_repository:
+            seen_repository = True
+        if support == "direct":
+            answerable.append(item)
+        elif support != "partial":
+            continue
+        elif role == "assistant":
+            if _assistant_partial_is_answerable(support_block, query):
+                answerable.append(item)
+        elif top_repository and _repository_partial_is_answerable(support_block):
             answerable.append(item)
     return answerable
+
+
+REPOSITORY_PARTIAL_MIN_COVERAGE = 0.8
+REPOSITORY_PARTIAL_MAX_UNPROVEN = 1
+# A name, version, path or ticket — something whose shape says it was coined
+# rather than spoken.  A bare lowercase word is not one of these however
+# specific it feels: ``conversation`` is an ordinary English word, and treating
+# every Latin token as an identifier collapses this gate back into ``direct``
+# for any all-ASCII query, which is measurably what happened on the public
+# fixture before this pattern was narrowed.
+_COINED_TERM = re.compile(r"[0-9]|[A-Za-z][-_./:@][A-Za-z0-9]")
+
+
+def _repository_partial_is_answerable(support: dict[str, Any]) -> bool:
+    """Bound the relaxed claim gate used only for repository citations.
+
+    Three bounds, and each one rejects a different failure.  ``coverage``
+    keeps out the document that shares a couple of words with the question.
+    The unproven-term ceiling keeps out the *long* compound question, where
+    four fifths of ten terms still leaves two parts of the claim unanswered —
+    coverage alone gets looser as the question gets longer, which is backwards.
+    And no coined term may be unproven: a version, a path, a ticket or a
+    hyphenated product name is not something a document paraphrases, so one
+    the evidence cannot show means the evidence is about something else.
+
+    The coined-term test is deliberately narrower than "looks like ASCII".
+    Measured on the public fixture: ``repository memory conversation memory
+    separate groups`` retrieved ``README.md`` first at ``coverage 0.8333`` with
+    only ``conversation`` unproven, and rejecting it as an unproven identifier
+    left the query answering from ``docs/plugin-architecture.md`` at rank 5 —
+    the one document that happened to score ``direct``.  An ordinary word
+    missing from an otherwise complete match is a vocabulary gap; a coined term
+    missing is a different subject.
+
+    Unlike the assistant gate this reads only the support block, never the raw
+    query.  The block already holds the terms ``_claim_support`` actually
+    required, after generic words are dropped and CJK n-grams collapse to their
+    longest form; re-tokenizing here would reintroduce terms that were
+    deliberately excluded and reject on a word the evidence was never asked to
+    prove.
+    """
+
+    try:
+        coverage = float(support.get("coverage") or 0.0)
+    except (TypeError, ValueError):
+        return False
+    if coverage < REPOSITORY_PARTIAL_MIN_COVERAGE:
+        return False
+
+    matched = [str(term).strip() for term in support.get("matched_terms", []) if str(term).strip()]
+    unproven = [str(term).strip() for term in support.get("unmatched_terms", []) if str(term).strip()]
+    if not matched:
+        return False
+    if len(unproven) > REPOSITORY_PARTIAL_MAX_UNPROVEN:
+        return False
+    return not any(_COINED_TERM.search(term) for term in unproven)
 
 
 def _assistant_partial_is_answerable(support: dict[str, Any], query: str) -> bool:
@@ -947,6 +1069,11 @@ def _package_search(query: str, mode: str, scope: str, views: list[SourceView], 
         # answer before the model sees it.
         "groups": groups if scope in {"all", "auto"} else None,
         "answered_by": answered_by,
+        "answer_policy": {
+            "ownership": "A recorder, author, tool name or personal standup is not proof that the requested team performed the work. Attribute only explicitly supported work ownership.",
+            "freshness": "Use the current repository evidence before historical conversation summaries; check later dated sections for updates. A pinned old commit proves only its historical state.",
+            "readback": "verified means the source was read back, not that its content answers the question or establishes real-world truth.",
+        },
         "sources": [_source_payload(view) for view in views],
         "verified": selected["verified"][:limit],
         "candidates": selected["candidates"][:limit],
@@ -1063,6 +1190,8 @@ def search(root: Path | None, query: str, limit: int = 5, deep: bool = False, so
                         continue
                     body = "\n".join(str(record.get(key) or "") for key in ("title", "summary", "content"))
                     support = _claim_support(team_terms, body, 1, max(1, body.count("\n") + 1), real_terms=frozenset(set(team_terms) - team_carved), carved=frozenset(team_carved))
+                    if not ownership_supported(query, record):
+                        support = {**support, "claim_support": "unknown"}
                     active_records.append({**record, "support": {key: support[key] for key in ("matched_terms", "unmatched_terms", "coverage", "claim_support")}})
                 active_records.sort(key=lambda item: -(item.get("support", {}).get("coverage") or 0.0))
                 groups["team"] = {
@@ -1083,6 +1212,15 @@ def search(root: Path | None, query: str, limit: int = 5, deep: bool = False, so
     ordered_candidates = [bucket for _score, _index, bucket in sorted(repository_candidate_buckets, key=lambda item: (-item[0], item[1]))]
     groups["repository"]["verified"] = _interleave_results(ordered_verified, limit)
     groups["repository"]["candidates"] = _interleave_results(ordered_candidates, limit)
+    personal_subjects = {
+        Path(str(item.get("path"))).stem for item in groups["repository"]["verified"]
+        if str(item.get("path") or "").split("/", 1)[0].casefold() in {"standup", "standups", "diary", "diaries", "journal", "journals", "people"}
+        and Path(str(item.get("path"))).stem in query
+    }
+    if personal_subjects:
+        for key in ("verified", "candidates"):
+            groups["memory"][key] = [item for item in groups["memory"][key]
+                if all(subject in str(item.get("excerpt") or "") for subject in personal_subjects)]
     echo_dropped = 0
     for name, group in groups.items():
         if name == "team":
@@ -1106,9 +1244,19 @@ def search(root: Path | None, query: str, limit: int = 5, deep: bool = False, so
         echo_dropped += (len(group["verified"]) - len(kept_verified)) + (len(group["candidates"]) - len(kept_candidates))
         group["verified"] = kept_verified[:limit]
         group["candidates"] = kept_candidates[:limit]
-        group["answerable"] = _answerable_items(group["verified"], echo_query)
+        group["answerable"] = _answerable_items(group["verified"], query)
         group["results"] = group["answerable"]
         group["abstain"] = not group["answerable"]
+    if re.search(r"最新|最近|目前|当前|latest|recent|current", query, re.I) and groups["repository"]["verified"]:
+        # Historical conversation is retained for audit, but cannot independently
+        # establish current state when a repository answer is available.
+        for plane in ("memory", "team"):
+            group = groups.get(plane, {})
+            group["historical_context"] = group.get("answerable", group.get("active", []))
+            group["answerable"] = []
+            group["results"] = []
+            group["abstain"] = True
+            group["answer_policy"] = "historical_context_only_for_current_repository_query"
     if echo_dropped:
         # Never a silent cap: say how much was removed, so a plane that looks
         # thin can be told apart from one that was crowded out by its own echo.
@@ -2393,7 +2541,7 @@ def build_parser() -> argparse.ArgumentParser:
     gui.add_argument("--port", type=int, default=0)
     gui.add_argument("--json", action="store_true")
     semantic = sub.add_parser("semantic", help="Configure the optional repository encoder (local Hugging Face model or remote OpenAI-compatible endpoint)")
-    semantic.add_argument("action", choices=("status", "configure"))
+    semantic.add_argument("action", choices=("status", "configure", "service-install", "service-status", "service-stop"))
     semantic.add_argument("--provider", choices=("huggingface", "gateway", "builtin"), default="huggingface", help="huggingface loads a local model into memory; gateway calls a remote /embeddings endpoint and uses no resident memory")
     semantic.add_argument("--model", help="Defaults to the recommended model for the selected provider")
     semantic.add_argument("--endpoint", help="Base URL of an OpenAI-compatible API for --provider gateway, for example https://host/v1")
@@ -2401,6 +2549,8 @@ def build_parser() -> argparse.ArgumentParser:
     semantic.add_argument("--api-key-env", help="Name of the environment variable holding the endpoint credential. The credential itself is never written to the configuration file")
     semantic.add_argument("--api-key-file", help="Path to a file holding the endpoint credential, for hosts launched without a shell environment. Only the path is stored")
     semantic.add_argument("--api-key-json-path", help="Dot path to the credential inside --api-key-file when that file is JSON belonging to another tool, for example models.providers.NAME.apiKey")
+    semantic.add_argument("--host", default="127.0.0.1", help="Loopback host for the resident local embedding service")
+    semantic.add_argument("--port", type=int, default=8493, help="Loopback port for the resident local embedding service")
     semantic.add_argument("--download", action="store_true", help="Allow the explicit configure operation to download model files")
     semantic.add_argument("--disable", action="store_true")
     semantic.add_argument("--json", action="store_true")
@@ -2717,6 +2867,23 @@ def main(argv: list[str] | None = None, forced_command: str | None = None) -> in
         elif args.command == "semantic":
             if args.action == "status":
                 value = semantic_model_status()
+            elif args.action == "service-status":
+                from semantic_service import status as semantic_service_status
+
+                value = semantic_service_status()
+            elif args.action == "service-stop":
+                from semantic_service import stop as stop_semantic_service
+
+                value = stop_semantic_service()
+            elif args.action == "service-install":
+                from local_embedding import HF_DEFAULT_MODEL
+                from semantic_service import install as install_semantic_service
+
+                value = install_semantic_service(
+                    model=args.model or HF_DEFAULT_MODEL,
+                    host=args.host,
+                    port=args.port,
+                )
             else:
                 from discovery import read_config
                 from local_embedding import GATEWAY_ALIASES, GATEWAY_DEFAULT_MODEL, HF_DEFAULT_MODEL

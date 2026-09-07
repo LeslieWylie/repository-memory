@@ -198,9 +198,9 @@ def _revision_snapshot(root: Path, revision: str) -> tuple[Path, str]:
     return target, commit
 
 
-def _select(result: dict[str, Any], scope: str, relevant: set[str]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], bool, str]:
+def _select(result: dict[str, Any], scope: str, relevant: set[str]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], bool, str]:
     if scope != "all":
-        return list(result.get("verified", [])), list(result.get("candidates", [])), bool(result.get("abstain")), scope
+        return list(result.get("verified", [])), list(result.get("candidates", [])), list(result.get("answerable", [])), bool(result.get("abstain")), scope
     groups = result.get("groups") if isinstance(result.get("groups"), dict) else {}
     chosen = "repository"
     for name in ("repository", "memory"):
@@ -209,7 +209,7 @@ def _select(result: dict[str, Any], scope: str, relevant: set[str]) -> tuple[lis
             chosen = name
             break
     group = groups.get(chosen) if isinstance(groups.get(chosen), dict) else {}
-    return list(group.get("verified", [])), list(group.get("candidates", [])), bool(group.get("abstain", True)), chosen
+    return list(group.get("verified", [])), list(group.get("candidates", [])), list(group.get("answerable", [])), bool(group.get("abstain", True)), chosen
 
 
 def evaluate_queries(root: Path, queries_path: Path, qrels_path: Path, *, limit: int = 5, deep: bool = False, local: bool = False, scope: str = "repository", revision: str | None = None) -> dict[str, Any]:
@@ -254,8 +254,9 @@ def evaluate_queries(root: Path, queries_path: Path, qrels_path: Path, *, limit:
             result = search(evaluated_root, str(query.get("query") or ""), limit=limit, deep=deep, source_id=source_id if revision else query.get("source_scope"), local=local or bool(revision), scope=scope)
             latency = (time.perf_counter() - started) * 1000
             latencies.append(latency)
-            hits, candidates, abstain, selected_scope = _select(result, scope, relevant)
+            hits, candidates, answerable, abstain, selected_scope = _select(result, scope, relevant)
             ids = [str(item.get("id") or "") for item in hits[:limit]]
+            answerable_ids = [str(item.get("id") or "") for item in answerable[:limit]]
             rank = next((number for number, item_id in enumerate(ids, 1) if item_id in relevant), None)
             primary_rank = next((number for number, item_id in enumerate(ids, 1) if item_id in primary_relevant), None)
             expected_abstain = bool(query.get("expected_abstain"))
@@ -277,6 +278,19 @@ def evaluate_queries(root: Path, queries_path: Path, qrels_path: Path, *, limit:
                 "recall_at_5": recall if not expected_abstain else None,
                 "abstain": abstain,
                 "abstain_correct": bool(abstain and not hits) if expected_abstain else None,
+                # ``verified`` measures retrieval; these measure what the caller
+                # is actually allowed to answer from.  A change to the claim
+                # gate moves only these, so without them the gate is tightened
+                # or relaxed with no number attached to it.
+                "answerable_count": len(answerable),
+                "answered": bool(answerable_ids),
+                # Served an answer whose top item is not gold: the wrong-answer
+                # rate.  ``None`` when nothing was served, so abstaining never
+                # counts as a wrong answer.
+                "answer_correct_at_1": (int(answerable_ids[0] in relevant) if answerable_ids else None) if not expected_abstain else None,
+                # A query whose whole point is that nothing supports it must not
+                # reach the answer surface at all.
+                "negative_answer_leak": (int(bool(answerable_ids)) if expected_abstain else None),
                 "verified_count": len(hits),
                 "candidate_count": len(candidates),
                 "citation_valid_count": sum(_citation_valid(evaluated_root, item, evaluated_commit) for item in hits),
@@ -311,6 +325,7 @@ def evaluate_queries(root: Path, queries_path: Path, qrels_path: Path, *, limit:
     primary_p1_hits = sum(int(row["primary_precision_at_1"] or 0) for row in positive)
     relevant_retrieved_at_5 = sum(len(set(row["top5_ids"]) & set(row["gold_ids"])) for row in positive)
     relevant_total = sum(len(row["gold_ids"]) for row in positive)
+    answered_positive = [row for row in positive if row["answer_correct_at_1"] is not None]
 
     def bucket(rows_for_intent: list[dict[str, Any]]) -> dict[str, Any]:
         positives = [row for row in rows_for_intent if not row["expected_abstain"]]
@@ -356,6 +371,15 @@ def evaluate_queries(root: Path, queries_path: Path, qrels_path: Path, *, limit:
         "recall_at_5_relevant_total": relevant_total,
         "recall_at_5_micro": relevant_retrieved_at_5 / relevant_total if relevant_total else 0.0,
         "negative_abstain_accuracy": sum(bool(row["abstain_correct"]) for row in negatives) / len(negatives) if negatives else None,
+        # The answer surface, measured separately from retrieval.  ``answer_rate``
+        # is how often a positive query got an answer at all; ``answer_precision``
+        # is how often the answer it got was the right document.  Precision is
+        # conditioned on having answered, so raising the abstain rate can never
+        # flatter it — the two have to be read together, wrong-answer rate first.
+        "answer_rate": sum(bool(row["answered"]) for row in positive) / len(positive) if positive else 0.0,
+        "answer_precision_at_1": sum(row["answer_correct_at_1"] for row in answered_positive) / len(answered_positive) if answered_positive else None,
+        "answered_positive_total": len(answered_positive),
+        "negative_answer_leak": sum(row["negative_answer_leak"] or 0 for row in negatives) / len(negatives) if negatives else None,
         "citation_parseability": citations / verified if verified else 0.0,
         "candidate_contamination": candidates / (verified + candidates) if verified + candidates else 0.0,
         "p50_latency_ms": statistics.median(latencies) if latencies else 0.0,
