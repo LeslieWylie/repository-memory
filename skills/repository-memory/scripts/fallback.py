@@ -1003,6 +1003,8 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
                 tuple(int(part) for part in value.replace("/", "-").replace("-W", "-").split("-") if part.isdigit())
                 for value in DATE_RE.findall(relative)
             ]
+        if date_terms:
+            dates = [tuple(int(p) for p in re.findall(r"\d+", value)[:3]) for value in date_terms]
         if latest and not date_terms:
             # Date the selected evidence, never an unrelated newest section.
             heading_dates = []
@@ -1153,7 +1155,7 @@ def search(source: SourceView, query: str, limit: int = 5, deep: bool = False) -
                 + (72 if relative.split("/", 1)[0] in preferred_layers else 0)
                 + layer_bonus
                 + (4 if relative.startswith(("papers/", "models/", "people/", "benchmarks/", "survey/", "reports/", "notes/")) else 0)
-                + ((latest_score[0] * 10000 + latest_score[1] * 100 + latest_score[2]) * 1000000 if latest and float(support.get("coverage") or 0) >= 0.5 and not any(re.search(r"[0-9]|([㐀-鿿])(?:到|对)\1", term) for term in support.get("unmatched_terms", [])) else 0)
+                + ((latest_score[0] * 10000 + latest_score[1] * 100 + latest_score[2]) * 1000000 if latest and (not date_terms or support.get("claim_support") == "direct") and float(support.get("coverage") or 0) >= 0.5 and not any(re.search(r"[0-9]|([㐀-鿿])(?:到|对)\1", term) for term in support.get("unmatched_terms", [])) else 0)
             ),
         })
     hits.sort(key=lambda item: (-int(item.pop("_score", 0)), str(item.get("path") or "")))
