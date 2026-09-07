@@ -90,4 +90,4 @@ def ownership_supported(query: str, item: dict[str, Any]) -> bool:
     if any(str(p).casefold() == team.casefold() for p in performers):
         return True
     text = str(item.get("excerpt") or item.get("content") or "")
-    return bool(re.search(re.escape(team) + r"\s*(?:团队|team)\s*(?:本周|本月|已经|已|主要|负责|完成|实现|修复|推进|built\b|fixed\b|delivered\b|completed\b)", text, re.I))
+    return bool(re.search(re.escape(team) + r"\s*(?:团队|team)\s*(?:(?:本周|本月|已经|已|主要)\s*)*(?:负责|完成|实现|修复|推进|built\b|fixed\b|delivered\b|completed\b)", text, re.I))

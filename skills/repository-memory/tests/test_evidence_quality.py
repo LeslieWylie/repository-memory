@@ -48,6 +48,7 @@ def test_recorder_and_tool_use_do_not_establish_a_teams_work():
     query = "Orbit 团队本周完成了什么？"
     record = {"content": "林小明与 Codex 完成视频验证，并通过 Orbit 投递日报。", "attribution": {"recorded_by": "Orbit", "work_performed_by": []}}
     assert not ownership_supported(query, record)
+    assert not ownership_supported(query, {"content": "Orbit 团队本周记录了林小明与 Codex 完成的工作。"})
     assert ownership_supported(query, {"content": "Orbit 团队完成了任务调度器的修复。"})
     assert ownership_supported(query, {"content": "完成了任务调度器修复。", "attribution": {"work_performed_by": ["Orbit"]}})
 
