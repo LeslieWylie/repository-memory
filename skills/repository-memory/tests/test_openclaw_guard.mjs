@@ -275,6 +275,11 @@ for (const name of ["repository_memory_doctor", "repository_memory_search", "rep
 for (const name of ["before_prompt_build", "before_agent_run", "agent_end", "session_start", "session_end", "tool_result_persist", "before_tool_call", "after_tool_call"]) {
   assert.equal(nativeHooks.has(name), true, `lifecycle hook ${name} should be registered`);
 }
+assert.equal(
+  nativeHooks.get("tool_result_persist")({ toolName: "read", result: { ok: true } }, { agentId: "yaole" }),
+  undefined,
+  "the synchronous tool_result_persist hook must not return a Promise",
+);
 const nativeSearch = await nativeTools.get("repository_memory_search").execute("call-1", { query: "memory" });
 assert.equal(nativeSearch.isError, undefined);
 assert.match(nativeSearch.content[0].text, /accepted profile context/);

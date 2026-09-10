@@ -1114,9 +1114,11 @@ export default {
       if (!isAllowedAgent(cfg, ctx)) return;
       await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "session_end", session_id: optional(event?.sessionId) || optional(ctx?.sessionId) || null, reason: optional(event?.reason) || null });
     }, { priority: -20, timeoutMs: 5000 });
-    api.on("tool_result_persist", async (event, ctx) => {
+    api.on("tool_result_persist", (event, ctx) => {
       if (!isAllowedAgent(cfg, ctx)) return;
-      await appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "tool_result_persist", tool: optional(event?.toolName) || "unknown", tool_call_id: optional(event?.toolCallId) || null, result_hash: digest(event?.result ?? event?.message ?? {}), error: optional(event?.error) || null });
+      // OpenClaw dispatches this hook synchronously. Keep the metadata-only
+      // audit best-effort without returning a Promise that the host will ignore.
+      void appendAudit(cfg, { agent: optional(ctx?.agentId) || "main", run_id: optional(ctx?.runId) || null, event: "tool_result_persist", tool: optional(event?.toolName) || "unknown", tool_call_id: optional(event?.toolCallId) || null, result_hash: digest(event?.result ?? event?.message ?? {}), error: optional(event?.error) || null });
     }, { priority: -50, timeoutMs: 5000 });
 
     api.on("agent_end", (event, ctx) => {
