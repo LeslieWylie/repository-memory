@@ -3669,7 +3669,9 @@ class HuggingFaceServiceTest(unittest.TestCase):
             semantic_service, "_launchctl", side_effect=launchctl
         ), patch.object(
             semantic_service, "_health", return_value={"ok": True, "model": "local-test-model", "dimension": 3}
-        ), patch.object(semantic_service.time, "sleep", return_value=None):
+        ), patch.object(semantic_service.time, "sleep", return_value=None), patch.object(
+            semantic_service.os, "getuid", return_value=501, create=True
+        ):
             result = semantic_service.install(model="local-test-model")
 
         self.assertTrue(result["ok"])
