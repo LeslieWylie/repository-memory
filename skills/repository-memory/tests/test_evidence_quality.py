@@ -119,7 +119,7 @@ def test_capture_keeps_raw_turns_but_only_projects_statements(tmp_path):
         {"role": "user", "content": "Atlas 何时交付？只给结论。"},
         {"role": "assistant", "content": "Atlas 每周四交付。"},
         {"role": "assistant", "content": "好的。"},
-    ]}, ensure_ascii=False))
+    ]}, ensure_ascii=False), encoding="utf-8")
     client.ingest(source)
     client.ingest(source)
     conn = client._connect()
